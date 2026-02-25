@@ -18,6 +18,7 @@ pub enum Auth {
 pub struct Client {
     endpoint: String,
     auth: Auth,
+    fallback_auth: Option<Auth>,
     allow_insecure_tls: bool,
 }
 
@@ -26,6 +27,7 @@ impl Client {
         Self {
             endpoint: endpoint.into(),
             auth,
+            fallback_auth: None,
             allow_insecure_tls: true,
         }
     }
@@ -42,6 +44,16 @@ impl Client {
         Self {
             endpoint: self.endpoint.clone(),
             auth,
+            fallback_auth: self.fallback_auth.clone(),
+            allow_insecure_tls: self.allow_insecure_tls,
+        }
+    }
+
+    pub fn with_fallback_auth(&self, fallback_auth: Auth) -> Self {
+        Self {
+            endpoint: self.endpoint.clone(),
+            auth: self.auth.clone(),
+            fallback_auth: Some(fallback_auth),
             allow_insecure_tls: self.allow_insecure_tls,
         }
     }
@@ -54,9 +66,33 @@ impl Client {
     }
 
     pub fn execute(&self, request: CommandRequest) -> AppResult<CommandResponse> {
+        match self.execute_with_auth(&request, &self.auth) {
+            Ok(response) => Ok(response),
+            Err(error) if self.should_fallback(&error) => {
+                if let Some(fallback_auth) = &self.fallback_auth {
+                    self.execute_with_auth(&request, fallback_auth)
+                } else {
+                    Err(error)
+                }
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    fn should_fallback(&self, error: &AppError) -> bool {
+        matches!(self.auth, Auth::Token(_))
+            && self.fallback_auth.is_some()
+            && matches!(error.kind, ErrorKind::Authentication)
+    }
+
+    fn execute_with_auth(
+        &self,
+        request: &CommandRequest,
+        auth: &Auth,
+    ) -> AppResult<CommandResponse> {
         let api_url = self.api_url()?;
-        let query_params = self.query_params(request.command.as_str())?;
-        let request_body = build_request_body(&request);
+        let query_params = self.query_params_for_auth(request.command.as_str(), auth)?;
+        let request_body = build_request_body(request);
 
         let http_client = self.http_client()?;
         let response = http_client
@@ -110,6 +146,17 @@ impl Client {
         }
 
         let normalized = normalize_body(body_text);
+        if looks_like_authentication_failure(&normalized) {
+            return Err(AppError::new(
+                ErrorKind::Authentication,
+                format!(
+                    "authentication failed for {}: body={}",
+                    request.command.as_str(),
+                    truncate_body(&normalized)
+                ),
+            ));
+        }
+
         Ok(CommandResponse::new(request.command, normalized))
     }
 
@@ -127,10 +174,14 @@ impl Client {
         ))
     }
 
-    fn query_params(&self, command: &str) -> AppResult<Vec<(&'static str, String)>> {
+    fn query_params_for_auth(
+        &self,
+        command: &str,
+        auth: &Auth,
+    ) -> AppResult<Vec<(&'static str, String)>> {
         let mut params = vec![("cmd", command.to_string())];
 
-        match &self.auth {
+        match auth {
             Auth::Anonymous => {}
             Auth::UserPassword { user, password } => {
                 if user.trim().is_empty() || password.is_empty() {
@@ -167,6 +218,42 @@ impl Client {
                     format!("failed to create HTTP client: {error}"),
                 )
             })
+    }
+}
+
+fn looks_like_authentication_failure(body: &str) -> bool {
+    if body.to_ascii_lowercase().contains("please login first") {
+        return true;
+    }
+
+    let Ok(parsed) = serde_json::from_str::<Value>(body) else {
+        return false;
+    };
+
+    contains_rsp_code(&parsed, -6)
+}
+
+fn contains_rsp_code(value: &Value, target: i64) -> bool {
+    match value {
+        Value::Array(entries) => entries.iter().any(|entry| contains_rsp_code(entry, target)),
+        Value::Object(map) => {
+            if let Some(raw) = map.get("rspCode")
+                && as_i64(raw).is_some_and(|value| value == target)
+            {
+                return true;
+            }
+
+            map.values().any(|nested| contains_rsp_code(nested, target))
+        }
+        _ => false,
+    }
+}
+
+fn as_i64(value: &Value) -> Option<i64> {
+    match value {
+        Value::Number(number) => number.as_i64(),
+        Value::String(text) => text.trim().parse::<i64>().ok(),
+        _ => None,
     }
 }
 

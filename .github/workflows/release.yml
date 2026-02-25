@@ -1,0 +1,153 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag (e.g. v0.1.0)"
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+  RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.tag || github.ref_name }}
+
+jobs:
+  verify:
+    name: Verify
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ env.RELEASE_TAG }}
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
+
+      - name: Validate release tag
+        shell: bash
+        run: |
+          if [[ ! "${RELEASE_TAG}" =~ ^v[0-9] ]]; then
+            echo "RELEASE_TAG must start with v (got: ${RELEASE_TAG})"
+            exit 1
+          fi
+
+      - name: cargo check
+        run: cargo check --all-targets --all-features
+
+      - name: cargo fmt
+        run: cargo fmt --all -- --check
+
+      - name: cargo clippy
+        run: cargo clippy --all-targets --all-features -- -D warnings
+
+      - name: cargo test
+        run: cargo test --all-targets --all-features
+
+  build:
+    name: Build ${{ matrix.target }}
+    needs: verify
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+            archive_ext: tar.gz
+            bin_ext: ""
+          - runner: windows-2022
+            target: x86_64-pc-windows-msvc
+            archive_ext: zip
+            bin_ext: ".exe"
+          - runner: macos-13
+            target: x86_64-apple-darwin
+            archive_ext: tar.gz
+            bin_ext: ""
+          - runner: macos-14
+            target: aarch64-apple-darwin
+            archive_ext: tar.gz
+            bin_ext: ""
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ env.RELEASE_TAG }}
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build binaries
+        run: cargo build --release --locked --target ${{ matrix.target }} --bin reocli --bin reocli-mcp
+
+      - name: Package (tar.gz)
+        if: matrix.archive_ext == 'tar.gz'
+        shell: bash
+        run: |
+          package_dir="reocli-${RELEASE_TAG}-${{ matrix.target }}"
+          mkdir -p "dist/${package_dir}"
+          cp "target/${{ matrix.target }}/release/reocli${{ matrix.bin_ext }}" "dist/${package_dir}/"
+          cp "target/${{ matrix.target }}/release/reocli-mcp${{ matrix.bin_ext }}" "dist/${package_dir}/"
+          cp README.md "dist/${package_dir}/"
+          tar -C dist -czf "dist/${package_dir}.tar.gz" "${package_dir}"
+          shasum -a 256 "dist/${package_dir}.tar.gz" > "dist/${package_dir}.tar.gz.sha256"
+
+      - name: Package (zip)
+        if: matrix.archive_ext == 'zip'
+        shell: pwsh
+        run: |
+          $packageDir = "reocli-$env:RELEASE_TAG-${{ matrix.target }}"
+          New-Item -ItemType Directory -Path "dist/$packageDir" -Force | Out-Null
+          Copy-Item "target/${{ matrix.target }}/release/reocli${{ matrix.bin_ext }}" "dist/$packageDir/"
+          Copy-Item "target/${{ matrix.target }}/release/reocli-mcp${{ matrix.bin_ext }}" "dist/$packageDir/"
+          Copy-Item "README.md" "dist/$packageDir/"
+          Compress-Archive -Path "dist/$packageDir/*" -DestinationPath "dist/$packageDir.zip" -Force
+          $hash = (Get-FileHash -Algorithm SHA256 "dist/$packageDir.zip").Hash.ToLowerInvariant()
+          "$hash  $packageDir.zip" | Out-File -FilePath "dist/$packageDir.zip.sha256" -Encoding ascii -NoNewline
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-${{ matrix.target }}
+          path: |
+            dist/*.tar.gz
+            dist/*.zip
+            dist/*.sha256
+          if-no-files-found: error
+
+  publish:
+    name: Publish GitHub Release
+    needs: build
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          pattern: release-*
+          merge-multiple: true
+
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ env.RELEASE_TAG }}
+          generate_release_notes: true
+          fail_on_unmatched_files: true
+          files: |
+            dist/*.tar.gz
+            dist/*.zip
+            dist/*.sha256

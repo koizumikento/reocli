@@ -14,7 +14,8 @@ pub struct McpRequest {
 const DEFAULT_ENDPOINT: &str = "https://camera.local";
 
 pub fn handle_request(request: McpRequest) -> AppResult<String> {
-    let client = Client::new(endpoint_from_env(), auth_from_env());
+    let (primary_auth, fallback_auth) = auth_from_env();
+    let client = build_client(primary_auth, fallback_auth);
 
     match request.tool.as_str() {
         "mcp.list_tools" => {
@@ -136,20 +137,33 @@ fn endpoint_from_env() -> String {
     std::env::var("REOCLI_ENDPOINT").unwrap_or_else(|_| DEFAULT_ENDPOINT.to_string())
 }
 
-fn auth_from_env() -> Auth {
-    if let Ok(token) = std::env::var("REOCLI_TOKEN") {
-        if !token.trim().is_empty() {
-            return Auth::Token(token);
-        }
+fn build_client(primary_auth: Auth, fallback_auth: Option<Auth>) -> Client {
+    let client = Client::new(endpoint_from_env(), primary_auth);
+    match fallback_auth {
+        Some(auth) => client.with_fallback_auth(auth),
+        None => client,
     }
+}
 
-    match (
+fn auth_from_env() -> (Auth, Option<Auth>) {
+    let fallback_auth = match (
         std::env::var("REOCLI_USER"),
         std::env::var("REOCLI_PASSWORD"),
     ) {
         (Ok(user), Ok(password)) if !user.trim().is_empty() && !password.is_empty() => {
-            Auth::UserPassword { user, password }
+            Some(Auth::UserPassword { user, password })
         }
-        _ => Auth::Anonymous,
+        _ => None,
+    };
+
+    if let Ok(token) = std::env::var("REOCLI_TOKEN") {
+        if !token.trim().is_empty() {
+            return (Auth::Token(token), fallback_auth);
+        }
+    }
+
+    match fallback_auth {
+        Some(user_password_auth) => (user_password_auth, None),
+        None => (Auth::Anonymous, None),
     }
 }
