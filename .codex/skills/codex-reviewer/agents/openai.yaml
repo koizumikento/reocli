@@ -1,0 +1,4 @@
+interface:
+  display_name: "Codex Reviewer"
+  short_description: "Structured, severity-first code review assistant."
+  default_prompt: "Use $codex-reviewer to review the current changes and report findings by severity with file/line evidence."

@@ -6,6 +6,12 @@ pub struct Ability {
     pub supported_commands: Vec<CgiCommand>,
 }
 
+impl Ability {
+    pub fn supports(&self, cmd: CgiCommand) -> bool {
+        self.supported_commands.contains(&cmd)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct DeviceInfo {
     pub model: String,
