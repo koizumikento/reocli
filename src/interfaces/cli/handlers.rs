@@ -1,6 +1,7 @@
 use crate::app::preflight::run_preflight;
 use crate::app::usecases;
 use crate::core::error::AppResult;
+use crate::core::model::NumericRange;
 use crate::interfaces::cli::args::{CliCommand, help_text, parse_args};
 use crate::interfaces::runtime::client_from_env;
 
@@ -44,6 +45,38 @@ pub fn run(args: &[String]) -> AppResult<String> {
                 status.channel, status.online
             ))
         }
+        CliCommand::GetPtzStatus { channel } => {
+            let status = usecases::get_ptz_status::execute(&client, channel)?;
+            let presets = if status.enabled_presets.is_empty() {
+                "[]".to_string()
+            } else {
+                format!(
+                    "[{}]",
+                    status
+                        .enabled_presets
+                        .iter()
+                        .map(|id| id.to_string())
+                        .collect::<Vec<_>>()
+                        .join(",")
+                )
+            };
+            Ok(format!(
+                "channel={}; pan={}; tilt={}; zoom={}; focus={}; pan_range={}; tilt_range={}; zoom_range={}; focus_range={}; preset_range={}; enabled_presets={}; calibration_state={}; calibrated={}",
+                status.channel,
+                format_optional_i64(status.pan_position),
+                format_optional_i64(status.tilt_position),
+                format_optional_i64(status.zoom_position),
+                format_optional_i64(status.focus_position),
+                format_optional_range(status.pan_range.as_ref()),
+                format_optional_range(status.tilt_range.as_ref()),
+                format_optional_range(status.zoom_range.as_ref()),
+                format_optional_range(status.focus_range.as_ref()),
+                format_optional_range(status.preset_range.as_ref()),
+                presets,
+                format_optional_i64(status.calibration_state),
+                format_optional_bool(status.calibrated()),
+            ))
+        }
         CliCommand::GetTime => {
             let time = usecases::get_time::execute(&client)?;
             Ok(format!("time={}", time.iso8601))
@@ -68,4 +101,22 @@ pub fn run(args: &[String]) -> AppResult<String> {
             ))
         }
     }
+}
+
+fn format_optional_i64(value: Option<i64>) -> String {
+    value
+        .map(|raw| raw.to_string())
+        .unwrap_or_else(|| "unknown".to_string())
+}
+
+fn format_optional_bool(value: Option<bool>) -> String {
+    value
+        .map(|flag| flag.to_string())
+        .unwrap_or_else(|| "unknown".to_string())
+}
+
+fn format_optional_range(range: Option<&NumericRange>) -> String {
+    range
+        .map(|bounds| format!("{}..{}", bounds.min, bounds.max))
+        .unwrap_or_else(|| "unknown".to_string())
 }

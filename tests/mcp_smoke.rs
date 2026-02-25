@@ -126,6 +126,74 @@ fn reocli_mcp_get_and_set_time_work() {
     );
 }
 
+#[test]
+fn reocli_mcp_get_ptz_status_works() {
+    let mut server = Server::new();
+    let _cur_pos_mock = server
+        .mock("POST", "/cgi-bin/api.cgi")
+        .match_query(Matcher::UrlEncoded(
+            "cmd".to_string(),
+            "GetPtzCurPos".to_string(),
+        ))
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(
+            r#"[{"cmd":"GetPtzCurPos","code":0,"value":{"PtzCurPos":{"channel":0,"Ppos":900,"Tpos":-120}}}]"#,
+        )
+        .expect(1)
+        .create();
+
+    let _zoom_mock = server
+        .mock("POST", "/cgi-bin/api.cgi")
+        .match_query(Matcher::UrlEncoded(
+            "cmd".to_string(),
+            "GetZoomFocus".to_string(),
+        ))
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(r#"[{"cmd":"GetZoomFocus","code":1}]"#)
+        .expect(1)
+        .create();
+
+    let _preset_mock = server
+        .mock("POST", "/cgi-bin/api.cgi")
+        .match_query(Matcher::UrlEncoded(
+            "cmd".to_string(),
+            "GetPtzPreset".to_string(),
+        ))
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(r#"[{"cmd":"GetPtzPreset","code":1}]"#)
+        .expect(1)
+        .create();
+
+    let _check_mock = server
+        .mock("POST", "/cgi-bin/api.cgi")
+        .match_query(Matcher::UrlEncoded(
+            "cmd".to_string(),
+            "GetPtzCheckState".to_string(),
+        ))
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(r#"[{"cmd":"GetPtzCheckState","code":1}]"#)
+        .expect(1)
+        .create();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_reocli-mcp"))
+        .arg("reolink.get_ptz_status")
+        .arg("0")
+        .env("REOCLI_ENDPOINT", server.url())
+        .output()
+        .expect("failed to run reocli-mcp reolink.get_ptz_status");
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let json = parse_stdout_json(&stdout);
+    assert_eq!(json.get("channel").and_then(Value::as_u64), Some(0));
+    assert_eq!(json.get("pan").and_then(Value::as_i64), Some(900));
+    assert_eq!(json.get("tilt").and_then(Value::as_i64), Some(-120));
+}
+
 fn parse_stdout_json(stdout: &str) -> Value {
     serde_json::from_str(stdout.trim()).expect("stdout should be valid JSON")
 }

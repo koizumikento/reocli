@@ -27,6 +27,10 @@ pub fn supported_tools() -> Vec<McpTool> {
             description: "Get online/offline status for a channel.",
         },
         McpTool {
+            name: "reolink.get_ptz_status",
+            description: "Get PTZ orientation and movement ranges for a channel.",
+        },
+        McpTool {
             name: "reolink.get_time",
             description: "Get camera time.",
         },

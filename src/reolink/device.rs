@@ -97,12 +97,16 @@ pub fn get_channel_status(client: &Client, channel: u8) -> AppResult<ChannelStat
     Ok(ChannelStatus { channel, online })
 }
 
-fn ordered_known_commands() -> [CgiCommand; 8] {
+fn ordered_known_commands() -> [CgiCommand; 12] {
     [
         CgiCommand::GetAbility,
         CgiCommand::GetDevInfo,
         CgiCommand::Snap,
         CgiCommand::GetChannelStatus,
+        CgiCommand::GetPtzCurPos,
+        CgiCommand::GetPtzPreset,
+        CgiCommand::GetPtzCheckState,
+        CgiCommand::GetZoomFocus,
         CgiCommand::GetTime,
         CgiCommand::SetTime,
         CgiCommand::GetNetwork,
@@ -225,6 +229,10 @@ fn command_from_name(name: &str) -> Option<CgiCommand> {
         "GetDevInfo" => Some(CgiCommand::GetDevInfo),
         "Snap" => Some(CgiCommand::Snap),
         "GetChannelStatus" | "GetChannelstatus" => Some(CgiCommand::GetChannelStatus),
+        "GetPtzCurPos" => Some(CgiCommand::GetPtzCurPos),
+        "GetPtzPreset" => Some(CgiCommand::GetPtzPreset),
+        "GetPtzCheckState" => Some(CgiCommand::GetPtzCheckState),
+        "GetZoomFocus" => Some(CgiCommand::GetZoomFocus),
         "GetTime" => Some(CgiCommand::GetTime),
         "SetTime" => Some(CgiCommand::SetTime),
         "GetNetwork" => Some(CgiCommand::GetNetwork),

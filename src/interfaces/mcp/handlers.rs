@@ -60,6 +60,25 @@ pub fn handle_request(request: McpRequest) -> AppResult<String> {
                 "online": status.online
             }))
         }
+        "reolink.get_ptz_status" => {
+            let channel = parse_channel(&request.arguments)?;
+            let status = usecases::get_ptz_status::execute(&client, channel)?;
+            json_response(json!({
+                "channel": status.channel,
+                "pan": status.pan_position,
+                "tilt": status.tilt_position,
+                "zoom": status.zoom_position,
+                "focus": status.focus_position,
+                "pan_range": status.pan_range.as_ref().map(|range| json!({ "min": range.min, "max": range.max })),
+                "tilt_range": status.tilt_range.as_ref().map(|range| json!({ "min": range.min, "max": range.max })),
+                "zoom_range": status.zoom_range.as_ref().map(|range| json!({ "min": range.min, "max": range.max })),
+                "focus_range": status.focus_range.as_ref().map(|range| json!({ "min": range.min, "max": range.max })),
+                "preset_range": status.preset_range.as_ref().map(|range| json!({ "min": range.min, "max": range.max })),
+                "enabled_presets": status.enabled_presets,
+                "calibration_state": status.calibration_state,
+                "calibrated": status.calibrated()
+            }))
+        }
         "reolink.get_time" => {
             let time = usecases::get_time::execute(&client)?;
             json_response(json!({ "time": time.iso8601 }))

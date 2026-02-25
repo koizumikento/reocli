@@ -79,3 +79,70 @@ fn reocli_uses_admin_when_only_password_env_is_set() {
 
     assert!(output.status.success());
 }
+
+#[test]
+fn reocli_get_ptz_status_works() {
+    let mut server = Server::new();
+    let _cur_pos_mock = server
+        .mock("POST", "/cgi-bin/api.cgi")
+        .match_query(Matcher::UrlEncoded(
+            "cmd".to_string(),
+            "GetPtzCurPos".to_string(),
+        ))
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(
+            r#"[{"cmd":"GetPtzCurPos","code":0,"value":{"PtzCurPos":{"channel":1,"Ppos":1200,"Tpos":-80}}}]"#,
+        )
+        .expect(1)
+        .create();
+
+    let _zoom_mock = server
+        .mock("POST", "/cgi-bin/api.cgi")
+        .match_query(Matcher::UrlEncoded(
+            "cmd".to_string(),
+            "GetZoomFocus".to_string(),
+        ))
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(r#"[{"cmd":"GetZoomFocus","code":1}]"#)
+        .expect(1)
+        .create();
+
+    let _preset_mock = server
+        .mock("POST", "/cgi-bin/api.cgi")
+        .match_query(Matcher::UrlEncoded(
+            "cmd".to_string(),
+            "GetPtzPreset".to_string(),
+        ))
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(r#"[{"cmd":"GetPtzPreset","code":1}]"#)
+        .expect(1)
+        .create();
+
+    let _check_mock = server
+        .mock("POST", "/cgi-bin/api.cgi")
+        .match_query(Matcher::UrlEncoded(
+            "cmd".to_string(),
+            "GetPtzCheckState".to_string(),
+        ))
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(r#"[{"cmd":"GetPtzCheckState","code":1}]"#)
+        .expect(1)
+        .create();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_reocli"))
+        .arg("get-ptz-status")
+        .arg("1")
+        .env("REOCLI_ENDPOINT", server.url())
+        .output()
+        .expect("failed to run reocli get-ptz-status");
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("channel=1"));
+    assert!(stdout.contains("pan=1200"));
+    assert!(stdout.contains("tilt=-80"));
+}
