@@ -5,6 +5,7 @@ const ENDPOINT_ENV: &str = "REOCLI_ENDPOINT";
 const TOKEN_ENV: &str = "REOCLI_TOKEN";
 const USER_ENV: &str = "REOCLI_USER";
 const PASSWORD_ENV: &str = "REOCLI_PASSWORD";
+const DEFAULT_USER: &str = "admin";
 
 pub(crate) fn client_from_env() -> Client {
     let (primary_auth, fallback_auth) = auth_from_env();
@@ -21,11 +22,21 @@ fn endpoint_from_env() -> String {
 }
 
 fn auth_from_env() -> (Auth, Option<Auth>) {
-    let fallback_auth = match (std::env::var(USER_ENV), std::env::var(PASSWORD_ENV)) {
-        (Ok(user), Ok(password)) if !user.trim().is_empty() && !password.is_empty() => {
+    let user = std::env::var(USER_ENV)
+        .ok()
+        .map(|value| value.trim().to_string());
+    let password = std::env::var(PASSWORD_ENV)
+        .ok()
+        .filter(|value| !value.is_empty());
+
+    let fallback_auth = match password {
+        Some(password) => {
+            let user = user
+                .filter(|value| !value.is_empty())
+                .unwrap_or_else(|| DEFAULT_USER.to_string());
             Some(Auth::UserPassword { user, password })
         }
-        _ => None,
+        None => None,
     };
 
     if let Ok(token) = std::env::var(TOKEN_ENV) {

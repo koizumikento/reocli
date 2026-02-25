@@ -1,5 +1,6 @@
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum CgiCommand {
+    Login,
     GetAbility,
     GetDevInfo,
     Snap,
@@ -13,6 +14,7 @@ pub enum CgiCommand {
 impl CgiCommand {
     pub fn as_str(self) -> &'static str {
         match self {
+            Self::Login => "Login",
             Self::GetAbility => "GetAbility",
             Self::GetDevInfo => "GetDevInfo",
             Self::Snap => "Snap",

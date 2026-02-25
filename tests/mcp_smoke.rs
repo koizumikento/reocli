@@ -49,13 +49,10 @@ fn reocli_mcp_get_user_auth_escapes_json() {
     let mut server = Server::new();
     let _mock = server
         .mock("POST", "/cgi-bin/api.cgi")
-        .match_query(Matcher::UrlEncoded(
-            "cmd".to_string(),
-            "GetUserAuth".to_string(),
-        ))
+        .match_query(Matcher::UrlEncoded("cmd".to_string(), "Login".to_string()))
         .with_status(200)
         .with_header("content-type", "application/json")
-        .with_body(r#"[{"cmd":"GetUserAuth","code":0,"value":{"Token":{"name":"tok\"en"}}}]"#)
+        .with_body(r#"[{"cmd":"Login","code":0,"value":{"Token":{"name":"tok\"en"}}}]"#)
         .expect(1)
         .create();
 

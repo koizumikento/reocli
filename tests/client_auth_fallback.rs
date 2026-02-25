@@ -21,12 +21,20 @@ fn token_auth_falls_back_to_user_password_when_login_is_required() {
         .expect(1)
         .create();
 
+    let _login_request = server
+        .mock("POST", "/cgi-bin/api.cgi")
+        .match_query(Matcher::UrlEncoded("cmd".to_string(), "Login".to_string()))
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(r#"[{"cmd":"Login","code":0,"value":{"Token":{"name":"fresh-token"}}}]"#)
+        .expect(1)
+        .create();
+
     let _fallback_request = server
         .mock("POST", "/cgi-bin/api.cgi")
         .match_query(Matcher::AllOf(vec![
             Matcher::UrlEncoded("cmd".to_string(), "GetDevInfo".to_string()),
-            Matcher::UrlEncoded("user".to_string(), "admin".to_string()),
-            Matcher::UrlEncoded("password".to_string(), "secret".to_string()),
+            Matcher::UrlEncoded("token".to_string(), "fresh-token".to_string()),
         ]))
         .with_status(200)
         .with_header("content-type", "application/json")

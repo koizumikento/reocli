@@ -4,7 +4,7 @@ use reqwest::{StatusCode, blocking::Client as HttpClient};
 use serde::Serialize;
 use serde_json::{Map, Value, json};
 
-use crate::core::command::{CommandParams, CommandRequest, CommandResponse};
+use crate::core::command::{CgiCommand, CommandParams, CommandRequest, CommandResponse};
 use crate::core::error::{AppError, AppResult, ErrorKind};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -79,6 +79,35 @@ impl Client {
         }
     }
 
+    pub fn login(&self, user: &str, password: &str) -> AppResult<String> {
+        if user.trim().is_empty() || password.is_empty() {
+            return Err(AppError::new(
+                ErrorKind::InvalidInput,
+                "login requires non-empty user/password",
+            ));
+        }
+
+        let payload = json!({
+            "User": {
+                "Version": "0",
+                "userName": user,
+                "password": password
+            }
+        });
+        let mut request = CommandRequest::new(CgiCommand::Login);
+        request.params = CommandParams {
+            user_name: None,
+            channel: None,
+            payload: Some(payload.to_string()),
+        };
+
+        let response = self.execute_with_query_params(
+            &request,
+            vec![("cmd", CgiCommand::Login.as_str().to_string())],
+        )?;
+        extract_login_token(&response.raw_json)
+    }
+
     fn should_fallback(&self, error: &AppError) -> bool {
         matches!(self.auth, Auth::Token(_))
             && self.fallback_auth.is_some()
@@ -90,8 +119,30 @@ impl Client {
         request: &CommandRequest,
         auth: &Auth,
     ) -> AppResult<CommandResponse> {
+        match auth {
+            Auth::UserPassword { user, password } => {
+                if request.command == CgiCommand::Login {
+                    let query_params =
+                        self.query_params_for_auth(request.command.as_str(), &Auth::Anonymous)?;
+                    self.execute_with_query_params(request, query_params)
+                } else {
+                    let token = self.login(user, password)?;
+                    self.execute_with_auth(request, &Auth::Token(token))
+                }
+            }
+            _ => {
+                let query_params = self.query_params_for_auth(request.command.as_str(), auth)?;
+                self.execute_with_query_params(request, query_params)
+            }
+        }
+    }
+
+    fn execute_with_query_params(
+        &self,
+        request: &CommandRequest,
+        query_params: Vec<(&'static str, String)>,
+    ) -> AppResult<CommandResponse> {
         let api_url = self.api_url()?;
-        let query_params = self.query_params_for_auth(request.command.as_str(), auth)?;
         let request_body = build_request_body(request);
 
         let http_client = self.http_client()?;
@@ -190,8 +241,10 @@ impl Client {
                         "user/password auth requires non-empty credentials",
                     ));
                 }
-                params.push(("user", user.clone()));
-                params.push(("password", password.clone()));
+                return Err(AppError::new(
+                    ErrorKind::InvalidInput,
+                    "user/password auth must be exchanged through Login before issuing commands",
+                ));
             }
             Auth::Token(token) => {
                 if token.trim().is_empty() {
@@ -222,7 +275,8 @@ impl Client {
 }
 
 fn looks_like_authentication_failure(body: &str) -> bool {
-    if body.to_ascii_lowercase().contains("please login first") {
+    let normalized = body.to_ascii_lowercase();
+    if normalized.contains("please login first") || normalized.contains("login failed") {
         return true;
     }
 
@@ -230,7 +284,95 @@ fn looks_like_authentication_failure(body: &str) -> bool {
         return false;
     };
 
-    contains_rsp_code(&parsed, -6)
+    contains_rsp_code(&parsed, -6) || contains_rsp_code(&parsed, -7)
+}
+
+fn extract_login_token(raw_json: &str) -> AppResult<String> {
+    let parsed: Value = serde_json::from_str(raw_json).map_err(|error| {
+        AppError::new(
+            ErrorKind::UnexpectedResponse,
+            format!("failed to parse Login response JSON: {error}"),
+        )
+    })?;
+
+    let item = response_item(&parsed)?;
+    ensure_success_code(item, CgiCommand::Login)?;
+
+    find_token(item).ok_or_else(|| {
+        AppError::new(
+            ErrorKind::UnexpectedResponse,
+            "Login succeeded but token was not found in response",
+        )
+    })
+}
+
+fn response_item(value: &Value) -> AppResult<&Value> {
+    match value {
+        Value::Array(items) => items.first().ok_or_else(|| {
+            AppError::new(ErrorKind::UnexpectedResponse, "response array was empty")
+        }),
+        _ => Ok(value),
+    }
+}
+
+fn ensure_success_code(item: &Value, command: CgiCommand) -> AppResult<()> {
+    if let Some(code) = read_code(item)
+        && code != 0
+    {
+        return Err(AppError::new(
+            ErrorKind::Authentication,
+            format!("{} returned non-zero code: {code}", command.as_str()),
+        ));
+    }
+
+    Ok(())
+}
+
+fn read_code(item: &Value) -> Option<i64> {
+    let value = item.get("code")?;
+
+    if let Some(code) = value.as_i64() {
+        return Some(code);
+    }
+
+    if let Some(code) = value.as_u64() {
+        return i64::try_from(code).ok();
+    }
+
+    value.as_str()?.parse::<i64>().ok()
+}
+
+fn find_token(item: &Value) -> Option<String> {
+    const CANDIDATE_PATHS: &[&[&str]] = &[
+        &["value", "Token", "name"],
+        &["value", "Token", "token"],
+        &["value", "token"],
+        &["value", "Token"],
+        &["Token", "name"],
+        &["Token", "token"],
+        &["token"],
+        &["Token"],
+    ];
+
+    for path in CANDIDATE_PATHS {
+        if let Some(token) = value_at_path(item, path).and_then(non_empty_str) {
+            return Some(token.to_string());
+        }
+    }
+
+    None
+}
+
+fn value_at_path<'a>(value: &'a Value, path: &[&str]) -> Option<&'a Value> {
+    let mut current = value;
+    for key in path {
+        current = current.get(*key)?;
+    }
+    Some(current)
+}
+
+fn non_empty_str(value: &Value) -> Option<&str> {
+    value.as_str().filter(|text| !text.trim().is_empty())
 }
 
 fn contains_rsp_code(value: &Value, target: i64) -> bool {
