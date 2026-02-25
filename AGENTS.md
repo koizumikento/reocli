@@ -89,7 +89,14 @@ cargo doc --no-deps
 - For each `unsafe` block, document the safety invariant and why it holds.
 - Keep `unsafe` scope as small as possible.
 
-## 10) Definition of Done (Agent Checklist)
+## 10) Configuration and Environment Variable Policy
+
+- Environment variable resolution must be centralized in a shared module (for example `runtime` or `config`), not duplicated across CLI/MCP handlers.
+- Avoid scattering `std::env::var` calls in multiple adapters; use shared helper functions instead.
+- Keep precedence rules explicit and documented (for example: token > user/password > anonymous).
+- Preserve backward compatibility for existing environment variable names unless a migration is explicitly planned.
+
+## 11) Definition of Done (Agent Checklist)
 
 - Code compiles (`cargo check`).
 - Formatting passes (`cargo fmt --check` path).

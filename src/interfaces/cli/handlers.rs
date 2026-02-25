@@ -2,14 +2,11 @@ use crate::app::preflight::run_preflight;
 use crate::app::usecases;
 use crate::core::error::AppResult;
 use crate::interfaces::cli::args::{CliCommand, help_text, parse_args};
-use crate::reolink::client::{Auth, Client};
-
-const DEFAULT_ENDPOINT: &str = "https://camera.local";
+use crate::interfaces::runtime::client_from_env;
 
 pub fn run(args: &[String]) -> AppResult<String> {
     let command = parse_args(args)?;
-    let (primary_auth, fallback_auth) = auth_from_env();
-    let client = build_client(primary_auth, fallback_auth);
+    let client = client_from_env();
 
     match command {
         CliCommand::Help => Ok(help_text().to_string()),
@@ -70,40 +67,5 @@ pub fn run(args: &[String]) -> AppResult<String> {
                 report.supported_commands.len()
             ))
         }
-    }
-}
-
-fn endpoint_from_env() -> String {
-    std::env::var("REOCLI_ENDPOINT").unwrap_or_else(|_| DEFAULT_ENDPOINT.to_string())
-}
-
-fn build_client(primary_auth: Auth, fallback_auth: Option<Auth>) -> Client {
-    let client = Client::new(endpoint_from_env(), primary_auth);
-    match fallback_auth {
-        Some(auth) => client.with_fallback_auth(auth),
-        None => client,
-    }
-}
-
-fn auth_from_env() -> (Auth, Option<Auth>) {
-    let fallback_auth = match (
-        std::env::var("REOCLI_USER"),
-        std::env::var("REOCLI_PASSWORD"),
-    ) {
-        (Ok(user), Ok(password)) if !user.trim().is_empty() && !password.is_empty() => {
-            Some(Auth::UserPassword { user, password })
-        }
-        _ => None,
-    };
-
-    if let Ok(token) = std::env::var("REOCLI_TOKEN") {
-        if !token.trim().is_empty() {
-            return (Auth::Token(token), fallback_auth);
-        }
-    }
-
-    match fallback_auth {
-        Some(user_password_auth) => (user_password_auth, None),
-        None => (Auth::Anonymous, None),
     }
 }
