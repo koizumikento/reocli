@@ -1,3 +1,5 @@
+use serde::{Deserialize, Serialize};
+
 use crate::core::command::CgiCommand;
 use crate::core::error::{AppError, AppResult, ErrorKind};
 
@@ -172,4 +174,53 @@ impl PtzStatus {
             || !self.enabled_presets.is_empty()
             || self.calibration_state.is_some()
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct AbsolutePose {
+    pub pan_deg: f64,
+    pub tilt_deg: f64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Default, Serialize, Deserialize)]
+pub struct AxisModelParams {
+    pub alpha: f64,
+    pub beta: f64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct AxisState {
+    pub position: f64,
+    pub velocity: f64,
+    pub bias: f64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct AxisEstimate {
+    pub state: AxisState,
+    pub measured_position: f64,
+}
+
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+pub struct CalibrationParams {
+    pub serial_number: String,
+    pub model: String,
+    pub firmware: String,
+    pub pan_offset: f64,
+    pub pan_scale: f64,
+    pub pan_deadband: f64,
+    pub tilt_offset: f64,
+    pub tilt_scale: f64,
+    pub tilt_deadband: f64,
+    pub pan_model: AxisModelParams,
+    pub tilt_model: AxisModelParams,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+pub struct CalibrationReport {
+    pub samples: usize,
+    pub pan_error_p95_deg: f64,
+    pub tilt_error_p95_deg: f64,
+    pub notes: String,
 }

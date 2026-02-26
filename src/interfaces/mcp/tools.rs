@@ -28,7 +28,7 @@ pub fn supported_tools() -> Vec<McpTool> {
         },
         McpTool {
             name: "reolink.get_ptz_status",
-            description: "Get PTZ orientation and movement ranges for a channel.",
+            description: "Get PTZ raw positions/ranges for a channel and calibrated degrees when available.",
         },
         McpTool {
             name: "reolink.get_time",
@@ -57,6 +57,18 @@ pub fn supported_tools() -> Vec<McpTool> {
         McpTool {
             name: "reolink.ptz_preset_goto",
             description: "Move PTZ to a preset ID.",
+        },
+        McpTool {
+            name: "reolink.ptz_calibrate_auto",
+            description: "Run PTZ auto calibration and return calibration/report summary.",
+        },
+        McpTool {
+            name: "reolink.ptz_set_absolute",
+            description: "Move PTZ to an absolute pan/tilt target.",
+        },
+        McpTool {
+            name: "reolink.ptz_get_absolute",
+            description: "Get current PTZ absolute pan/tilt position.",
         },
     ]
 }

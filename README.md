@@ -37,9 +37,12 @@ Rust ベースの Reolink CLI/MCP 実験用プロジェクトです。
 - `reocli ptz stop [--channel <0-255>]`
 - `reocli ptz preset list [--channel <0-255>]`
 - `reocli ptz preset goto <preset_id> [--channel <0-255>]`
+- `reocli ptz calibrate auto [--channel <0-255>]`
+- `reocli ptz set-absolute <pan_deg> <tilt_deg> [--tol-deg <f64>] [--timeout-ms <u64>] [--channel <0-255>]`
+- `reocli ptz get-absolute [--channel <0-255>]`
 - `reocli preflight [user]`
 
-`snap` と `ptz` 系コマンドは実行前に `GetAbility` でサポート確認し、未対応なら `UnsupportedCommand` で失敗します。
+`snap` と PTZ 制御系コマンド（`move` / `stop` / `preset goto` / `calibrate auto` / `set-absolute`）は実行前に `GetAbility` でサポート確認し、未対応なら `UnsupportedCommand` で失敗します。
 
 ## Implemented MCP Tools
 
@@ -56,6 +59,9 @@ Rust ベースの Reolink CLI/MCP 実験用プロジェクトです。
 - `reolink.ptz_stop`
 - `reolink.ptz_preset_list`
 - `reolink.ptz_preset_goto`
+- `reolink.ptz_calibrate_auto`
+- `reolink.ptz_set_absolute`
+- `reolink.ptz_get_absolute`
 
 ## Examples
 
@@ -76,6 +82,16 @@ reocli ptz move left --speed 6 --duration 300 --channel 0
 reocli ptz stop --channel 0
 reocli ptz preset list --channel 0
 reocli ptz preset goto 7 --channel 0
+reocli ptz calibrate auto --channel 0
+reocli ptz set-absolute 30.0 -10.0 --tol-deg 0.8 --timeout-ms 4000 --channel 0
+reocli ptz get-absolute --channel 0
+```
+
+```bash
+# MCP
+reocli-mcp reolink.ptz_calibrate_auto 0
+reocli-mcp reolink.ptz_set_absolute 0 30.0 -10.0 0.8 4000
+reocli-mcp reolink.ptz_get_absolute 0
 ```
 
 ## Testing
@@ -94,3 +110,9 @@ REOCLI_ENDPOINT=https://<camera-host> \
 REOCLI_TOKEN=<token> \
 cargo test --test live_smoke -- --nocapture
 ```
+
+## PTZ EKF State Persistence
+
+- `reocli ptz set-absolute ...` は、EKF の内部状態（pan/tilt の状態・共分散・直前制御入力）を
+  校正ファイルと同じディレクトリに `*.ch<channel>.ekf.json` として永続化します。
+- 次回 `set-absolute` 実行時は同ファイルを読み込み、同じ校正ファイルに紐づく状態を再利用します。

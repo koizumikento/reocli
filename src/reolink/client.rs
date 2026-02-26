@@ -1,3 +1,4 @@
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use reqwest::{StatusCode, blocking::Client as HttpClient};
@@ -14,12 +15,13 @@ pub enum Auth {
     Token(String),
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub struct Client {
     endpoint: String,
     auth: Auth,
     fallback_auth: Option<Auth>,
     allow_insecure_tls: bool,
+    session_token: Arc<Mutex<Option<String>>>,
 }
 
 impl Client {
@@ -29,6 +31,7 @@ impl Client {
             auth,
             fallback_auth: None,
             allow_insecure_tls: true,
+            session_token: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -46,6 +49,7 @@ impl Client {
             auth,
             fallback_auth: self.fallback_auth.clone(),
             allow_insecure_tls: self.allow_insecure_tls,
+            session_token: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -55,6 +59,7 @@ impl Client {
             auth: self.auth.clone(),
             fallback_auth: Some(fallback_auth),
             allow_insecure_tls: self.allow_insecure_tls,
+            session_token: Arc::clone(&self.session_token),
         }
     }
 
@@ -126,7 +131,18 @@ impl Client {
                         self.query_params_for_auth(request.command.as_str(), &Auth::Anonymous)?;
                     self.execute_with_query_params(request, query_params)
                 } else {
+                    if let Some(cached_token) = self.cached_session_token() {
+                        match self.execute_with_auth(request, &Auth::Token(cached_token)) {
+                            Ok(response) => return Ok(response),
+                            Err(error) if matches!(error.kind, ErrorKind::Authentication) => {
+                                self.clear_session_token();
+                            }
+                            Err(error) => return Err(error),
+                        }
+                    }
+
                     let token = self.login(user, password)?;
+                    self.set_session_token(token.clone());
                     self.execute_with_auth(request, &Auth::Token(token))
                 }
             }
@@ -272,7 +288,37 @@ impl Client {
                 )
             })
     }
+
+    fn cached_session_token(&self) -> Option<String> {
+        self.session_token
+            .lock()
+            .ok()
+            .and_then(|guard| guard.clone())
+    }
+
+    fn set_session_token(&self, token: String) {
+        if let Ok(mut guard) = self.session_token.lock() {
+            *guard = Some(token);
+        }
+    }
+
+    fn clear_session_token(&self) {
+        if let Ok(mut guard) = self.session_token.lock() {
+            *guard = None;
+        }
+    }
 }
+
+impl PartialEq for Client {
+    fn eq(&self, other: &Self) -> bool {
+        self.endpoint == other.endpoint
+            && self.auth == other.auth
+            && self.fallback_auth == other.fallback_auth
+            && self.allow_insecure_tls == other.allow_insecure_tls
+    }
+}
+
+impl Eq for Client {}
 
 fn looks_like_authentication_failure(body: &str) -> bool {
     let normalized = body.to_ascii_lowercase();

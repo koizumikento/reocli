@@ -175,6 +175,8 @@ fn reocli_get_ptz_status_works() {
     assert!(stdout.contains("channel=1"));
     assert!(stdout.contains("pan=1200"));
     assert!(stdout.contains("tilt=-80"));
+    assert!(stdout.contains("pan_deg=unknown"));
+    assert!(stdout.contains("tilt_deg=unknown"));
 }
 
 #[test]
@@ -319,6 +321,94 @@ fn reocli_ptz_preset_list_works() {
     assert!(stdout.contains("presets=[7:Home]"));
 }
 
+#[test]
+fn reocli_ptz_calibrate_auto_works() {
+    let mut server = Server::new();
+    setup_ptz_absolute_mocks(&mut server);
+    let calibration_dir = unique_temp_dir("cli-ptz-calibrate");
+    cleanup_output_dir(&calibration_dir);
+
+    let output = Command::new(env!("CARGO_BIN_EXE_reocli"))
+        .arg("ptz")
+        .arg("calibrate")
+        .arg("auto")
+        .arg("--channel")
+        .arg("0")
+        .env("REOCLI_ENDPOINT", server.url())
+        .env("REOCLI_CALIBRATION_DIR", &calibration_dir)
+        .output()
+        .expect("failed to run reocli ptz calibrate auto");
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("operation=calibrate_auto"));
+    cleanup_output_dir(&calibration_dir);
+}
+
+#[test]
+fn reocli_ptz_set_absolute_works() {
+    let mut server = Server::new();
+    setup_ptz_absolute_mocks(&mut server);
+    let calibration_dir = unique_temp_dir("cli-ptz-set-absolute");
+    cleanup_output_dir(&calibration_dir);
+
+    let output = Command::new(env!("CARGO_BIN_EXE_reocli"))
+        .arg("ptz")
+        .arg("set-absolute")
+        .arg("30.0")
+        .arg("-10.0")
+        .arg("--tol-deg")
+        .arg("0.8")
+        .arg("--timeout-ms")
+        .arg("4000")
+        .arg("--channel")
+        .arg("0")
+        .env("REOCLI_ENDPOINT", server.url())
+        .env("REOCLI_CALIBRATION_DIR", &calibration_dir)
+        .output()
+        .expect("failed to run reocli ptz set-absolute");
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("operation=set_absolute"));
+    cleanup_output_dir(&calibration_dir);
+}
+
+#[test]
+fn reocli_ptz_get_absolute_works() {
+    let mut server = Server::new();
+    setup_ptz_absolute_mocks(&mut server);
+    let calibration_dir = unique_temp_dir("cli-ptz-get-absolute");
+    cleanup_output_dir(&calibration_dir);
+
+    let calibrate_output = Command::new(env!("CARGO_BIN_EXE_reocli"))
+        .arg("ptz")
+        .arg("calibrate")
+        .arg("auto")
+        .arg("--channel")
+        .arg("0")
+        .env("REOCLI_ENDPOINT", server.url())
+        .env("REOCLI_CALIBRATION_DIR", &calibration_dir)
+        .output()
+        .expect("failed to run reocli ptz calibrate auto setup");
+    assert!(calibrate_output.status.success());
+
+    let output = Command::new(env!("CARGO_BIN_EXE_reocli"))
+        .arg("ptz")
+        .arg("get-absolute")
+        .arg("--channel")
+        .arg("0")
+        .env("REOCLI_ENDPOINT", server.url())
+        .env("REOCLI_CALIBRATION_DIR", &calibration_dir)
+        .output()
+        .expect("failed to run reocli ptz get-absolute");
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("operation=get_absolute"));
+    cleanup_output_dir(&calibration_dir);
+}
+
 fn unique_temp_file_path(prefix: &str, file_name: &str) -> PathBuf {
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -335,5 +425,113 @@ fn cleanup_output_file(path: &Path) {
     }
     if let Some(parent) = path.parent() {
         let _ = fs::remove_dir_all(parent);
+    }
+}
+
+fn setup_ptz_absolute_mocks(server: &mut Server) {
+    let _ability_mock = server
+        .mock("POST", "/cgi-bin/api.cgi")
+        .match_query(Matcher::UrlEncoded(
+            "cmd".to_string(),
+            "GetAbility".to_string(),
+        ))
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(
+            r#"[{"cmd":"GetAbility","code":0,"value":{"Ability":{"GetDevInfo":{"permit":1},"GetPtzCurPos":{"permit":1},"GetPtzCheckState":{"permit":1},"PtzCtrl":{"permit":1}}}}]"#,
+        )
+        .create();
+    let _dev_info_mock = server
+        .mock("POST", "/cgi-bin/api.cgi")
+        .match_query(Matcher::UrlEncoded(
+            "cmd".to_string(),
+            "GetDevInfo".to_string(),
+        ))
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(
+            r#"[{"cmd":"GetDevInfo","code":0,"value":{"DevInfo":{"name":"RLC-823A","firmVer":"v3.0.0","serial":"ABC123"}}}]"#,
+        )
+        .create();
+    let _cur_pos_mock = server
+        .mock("POST", "/cgi-bin/api.cgi")
+        .match_query(Matcher::UrlEncoded(
+            "cmd".to_string(),
+            "GetPtzCurPos".to_string(),
+        ))
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(
+            r#"[{"cmd":"GetPtzCurPos","code":0,"value":{"PtzCurPos":{"channel":0,"Ppos":1200,"Tpos":-80}}}]"#,
+        )
+        .expect(1)
+        .create();
+    let _cur_pos_after_move_mock = server
+        .mock("POST", "/cgi-bin/api.cgi")
+        .match_query(Matcher::UrlEncoded(
+            "cmd".to_string(),
+            "GetPtzCurPos".to_string(),
+        ))
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(
+            r#"[{"cmd":"GetPtzCurPos","code":0,"value":{"PtzCurPos":{"channel":0,"Ppos":1500,"Tpos":-180}}}]"#,
+        )
+        .create();
+    let _zoom_focus_mock = server
+        .mock("POST", "/cgi-bin/api.cgi")
+        .match_query(Matcher::UrlEncoded(
+            "cmd".to_string(),
+            "GetZoomFocus".to_string(),
+        ))
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(r#"[{"cmd":"GetZoomFocus","code":1}]"#)
+        .create();
+    let _preset_mock = server
+        .mock("POST", "/cgi-bin/api.cgi")
+        .match_query(Matcher::UrlEncoded(
+            "cmd".to_string(),
+            "GetPtzPreset".to_string(),
+        ))
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(r#"[{"cmd":"GetPtzPreset","code":1}]"#)
+        .create();
+    let _check_mock = server
+        .mock("POST", "/cgi-bin/api.cgi")
+        .match_query(Matcher::UrlEncoded(
+            "cmd".to_string(),
+            "GetPtzCheckState".to_string(),
+        ))
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(
+            r#"[{"cmd":"GetPtzCheckState","code":0,"value":{"PtzCheckState":{"channel":0,"state":2}}}]"#,
+        )
+        .create();
+    let _ptz_ctrl_mock = server
+        .mock("POST", "/cgi-bin/api.cgi")
+        .match_query(Matcher::UrlEncoded(
+            "cmd".to_string(),
+            "PtzCtrl".to_string(),
+        ))
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(r#"[{"cmd":"PtzCtrl","code":0}]"#)
+        .create();
+}
+
+fn unique_temp_dir(prefix: &str) -> PathBuf {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    std::env::temp_dir().join(format!("reocli-{prefix}-{now}-{}", std::process::id()))
+}
+
+fn cleanup_output_dir(path: &Path) {
+    if path.exists() {
+        let _ = fs::remove_dir_all(path);
     }
 }

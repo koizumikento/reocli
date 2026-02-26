@@ -49,7 +49,8 @@ pub fn run(args: &[String]) -> AppResult<String> {
             ))
         }
         CliCommand::GetPtzStatus { channel } => {
-            let status = usecases::get_ptz_status::execute(&client, channel)?;
+            let status_view = usecases::get_ptz_status::execute(&client, channel)?;
+            let status = &status_view.status;
             let presets = if status.enabled_presets.is_empty() {
                 "[]".to_string()
             } else {
@@ -64,10 +65,12 @@ pub fn run(args: &[String]) -> AppResult<String> {
                 )
             };
             Ok(format!(
-                "channel={}; pan={}; tilt={}; zoom={}; focus={}; pan_range={}; tilt_range={}; zoom_range={}; focus_range={}; preset_range={}; enabled_presets={}; calibration_state={}; calibrated={}",
+                "channel={}; pan={}; tilt={}; pan_deg={}; tilt_deg={}; zoom={}; focus={}; pan_range={}; tilt_range={}; zoom_range={}; focus_range={}; preset_range={}; enabled_presets={}; calibration_state={}; calibrated={}; calibration_path={}",
                 status.channel,
                 format_optional_i64(status.pan_position),
                 format_optional_i64(status.tilt_position),
+                format_optional_f64(status_view.pan_deg),
+                format_optional_f64(status_view.tilt_deg),
                 format_optional_i64(status.zoom_position),
                 format_optional_i64(status.focus_position),
                 format_optional_range(status.pan_range.as_ref()),
@@ -78,6 +81,7 @@ pub fn run(args: &[String]) -> AppResult<String> {
                 presets,
                 format_optional_i64(status.calibration_state),
                 format_optional_bool(status.calibrated()),
+                format_optional_string(status_view.calibration_path.as_deref()),
             ))
         }
         CliCommand::GetTime => {
@@ -146,6 +150,46 @@ pub fn run(args: &[String]) -> AppResult<String> {
                 "channel={channel}; operation=preset_goto; preset_id={preset_id}"
             ))
         }
+        CliCommand::PtzCalibrateAuto { channel } => {
+            ensure_command_supported(&client, CgiCommand::PtzCtrl)?;
+            let result = usecases::ptz_calibrate_auto::execute(&client, channel)?;
+            Ok(format!(
+                "channel={channel}; operation=calibrate_auto; camera_key={}; calibration_path={}; reused_existing={}; calibrated={}; model={}; firmware={}; samples={}; pan_error_p95_deg={}; tilt_error_p95_deg={}; notes={}",
+                result.camera_key,
+                result.calibration_path,
+                result.reused_existing,
+                format_optional_bool(result.calibrated_state),
+                result.calibration.model,
+                result.calibration.firmware,
+                result.report.samples,
+                result.report.pan_error_p95_deg,
+                result.report.tilt_error_p95_deg,
+                result.report.notes,
+            ))
+        }
+        CliCommand::PtzSetAbsolute {
+            channel,
+            pan_deg,
+            tilt_deg,
+            tol_deg,
+            timeout_ms,
+        } => {
+            ensure_command_supported(&client, CgiCommand::PtzCtrl)?;
+            let pose = usecases::ptz_set_absolute::execute(
+                &client, channel, pan_deg, tilt_deg, tol_deg, timeout_ms,
+            )?;
+            Ok(format!(
+                "channel={channel}; operation=set_absolute; pan_deg={}; tilt_deg={}; calibration_path={}; tol_deg={tol_deg}; timeout_ms={timeout_ms}",
+                pose.pan_deg, pose.tilt_deg, pose.calibration_path
+            ))
+        }
+        CliCommand::PtzGetAbsolute { channel } => {
+            let pose = usecases::ptz_get_absolute::execute(&client, channel)?;
+            Ok(format!(
+                "channel={channel}; operation=get_absolute; pan_deg={}; tilt_deg={}; calibration_path={}",
+                pose.pan_deg, pose.tilt_deg, pose.calibration_path
+            ))
+        }
         CliCommand::Preflight { user_name } => {
             let report = run_preflight(&client, &user_name)?;
             Ok(format!(
@@ -172,6 +216,18 @@ fn format_optional_bool(value: Option<bool>) -> String {
 fn format_optional_range(range: Option<&NumericRange>) -> String {
     range
         .map(|bounds| format!("{}..{}", bounds.min, bounds.max))
+        .unwrap_or_else(|| "unknown".to_string())
+}
+
+fn format_optional_f64(value: Option<f64>) -> String {
+    value
+        .map(|raw| format!("{raw:.6}"))
+        .unwrap_or_else(|| "unknown".to_string())
+}
+
+fn format_optional_string(value: Option<&str>) -> String {
+    value
+        .map(|raw| raw.to_string())
         .unwrap_or_else(|| "unknown".to_string())
 }
 

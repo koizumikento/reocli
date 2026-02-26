@@ -226,19 +226,25 @@ fn parse_enabled_string(text: &str) -> Option<bool> {
 
 fn command_from_name(name: &str) -> Option<CgiCommand> {
     match name {
-        "GetAbility" => Some(CgiCommand::GetAbility),
-        "GetDevInfo" => Some(CgiCommand::GetDevInfo),
-        "Snap" => Some(CgiCommand::Snap),
-        "GetChannelStatus" | "GetChannelstatus" => Some(CgiCommand::GetChannelStatus),
-        "GetPtzCurPos" => Some(CgiCommand::GetPtzCurPos),
-        "GetPtzPreset" => Some(CgiCommand::GetPtzPreset),
-        "GetPtzCheckState" => Some(CgiCommand::GetPtzCheckState),
-        "PtzCtrl" => Some(CgiCommand::PtzCtrl),
-        "GetZoomFocus" => Some(CgiCommand::GetZoomFocus),
-        "GetTime" => Some(CgiCommand::GetTime),
+        "GetAbility" | "ability" => Some(CgiCommand::GetAbility),
+        "GetDevInfo" | "devInfo" => Some(CgiCommand::GetDevInfo),
+        "Snap" | "snap" => Some(CgiCommand::Snap),
+        "GetChannelStatus" | "GetChannelstatus" | "channelStatus" => {
+            Some(CgiCommand::GetChannelStatus)
+        }
+        "GetPtzCurPos" | "ptzCurPos" => Some(CgiCommand::GetPtzCurPos),
+        "GetPtzPreset" | "ptzPreset" => Some(CgiCommand::GetPtzPreset),
+        "GetPtzCheckState" | "ptzCheckState" | "supportPtzCheck" => {
+            Some(CgiCommand::GetPtzCheckState)
+        }
+        "PtzCtrl" | "ptzCtrl" => Some(CgiCommand::PtzCtrl),
+        "GetZoomFocus" | "zoomFocus" | "supportZoom" | "supportFocus" => {
+            Some(CgiCommand::GetZoomFocus)
+        }
+        "GetTime" | "time" => Some(CgiCommand::GetTime),
         "SetTime" => Some(CgiCommand::SetTime),
-        "GetNetwork" => Some(CgiCommand::GetNetwork),
-        "GetUserAuth" => Some(CgiCommand::GetUserAuth),
+        "GetNetwork" | "network" => Some(CgiCommand::GetNetwork),
+        "GetUserAuth" | "userAuth" => Some(CgiCommand::GetUserAuth),
         _ => None,
     }
 }

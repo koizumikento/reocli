@@ -86,6 +86,18 @@
   - `reolink.ptz_set_absolute`
   - `reolink.ptz_get_absolute`
 
+CLI 例:
+
+- `reocli ptz calibrate auto --channel 0`
+- `reocli ptz set-absolute 30.0 -10.0 --tol-deg 0.8 --timeout-ms 4000 --channel 0`
+- `reocli ptz get-absolute --channel 0`
+
+MCP 例:
+
+- `reocli-mcp reolink.ptz_calibrate_auto 0`
+- `reocli-mcp reolink.ptz_set_absolute 0 30.0 -10.0 0.8 4000`
+- `reocli-mcp reolink.ptz_get_absolute 0`
+
 ### 6.2 制御ループ
 
 1. 目標 `(pan_deg, tilt_deg)` を校正写像 `f^{-1}` で内部座標へ変換
@@ -155,4 +167,3 @@
   - https://support.reolink.com/hc/en-us/articles/34512745835289-Introduction-to-PTZ-Camera-Calibration/
 - Reolink サポート: Modify Monitor Point（PTZ 校正中は操作不可の注意）
   - https://support.reolink.com/hc/en-us/articles/360008718814-How-to-Set-up-Monitor-Point-via-Reolink-App/
-

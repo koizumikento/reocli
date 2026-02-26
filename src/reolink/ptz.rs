@@ -91,6 +91,25 @@ pub fn get_ptz_status(client: &Client, channel: u8) -> AppResult<PtzStatus> {
     Ok(status)
 }
 
+pub fn get_ptz_cur_pos(client: &Client, channel: u8) -> AppResult<PtzStatus> {
+    let command_payload =
+        execute_required_command(client, build_request(CgiCommand::GetPtzCurPos, channel))?;
+    let mut status = PtzStatus {
+        channel,
+        ..PtzStatus::default()
+    };
+    apply_cur_pos_payload(&command_payload, channel, &mut status);
+
+    if status.pan_position.is_none() && status.tilt_position.is_none() {
+        return Err(AppError::new(
+            ErrorKind::UnexpectedResponse,
+            format!("GetPtzCurPos response missing pan/tilt values for channel {channel}"),
+        ));
+    }
+
+    Ok(status)
+}
+
 fn execute_ptz_ctrl(
     client: &Client,
     channel: u8,
