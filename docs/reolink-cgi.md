@@ -83,4 +83,21 @@ https://<USER>:<PASSWORD>@<IP>/cgi-bin/api.cgi?cmd=Snap&channel=0&rs=flsYJfZgM6R
 
 ---
 
-必要になったら次段で、`GetUserAuth` による token 取得フローや、よく使う `cmd`（`GetTime`/`SetTime`/`GetChannelstatus` など）を別ページで拡張する。
+## 6. `reocli` 実装済みコマンド（2026-02-26 時点）
+
+- 認証/能力
+  - `GetUserAuth` / `GetAbility`
+- デバイス/時刻/チャネル
+  - `GetDevInfo`
+  - `GetChannelStatus`
+  - `GetTime` / `SetTime`（入力は RFC3339 形式を検証）
+- スナップショット
+  - `Snap`（保存先指定可。`snapshots/channel-<n>.jpg` 既定）
+- PTZ
+  - 状態: `GetPtzCurPos`, `GetZoomFocus`, `GetPtzPreset`, `GetPtzCheckState`
+  - 制御: `PtzCtrl`（move/stop/preset goto）
+
+## 7. 既知の機種差分メモ
+
+- `GetAbility` の結果は機種・FWで差があるため、`snap` と `ptz` 実行前に対応可否をガードしている。
+- `GetChannelStatus` は機種によりレスポンスキー名差分（`channel/channelId/channelNo`, `online/status/state`）があるため、実装側で吸収している。

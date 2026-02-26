@@ -17,6 +17,14 @@ pub(crate) fn client_from_env() -> Client {
     }
 }
 
+pub(crate) fn ability_user_from_env() -> String {
+    std::env::var(USER_ENV)
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| DEFAULT_USER.to_string())
+}
+
 fn endpoint_from_env() -> String {
     std::env::var(ENDPOINT_ENV).unwrap_or_else(|_| DEFAULT_ENDPOINT.to_string())
 }

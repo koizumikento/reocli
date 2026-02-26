@@ -40,7 +40,23 @@ pub fn supported_tools() -> Vec<McpTool> {
         },
         McpTool {
             name: "reolink.snap",
-            description: "Capture a snapshot for a channel.",
+            description: "Capture a snapshot for a channel and save it.",
+        },
+        McpTool {
+            name: "reolink.ptz_move",
+            description: "Move PTZ direction with speed and optional duration.",
+        },
+        McpTool {
+            name: "reolink.ptz_stop",
+            description: "Stop PTZ movement immediately.",
+        },
+        McpTool {
+            name: "reolink.ptz_preset_list",
+            description: "List enabled PTZ presets.",
+        },
+        McpTool {
+            name: "reolink.ptz_preset_goto",
+            description: "Move PTZ to a preset ID.",
         },
     ]
 }

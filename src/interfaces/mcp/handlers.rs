@@ -1,6 +1,8 @@
 use crate::app::usecases;
+use crate::core::command::CgiCommand;
 use crate::core::error::{AppError, AppResult, ErrorKind};
-use crate::interfaces::runtime::client_from_env;
+use crate::core::model::PtzDirection;
+use crate::interfaces::runtime::{ability_user_from_env, client_from_env};
 use serde_json::{Value, json};
 
 use super::tools::supported_tools;
@@ -46,13 +48,16 @@ pub fn handle_request(request: McpRequest) -> AppResult<String> {
             }))
         }
         "reolink.get_dev_info" => {
+            ensure_command_supported(&client, CgiCommand::GetDevInfo)?;
             let info = usecases::get_dev_info::execute(&client)?;
             json_response(json!({
                 "model": info.model,
-                "firmware": info.firmware
+                "firmware": info.firmware,
+                "serial": info.serial_number
             }))
         }
         "reolink.get_channel_status" => {
+            ensure_command_supported(&client, CgiCommand::GetChannelStatus)?;
             let channel = parse_channel(&request.arguments)?;
             let status = usecases::get_channel_status::execute(&client, channel)?;
             json_response(json!({
@@ -80,21 +85,60 @@ pub fn handle_request(request: McpRequest) -> AppResult<String> {
             }))
         }
         "reolink.get_time" => {
+            ensure_command_supported(&client, CgiCommand::GetTime)?;
             let time = usecases::get_time::execute(&client)?;
             json_response(json!({ "time": time.iso8601 }))
         }
         "reolink.set_time" => {
+            ensure_command_supported(&client, CgiCommand::SetTime)?;
             let iso8601 = parse_iso8601(&request.arguments)?;
             let updated = usecases::set_time::execute(&client, &iso8601)?;
             json_response(json!({ "time": updated.iso8601 }))
         }
         "reolink.snap" => {
-            let channel = parse_channel(&request.arguments)?;
-            let snapshot = usecases::snap::execute(&client, channel)?;
+            ensure_command_supported(&client, CgiCommand::Snap)?;
+            let (channel, out_path) = parse_snap_args(&request.arguments)?;
+            let snapshot =
+                usecases::snap::execute_with_out_path(&client, channel, out_path.as_deref())?;
             json_response(json!({
                 "channel": snapshot.channel,
-                "image_path": snapshot.image_path
+                "image_path": snapshot.image_path,
+                "bytes_written": snapshot.bytes_written
             }))
+        }
+        "reolink.ptz_move" => {
+            ensure_command_supported(&client, CgiCommand::PtzCtrl)?;
+            let (channel, direction, speed, duration_ms) = parse_ptz_move_args(&request.arguments)?;
+            usecases::ptz_move::execute(&client, channel, direction, speed, duration_ms)?;
+            json_response(json!({
+                "ok": true,
+                "channel": channel,
+                "direction": direction.as_op(),
+                "speed": speed,
+                "duration_ms": duration_ms
+            }))
+        }
+        "reolink.ptz_stop" => {
+            ensure_command_supported(&client, CgiCommand::PtzCtrl)?;
+            let channel = parse_channel(&request.arguments)?;
+            usecases::ptz_stop::execute(&client, channel)?;
+            json_response(json!({ "ok": true, "channel": channel }))
+        }
+        "reolink.ptz_preset_list" => {
+            ensure_command_supported(&client, CgiCommand::GetPtzPreset)?;
+            let channel = parse_channel(&request.arguments)?;
+            let presets = usecases::ptz_preset_list::execute(&client, channel)?;
+            let mapped = presets
+                .iter()
+                .map(|preset| json!({ "id": preset.id.value(), "name": preset.name }))
+                .collect::<Vec<_>>();
+            json_response(json!({ "channel": channel, "presets": mapped }))
+        }
+        "reolink.ptz_preset_goto" => {
+            ensure_command_supported(&client, CgiCommand::PtzCtrl)?;
+            let (channel, preset_id) = parse_ptz_preset_goto_args(&request.arguments)?;
+            usecases::ptz_preset_goto::execute(&client, channel, preset_id)?;
+            json_response(json!({ "ok": true, "channel": channel, "preset_id": preset_id }))
         }
         _ => Err(AppError::new(
             ErrorKind::UnsupportedCommand,
@@ -105,12 +149,7 @@ pub fn handle_request(request: McpRequest) -> AppResult<String> {
 
 fn parse_channel(arguments: &[String]) -> AppResult<u8> {
     match arguments.first() {
-        Some(raw) => raw.parse::<u8>().map_err(|_| {
-            AppError::new(
-                ErrorKind::InvalidInput,
-                "channel argument must be an integer between 0 and 255",
-            )
-        }),
+        Some(raw) => parse_u8(raw, "channel"),
         None => Ok(0),
     }
 }
@@ -138,6 +177,130 @@ fn parse_iso8601(arguments: &[String]) -> AppResult<String> {
             "reolink.set_time requires [iso8601]",
         )
     })
+}
+
+fn parse_snap_args(arguments: &[String]) -> AppResult<(u8, Option<String>)> {
+    match arguments.len() {
+        0 => Ok((0, None)),
+        1 => {
+            if let Ok(channel) = parse_u8(&arguments[0], "channel") {
+                Ok((channel, None))
+            } else {
+                Ok((0, Some(arguments[0].clone())))
+            }
+        }
+        2 => Ok((
+            parse_u8(&arguments[0], "channel")?,
+            Some(arguments[1].clone()),
+        )),
+        _ => Err(AppError::new(
+            ErrorKind::InvalidInput,
+            "reolink.snap accepts [channel] [out_path]",
+        )),
+    }
+}
+
+fn parse_ptz_move_args(arguments: &[String]) -> AppResult<(u8, PtzDirection, u8, Option<u64>)> {
+    let (channel, consumed_channel) = parse_optional_channel_prefix(arguments)?;
+    let direction_raw = arguments.get(consumed_channel).ok_or_else(|| {
+        AppError::new(
+            ErrorKind::InvalidInput,
+            "reolink.ptz_move requires [channel?] <direction> [speed] [duration_ms]",
+        )
+    })?;
+    let direction = PtzDirection::parse(direction_raw).ok_or_else(|| {
+        AppError::new(
+            ErrorKind::InvalidInput,
+            format!("unknown PTZ direction: {direction_raw}"),
+        )
+    })?;
+
+    let speed_index = consumed_channel + 1;
+    let speed = match arguments.get(speed_index) {
+        Some(raw) => parse_u8(raw, "speed")?,
+        None => 32,
+    };
+    let duration_index = speed_index + usize::from(arguments.get(speed_index).is_some());
+    let duration_ms = match arguments.get(duration_index) {
+        Some(raw) => Some(parse_u64(raw, "duration_ms")?),
+        None => None,
+    };
+    let consumed = duration_index + usize::from(arguments.get(duration_index).is_some());
+    if consumed != arguments.len() {
+        return Err(AppError::new(
+            ErrorKind::InvalidInput,
+            "reolink.ptz_move accepts [channel?] <direction> [speed] [duration_ms]",
+        ));
+    }
+
+    Ok((channel, direction, speed, duration_ms))
+}
+
+fn parse_ptz_preset_goto_args(arguments: &[String]) -> AppResult<(u8, u8)> {
+    let (channel, consumed_channel) = parse_optional_channel_prefix(arguments)?;
+    let preset_raw = arguments.get(consumed_channel).ok_or_else(|| {
+        AppError::new(
+            ErrorKind::InvalidInput,
+            "reolink.ptz_preset_goto requires [channel?] <preset_id>",
+        )
+    })?;
+    if arguments.len() != consumed_channel + 1 {
+        return Err(AppError::new(
+            ErrorKind::InvalidInput,
+            "reolink.ptz_preset_goto accepts [channel?] <preset_id>",
+        ));
+    }
+
+    Ok((channel, parse_u8(preset_raw, "preset_id")?))
+}
+
+fn parse_optional_channel_prefix(arguments: &[String]) -> AppResult<(u8, usize)> {
+    let Some(first) = arguments.first() else {
+        return Ok((0, 0));
+    };
+    if let Ok(channel) = parse_u8(first, "channel") {
+        Ok((channel, 1))
+    } else {
+        Ok((0, 0))
+    }
+}
+
+fn parse_u8(raw: &str, field: &str) -> AppResult<u8> {
+    raw.parse::<u8>().map_err(|_| {
+        AppError::new(
+            ErrorKind::InvalidInput,
+            format!("{field} must be an integer between 0 and 255"),
+        )
+    })
+}
+
+fn parse_u64(raw: &str, field: &str) -> AppResult<u64> {
+    raw.parse::<u64>().map_err(|_| {
+        AppError::new(
+            ErrorKind::InvalidInput,
+            format!("{field} must be a non-negative integer"),
+        )
+    })
+}
+
+fn ensure_command_supported(
+    client: &crate::reolink::client::Client,
+    command: CgiCommand,
+) -> AppResult<()> {
+    let user_name = ability_user_from_env();
+    let ability = usecases::get_ability::execute(client, &user_name)?;
+    if ability.supports(command) {
+        return Ok(());
+    }
+
+    Err(AppError::new(
+        ErrorKind::UnsupportedCommand,
+        format!(
+            "command {} is not supported by this camera (user={})",
+            command.as_str(),
+            ability.user_name
+        ),
+    ))
 }
 
 fn json_response(value: Value) -> AppResult<String> {

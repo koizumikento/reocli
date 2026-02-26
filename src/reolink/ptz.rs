@@ -1,9 +1,61 @@
+use std::thread;
+use std::time::Duration;
+
 use serde_json::{Value, json};
 
 use crate::core::command::{CgiCommand, CommandParams, CommandRequest};
 use crate::core::error::{AppError, AppResult, ErrorKind};
-use crate::core::model::{NumericRange, PtzStatus};
+use crate::core::model::{NumericRange, PresetId, PtzDirection, PtzPreset, PtzSpeed, PtzStatus};
 use crate::reolink::client::Client;
+
+pub fn move_ptz(
+    client: &Client,
+    channel: u8,
+    direction: PtzDirection,
+    speed: u8,
+    duration_ms: Option<u64>,
+) -> AppResult<()> {
+    let speed = PtzSpeed::new(speed)?;
+    execute_ptz_ctrl(
+        client,
+        channel,
+        direction.as_op(),
+        Some(speed.value()),
+        None,
+    )?;
+
+    if let Some(duration_ms) = duration_ms {
+        thread::sleep(Duration::from_millis(duration_ms));
+        stop_ptz(client, channel)?;
+    }
+
+    Ok(())
+}
+
+pub fn stop_ptz(client: &Client, channel: u8) -> AppResult<()> {
+    execute_ptz_ctrl(client, channel, "Stop", None, None)
+}
+
+pub fn list_presets(client: &Client, channel: u8) -> AppResult<Vec<PtzPreset>> {
+    let command_payload =
+        execute_required_command(client, build_request(CgiCommand::GetPtzPreset, channel))?;
+    let value_payload = command_payload
+        .get("value")
+        .and_then(|value| value.get("PtzPreset").or(Some(value)))
+        .unwrap_or(&command_payload);
+
+    let mut presets = Vec::new();
+    collect_enabled_presets(value_payload, channel, &mut presets);
+    presets.sort_by_key(|preset| preset.id.value());
+    presets.dedup_by_key(|preset| preset.id.value());
+
+    Ok(presets)
+}
+
+pub fn goto_preset(client: &Client, channel: u8, preset_id: u8) -> AppResult<()> {
+    let preset_id = PresetId::new(preset_id)?;
+    execute_ptz_ctrl(client, channel, "ToPos", None, Some(preset_id.value()))
+}
 
 pub fn get_ptz_status(client: &Client, channel: u8) -> AppResult<PtzStatus> {
     let cur_pos = execute_optional_command(client, CgiCommand::GetPtzCurPos, channel)?;
@@ -39,6 +91,54 @@ pub fn get_ptz_status(client: &Client, channel: u8) -> AppResult<PtzStatus> {
     Ok(status)
 }
 
+fn execute_ptz_ctrl(
+    client: &Client,
+    channel: u8,
+    op: &str,
+    speed: Option<u8>,
+    preset_id: Option<u8>,
+) -> AppResult<()> {
+    let mut payload = serde_json::Map::new();
+    payload.insert("op".to_string(), json!(op));
+    if let Some(speed) = speed {
+        payload.insert("speed".to_string(), json!(speed));
+    }
+    if let Some(preset_id) = preset_id {
+        payload.insert("id".to_string(), json!(preset_id));
+    }
+
+    let mut request = CommandRequest::new(CgiCommand::PtzCtrl);
+    request.params = CommandParams {
+        user_name: None,
+        channel: Some(channel),
+        payload: Some(Value::Object(payload).to_string()),
+    };
+    let _ = execute_required_command(client, request)?;
+
+    Ok(())
+}
+
+fn execute_required_command(client: &Client, request: CommandRequest) -> AppResult<Value> {
+    let command = request.command;
+    let response = client.execute(request)?;
+    let parsed = parse_response_json(&response.raw_json, command)?;
+    let command_payload = find_command_payload(&parsed, command).unwrap_or(&parsed);
+    let code = extract_code(command_payload).ok_or_else(|| {
+        AppError::new(
+            ErrorKind::UnexpectedResponse,
+            format!("{} response did not include result code", command.as_str()),
+        )
+    })?;
+    if code != 0 {
+        return Err(AppError::new(
+            ErrorKind::UnexpectedResponse,
+            format!("{} failed with code={code}", command.as_str()),
+        ));
+    }
+
+    Ok(command_payload.clone())
+}
+
 fn execute_optional_command(
     client: &Client,
     command: CgiCommand,
@@ -58,6 +158,33 @@ fn execute_optional_command(
     }
 
     Ok(Some(command_payload.clone()))
+}
+
+fn collect_enabled_presets(value: &Value, channel: u8, presets: &mut Vec<PtzPreset>) {
+    match value {
+        Value::Array(entries) => {
+            for entry in entries {
+                collect_enabled_presets(entry, channel, presets);
+            }
+        }
+        Value::Object(map) => {
+            let channel_matches =
+                !object_has_channel_identifier(map) || channel_matches_map(map, channel);
+            if channel_matches
+                && let (Some(id_raw), Some(enable_raw)) = (map.get("id"), map.get("enable"))
+                && parse_enabled(enable_raw).is_some_and(|enabled| enabled)
+                && let Some(id) = as_u8(id_raw).and_then(|raw| PresetId::new(raw).ok())
+            {
+                let name = map.get("name").and_then(value_to_non_empty_text);
+                presets.push(PtzPreset { id, name });
+            }
+
+            for nested in map.values() {
+                collect_enabled_presets(nested, channel, presets);
+            }
+        }
+        _ => {}
+    }
 }
 
 fn build_request(command: CgiCommand, channel: u8) -> CommandRequest {
@@ -408,6 +535,20 @@ fn as_u8(value: &Value) -> Option<u8> {
     match value {
         Value::Number(number) => number.as_u64().and_then(|raw| u8::try_from(raw).ok()),
         Value::String(text) => text.trim().parse::<u8>().ok(),
+        _ => None,
+    }
+}
+
+fn value_to_non_empty_text(value: &Value) -> Option<String> {
+    match value {
+        Value::String(text) => {
+            let normalized = text.trim();
+            if normalized.is_empty() {
+                None
+            } else {
+                Some(normalized.to_string())
+            }
+        }
         _ => None,
     }
 }

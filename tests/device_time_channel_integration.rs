@@ -174,3 +174,20 @@ fn get_channel_status_fails_when_requested_channel_is_missing() {
     assert_eq!(error.kind, ErrorKind::UnexpectedResponse);
     assert!(error.message.contains("missing online state"));
 }
+
+#[test]
+fn set_time_rejects_non_rfc3339_like_timestamp() {
+    let client = Client::new("http://camera.local", Auth::Anonymous);
+
+    for invalid_time in [
+        "2026-02-25 10:00:00Z",
+        "2026-13-25T10:00:00Z",
+        "2026-02-25T10:00:00",
+        "not-a-time",
+    ] {
+        let error = usecases::set_time::execute(&client, invalid_time)
+            .expect_err("invalid timestamp must be rejected before request execution");
+        assert_eq!(error.kind, ErrorKind::InvalidInput);
+        assert!(error.message.contains("RFC3339-like"));
+    }
+}

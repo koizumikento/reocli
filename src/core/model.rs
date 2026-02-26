@@ -1,4 +1,5 @@
 use crate::core::command::CgiCommand;
+use crate::core::error::{AppError, AppResult, ErrorKind};
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct Ability {
@@ -29,6 +30,7 @@ pub struct ChannelStatus {
 pub struct Snapshot {
     pub channel: u8,
     pub image_path: String,
+    pub bytes_written: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -47,6 +49,93 @@ pub struct NetworkInfo {
 pub struct NumericRange {
     pub min: i64,
     pub max: i64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum PtzDirection {
+    Left,
+    Right,
+    Up,
+    Down,
+    LeftUp,
+    LeftDown,
+    RightUp,
+    RightDown,
+}
+
+impl PtzDirection {
+    pub fn as_op(self) -> &'static str {
+        match self {
+            Self::Left => "Left",
+            Self::Right => "Right",
+            Self::Up => "Up",
+            Self::Down => "Down",
+            Self::LeftUp => "LeftUp",
+            Self::LeftDown => "LeftDown",
+            Self::RightUp => "RightUp",
+            Self::RightDown => "RightDown",
+        }
+    }
+
+    pub fn parse(raw: &str) -> Option<Self> {
+        match raw.to_ascii_lowercase().as_str() {
+            "left" => Some(Self::Left),
+            "right" => Some(Self::Right),
+            "up" => Some(Self::Up),
+            "down" => Some(Self::Down),
+            "leftup" | "left-up" => Some(Self::LeftUp),
+            "leftdown" | "left-down" => Some(Self::LeftDown),
+            "rightup" | "right-up" => Some(Self::RightUp),
+            "rightdown" | "right-down" => Some(Self::RightDown),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct PtzSpeed(u8);
+
+impl PtzSpeed {
+    pub fn new(value: u8) -> AppResult<Self> {
+        if (1..=64).contains(&value) {
+            return Ok(Self(value));
+        }
+
+        Err(AppError::new(
+            ErrorKind::InvalidInput,
+            format!("speed must be in range 1..=64, got {value}"),
+        ))
+    }
+
+    pub fn value(self) -> u8 {
+        self.0
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct PresetId(u8);
+
+impl PresetId {
+    pub fn new(value: u8) -> AppResult<Self> {
+        if (1..=255).contains(&value) {
+            return Ok(Self(value));
+        }
+
+        Err(AppError::new(
+            ErrorKind::InvalidInput,
+            format!("preset_id must be in range 1..=255, got {value}"),
+        ))
+    }
+
+    pub fn value(self) -> u8 {
+        self.0
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PtzPreset {
+    pub id: PresetId,
+    pub name: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
