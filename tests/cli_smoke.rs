@@ -175,8 +175,8 @@ fn reocli_get_ptz_status_works() {
     assert!(stdout.contains("channel=1"));
     assert!(stdout.contains("pan=1200"));
     assert!(stdout.contains("tilt=-80"));
-    assert!(stdout.contains("pan_deg=unknown"));
-    assert!(stdout.contains("tilt_deg=unknown"));
+    assert!(!stdout.contains("pan_deg="));
+    assert!(!stdout.contains("tilt_deg="));
 }
 
 #[test]
@@ -342,6 +342,12 @@ fn reocli_ptz_calibrate_auto_works() {
     assert!(output.status.success());
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(stdout.contains("operation=calibrate_auto"));
+    assert!(stdout.contains("pan_count="));
+    assert!(stdout.contains("tilt_count="));
+    assert!(stdout.contains("pan_error_p95_count="));
+    assert!(stdout.contains("tilt_error_p95_count="));
+    assert!(!stdout.contains("pan_error_p95_deg="));
+    assert!(!stdout.contains("tilt_error_p95_deg="));
     cleanup_output_dir(&calibration_dir);
 }
 
@@ -349,49 +355,33 @@ fn reocli_ptz_calibrate_auto_works() {
 fn reocli_ptz_set_absolute_works() {
     let mut server = Server::new();
     setup_ptz_absolute_mocks(&mut server);
-    let calibration_dir = unique_temp_dir("cli-ptz-set-absolute");
-    cleanup_output_dir(&calibration_dir);
 
     let output = Command::new(env!("CARGO_BIN_EXE_reocli"))
         .arg("ptz")
         .arg("set-absolute")
-        .arg("30.0")
-        .arg("-10.0")
-        .arg("--tol-deg")
-        .arg("0.8")
+        .arg("1500")
+        .arg("-180")
+        .arg("--tol-count")
+        .arg("5")
         .arg("--timeout-ms")
         .arg("4000")
         .arg("--channel")
         .arg("0")
         .env("REOCLI_ENDPOINT", server.url())
-        .env("REOCLI_CALIBRATION_DIR", &calibration_dir)
         .output()
         .expect("failed to run reocli ptz set-absolute");
 
     assert!(output.status.success());
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(stdout.contains("operation=set_absolute"));
-    cleanup_output_dir(&calibration_dir);
+    assert!(stdout.contains("pan_count=1500"));
+    assert!(stdout.contains("tilt_count=-180"));
 }
 
 #[test]
 fn reocli_ptz_get_absolute_works() {
     let mut server = Server::new();
     setup_ptz_absolute_mocks(&mut server);
-    let calibration_dir = unique_temp_dir("cli-ptz-get-absolute");
-    cleanup_output_dir(&calibration_dir);
-
-    let calibrate_output = Command::new(env!("CARGO_BIN_EXE_reocli"))
-        .arg("ptz")
-        .arg("calibrate")
-        .arg("auto")
-        .arg("--channel")
-        .arg("0")
-        .env("REOCLI_ENDPOINT", server.url())
-        .env("REOCLI_CALIBRATION_DIR", &calibration_dir)
-        .output()
-        .expect("failed to run reocli ptz calibrate auto setup");
-    assert!(calibrate_output.status.success());
 
     let output = Command::new(env!("CARGO_BIN_EXE_reocli"))
         .arg("ptz")
@@ -399,14 +389,14 @@ fn reocli_ptz_get_absolute_works() {
         .arg("--channel")
         .arg("0")
         .env("REOCLI_ENDPOINT", server.url())
-        .env("REOCLI_CALIBRATION_DIR", &calibration_dir)
         .output()
         .expect("failed to run reocli ptz get-absolute");
 
     assert!(output.status.success());
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(stdout.contains("operation=get_absolute"));
-    cleanup_output_dir(&calibration_dir);
+    assert!(stdout.contains("pan_count=1200"));
+    assert!(stdout.contains("tilt_count=-80"));
 }
 
 fn unique_temp_file_path(prefix: &str, file_name: &str) -> PathBuf {

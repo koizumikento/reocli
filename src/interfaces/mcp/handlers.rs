@@ -7,7 +7,7 @@ use serde_json::{Value, json};
 
 use super::tools::supported_tools;
 
-const DEFAULT_ABSOLUTE_TOL_DEG: f64 = 1.0;
+const DEFAULT_ABSOLUTE_RAW_TOL_COUNT: i64 = 10;
 const DEFAULT_ABSOLUTE_TIMEOUT_MS: u64 = 5_000;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -76,8 +76,6 @@ pub fn handle_request(request: McpRequest) -> AppResult<String> {
                 "channel": status.channel,
                 "pan": status.pan_position,
                 "tilt": status.tilt_position,
-                "pan_deg": status_view.pan_deg,
-                "tilt_deg": status_view.tilt_deg,
                 "zoom": status.zoom_position,
                 "focus": status.focus_position,
                 "pan_range": status.pan_range.as_ref().map(|range| json!({ "min": range.min, "max": range.max })),
@@ -87,8 +85,7 @@ pub fn handle_request(request: McpRequest) -> AppResult<String> {
                 "preset_range": status.preset_range.as_ref().map(|range| json!({ "min": range.min, "max": range.max })),
                 "enabled_presets": status.enabled_presets,
                 "calibration_state": status.calibration_state,
-                "calibrated": status.calibrated(),
-                "calibration_path": status_view.calibration_path
+                "calibrated": status.calibrated()
             }))
         }
         "reolink.get_time" => {
@@ -157,16 +154,18 @@ pub fn handle_request(request: McpRequest) -> AppResult<String> {
                 "calibration_path": result.calibration_path,
                 "reused_existing": result.reused_existing,
                 "calibrated_state": result.calibrated_state,
+                "pan_count": result.pan_count,
+                "tilt_count": result.tilt_count,
                 "calibration": {
                     "serial_number": result.calibration.serial_number,
                     "model": result.calibration.model,
                     "firmware": result.calibration.firmware,
-                    "pan_offset": result.calibration.pan_offset,
-                    "pan_scale": result.calibration.pan_scale,
-                    "pan_deadband": result.calibration.pan_deadband,
-                    "tilt_offset": result.calibration.tilt_offset,
-                    "tilt_scale": result.calibration.tilt_scale,
-                    "tilt_deadband": result.calibration.tilt_deadband,
+                    "pan_min_count": result.calibration.pan_min_count,
+                    "pan_max_count": result.calibration.pan_max_count,
+                    "pan_deadband_count": result.calibration.pan_deadband_count,
+                    "tilt_min_count": result.calibration.tilt_min_count,
+                    "tilt_max_count": result.calibration.tilt_max_count,
+                    "tilt_deadband_count": result.calibration.tilt_deadband_count,
                     "pan_model": {
                         "alpha": result.calibration.pan_model.alpha,
                         "beta": result.calibration.pan_model.beta
@@ -179,36 +178,38 @@ pub fn handle_request(request: McpRequest) -> AppResult<String> {
                 },
                 "report": {
                     "samples": result.report.samples,
-                    "pan_error_p95_deg": result.report.pan_error_p95_deg,
-                    "tilt_error_p95_deg": result.report.tilt_error_p95_deg,
+                    "pan_error_p95_count": result.report.pan_error_p95_count,
+                    "tilt_error_p95_count": result.report.tilt_error_p95_count,
                     "notes": result.report.notes
                 }
             }))
         }
         "reolink.ptz_set_absolute" => {
             ensure_command_supported(&client, CgiCommand::PtzCtrl)?;
-            let (channel, pan_deg, tilt_deg, tol_deg, timeout_ms) =
+            let (channel, pan_count, tilt_count, tol_count, timeout_ms) =
                 parse_ptz_set_absolute_args(&request.arguments)?;
-            let pose = usecases::ptz_set_absolute::execute(
-                &client, channel, pan_deg, tilt_deg, tol_deg, timeout_ms,
+            let pose = usecases::ptz_set_absolute_raw::execute(
+                &client, channel, pan_count, tilt_count, tol_count, timeout_ms,
             )?;
             json_response(json!({
                 "channel": pose.channel,
-                "pan_deg": pose.pan_deg,
-                "tilt_deg": pose.tilt_deg,
-                "calibration_path": pose.calibration_path,
-                "tol_deg": tol_deg,
+                "pan_count": pose.pan_count,
+                "tilt_count": pose.tilt_count,
+                "zoom_count": pose.zoom_count,
+                "focus_count": pose.focus_count,
+                "tol_count": tol_count,
                 "timeout_ms": timeout_ms
             }))
         }
         "reolink.ptz_get_absolute" => {
             let channel = parse_channel(&request.arguments)?;
-            let pose = usecases::ptz_get_absolute::execute(&client, channel)?;
+            let pose = usecases::ptz_get_absolute_raw::execute(&client, channel)?;
             json_response(json!({
                 "channel": pose.channel,
-                "pan_deg": pose.pan_deg,
-                "tilt_deg": pose.tilt_deg,
-                "calibration_path": pose.calibration_path
+                "pan_count": pose.pan_count,
+                "tilt_count": pose.tilt_count,
+                "zoom_count": pose.zoom_count,
+                "focus_count": pose.focus_count
             }))
         }
         _ => Err(AppError::new(
@@ -325,27 +326,27 @@ fn parse_ptz_preset_goto_args(arguments: &[String]) -> AppResult<(u8, u8)> {
     Ok((channel, parse_u8(preset_raw, "preset_id")?))
 }
 
-fn parse_ptz_set_absolute_args(arguments: &[String]) -> AppResult<(u8, f64, f64, f64, u64)> {
+fn parse_ptz_set_absolute_args(arguments: &[String]) -> AppResult<(u8, i64, i64, i64, u64)> {
     let (channel, consumed_channel) = parse_optional_channel_prefix(arguments)?;
     let pan_raw = arguments.get(consumed_channel).ok_or_else(|| {
         AppError::new(
             ErrorKind::InvalidInput,
-            "reolink.ptz_set_absolute requires [channel?] <pan_deg> <tilt_deg> [tol_deg] [timeout_ms]",
+            "reolink.ptz_set_absolute requires [channel?] <pan_count> <tilt_count> [tol_count] [timeout_ms]",
         )
     })?;
     let tilt_raw = arguments.get(consumed_channel + 1).ok_or_else(|| {
         AppError::new(
             ErrorKind::InvalidInput,
-            "reolink.ptz_set_absolute requires [channel?] <pan_deg> <tilt_deg> [tol_deg] [timeout_ms]",
+            "reolink.ptz_set_absolute requires [channel?] <pan_count> <tilt_count> [tol_count] [timeout_ms]",
         )
     })?;
-    let pan_deg = parse_f64(pan_raw, "pan_deg")?;
-    let tilt_deg = parse_f64(tilt_raw, "tilt_deg")?;
+    let pan_count = parse_i64(pan_raw, "pan_count")?;
+    let tilt_count = parse_i64(tilt_raw, "tilt_count")?;
 
     let tol_index = consumed_channel + 2;
-    let tol_deg = match arguments.get(tol_index) {
-        Some(raw) => parse_f64(raw, "tol_deg")?,
-        None => DEFAULT_ABSOLUTE_TOL_DEG,
+    let tol_count = match arguments.get(tol_index) {
+        Some(raw) => parse_i64(raw, "tol_count")?,
+        None => DEFAULT_ABSOLUTE_RAW_TOL_COUNT,
     };
 
     let timeout_index = tol_index + usize::from(arguments.get(tol_index).is_some());
@@ -358,11 +359,11 @@ fn parse_ptz_set_absolute_args(arguments: &[String]) -> AppResult<(u8, f64, f64,
     if consumed != arguments.len() {
         return Err(AppError::new(
             ErrorKind::InvalidInput,
-            "reolink.ptz_set_absolute accepts [channel?] <pan_deg> <tilt_deg> [tol_deg] [timeout_ms]",
+            "reolink.ptz_set_absolute accepts [channel?] <pan_count> <tilt_count> [tol_count] [timeout_ms]",
         ));
     }
 
-    Ok((channel, pan_deg, tilt_deg, tol_deg, timeout_ms))
+    Ok((channel, pan_count, tilt_count, tol_count, timeout_ms))
 }
 
 fn parse_optional_channel_prefix(arguments: &[String]) -> AppResult<(u8, usize)> {
@@ -394,20 +395,13 @@ fn parse_u64(raw: &str, field: &str) -> AppResult<u64> {
     })
 }
 
-fn parse_f64(raw: &str, field: &str) -> AppResult<f64> {
-    let parsed = raw.parse::<f64>().map_err(|_| {
+fn parse_i64(raw: &str, field: &str) -> AppResult<i64> {
+    raw.parse::<i64>().map_err(|_| {
         AppError::new(
             ErrorKind::InvalidInput,
-            format!("{field} must be a finite number"),
+            format!("{field} must be an integer"),
         )
-    })?;
-    if parsed.is_finite() {
-        return Ok(parsed);
-    }
-    Err(AppError::new(
-        ErrorKind::InvalidInput,
-        format!("{field} must be a finite number"),
-    ))
+    })
 }
 
 fn ensure_command_supported(

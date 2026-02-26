@@ -38,7 +38,7 @@ Rust ベースの Reolink CLI/MCP 実験用プロジェクトです。
 - `reocli ptz preset list [--channel <0-255>]`
 - `reocli ptz preset goto <preset_id> [--channel <0-255>]`
 - `reocli ptz calibrate auto [--channel <0-255>]`
-- `reocli ptz set-absolute <pan_deg> <tilt_deg> [--tol-deg <f64>] [--timeout-ms <u64>] [--channel <0-255>]`
+- `reocli ptz set-absolute <pan_count> <tilt_count> [--tol-count <i64>] [--timeout-ms <u64>] [--channel <0-255>]`
 - `reocli ptz get-absolute [--channel <0-255>]`
 - `reocli preflight [user]`
 
@@ -83,14 +83,14 @@ reocli ptz stop --channel 0
 reocli ptz preset list --channel 0
 reocli ptz preset goto 7 --channel 0
 reocli ptz calibrate auto --channel 0
-reocli ptz set-absolute 30.0 -10.0 --tol-deg 0.8 --timeout-ms 4000 --channel 0
+reocli ptz set-absolute 1500 -180 --tol-count 12 --timeout-ms 4000 --channel 0
 reocli ptz get-absolute --channel 0
 ```
 
 ```bash
 # MCP
 reocli-mcp reolink.ptz_calibrate_auto 0
-reocli-mcp reolink.ptz_set_absolute 0 30.0 -10.0 0.8 4000
+reocli-mcp reolink.ptz_set_absolute 0 1500 -180 12 4000
 reocli-mcp reolink.ptz_get_absolute 0
 ```
 
@@ -111,8 +111,7 @@ REOCLI_TOKEN=<token> \
 cargo test --test live_smoke -- --nocapture
 ```
 
-## PTZ EKF State Persistence
+## PTZ Absolute (Raw Count)
 
-- `reocli ptz set-absolute ...` は、EKF の内部状態（pan/tilt の状態・共分散・直前制御入力）を
-  校正ファイルと同じディレクトリに `*.ch<channel>.ekf.json` として永続化します。
-- 次回 `set-absolute` 実行時は同ファイルを読み込み、同じ校正ファイルに紐づく状態を再利用します。
+- `set-absolute` / `get-absolute` は角度ではなく `GetPtzCurPos` の生カウント値で扱います。
+- `set-absolute` は `pan_count` / `tilt_count` を目標として、`tol_count` 以内になるまで PTZ 制御を繰り返します。

@@ -237,8 +237,8 @@ fn reocli_mcp_get_ptz_status_works() {
     assert_eq!(json.get("channel").and_then(Value::as_u64), Some(0));
     assert_eq!(json.get("pan").and_then(Value::as_i64), Some(900));
     assert_eq!(json.get("tilt").and_then(Value::as_i64), Some(-120));
-    assert_eq!(json.get("pan_deg").and_then(Value::as_f64), None);
-    assert_eq!(json.get("tilt_deg").and_then(Value::as_f64), None);
+    assert!(json.get("pan_deg").is_none());
+    assert!(json.get("tilt_deg").is_none());
 }
 
 #[test]
@@ -399,8 +399,24 @@ fn reocli_mcp_ptz_calibrate_auto_works() {
     let json = parse_stdout_json(&String::from_utf8_lossy(&output.stdout));
     assert_eq!(json.get("channel").and_then(Value::as_u64), Some(0));
     assert!(json.get("camera_key").is_some());
-    assert!(json.get("calibration").is_some());
-    assert!(json.get("report").is_some());
+    assert!(json.get("pan_count").and_then(Value::as_i64).is_some());
+    assert!(json.get("tilt_count").and_then(Value::as_i64).is_some());
+    let calibration = json.get("calibration").expect("calibration should exist");
+    assert!(calibration.get("pan_min_count").is_some());
+    assert!(calibration.get("pan_max_count").is_some());
+    assert!(calibration.get("pan_deadband_count").is_some());
+    assert!(calibration.get("tilt_min_count").is_some());
+    assert!(calibration.get("tilt_max_count").is_some());
+    assert!(calibration.get("tilt_deadband_count").is_some());
+    assert!(calibration.get("pan_offset").is_none());
+    assert!(calibration.get("pan_scale").is_none());
+    assert!(calibration.get("tilt_offset").is_none());
+    assert!(calibration.get("tilt_scale").is_none());
+    let report = json.get("report").expect("report should exist");
+    assert!(report.get("pan_error_p95_count").is_some());
+    assert!(report.get("tilt_error_p95_count").is_some());
+    assert!(report.get("pan_error_p95_deg").is_none());
+    assert!(report.get("tilt_error_p95_deg").is_none());
     cleanup_output_dir(&calibration_dir);
 }
 
@@ -408,61 +424,42 @@ fn reocli_mcp_ptz_calibrate_auto_works() {
 fn reocli_mcp_ptz_set_absolute_works() {
     let mut server = Server::new();
     setup_ptz_absolute_mocks(&mut server);
-    let calibration_dir = unique_temp_dir("mcp-ptz-set-absolute");
-    cleanup_output_dir(&calibration_dir);
 
     let output = Command::new(env!("CARGO_BIN_EXE_reocli-mcp"))
         .arg("reolink.ptz_set_absolute")
         .arg("0")
-        .arg("30.0")
-        .arg("-10.0")
-        .arg("0.8")
+        .arg("1500")
+        .arg("-180")
+        .arg("5")
         .arg("4000")
         .env("REOCLI_ENDPOINT", server.url())
-        .env("REOCLI_CALIBRATION_DIR", &calibration_dir)
         .output()
         .expect("failed to run reolink.ptz_set_absolute");
 
     assert!(output.status.success());
     let json = parse_stdout_json(&String::from_utf8_lossy(&output.stdout));
     assert_eq!(json.get("channel").and_then(Value::as_u64), Some(0));
-    assert!(json.get("pan_deg").is_some());
-    assert!(json.get("tilt_deg").is_some());
-    assert!(json.get("calibration_path").is_some());
-    cleanup_output_dir(&calibration_dir);
+    assert_eq!(json.get("pan_count").and_then(Value::as_i64), Some(1500));
+    assert_eq!(json.get("tilt_count").and_then(Value::as_i64), Some(-180));
 }
 
 #[test]
 fn reocli_mcp_ptz_get_absolute_works() {
     let mut server = Server::new();
     setup_ptz_absolute_mocks(&mut server);
-    let calibration_dir = unique_temp_dir("mcp-ptz-get-absolute");
-    cleanup_output_dir(&calibration_dir);
-
-    let calibrate_output = Command::new(env!("CARGO_BIN_EXE_reocli-mcp"))
-        .arg("reolink.ptz_calibrate_auto")
-        .arg("0")
-        .env("REOCLI_ENDPOINT", server.url())
-        .env("REOCLI_CALIBRATION_DIR", &calibration_dir)
-        .output()
-        .expect("failed to run reolink.ptz_calibrate_auto setup");
-    assert!(calibrate_output.status.success());
 
     let output = Command::new(env!("CARGO_BIN_EXE_reocli-mcp"))
         .arg("reolink.ptz_get_absolute")
         .arg("0")
         .env("REOCLI_ENDPOINT", server.url())
-        .env("REOCLI_CALIBRATION_DIR", &calibration_dir)
         .output()
         .expect("failed to run reolink.ptz_get_absolute");
 
     assert!(output.status.success());
     let json = parse_stdout_json(&String::from_utf8_lossy(&output.stdout));
     assert_eq!(json.get("channel").and_then(Value::as_u64), Some(0));
-    assert!(json.get("pan_deg").is_some());
-    assert!(json.get("tilt_deg").is_some());
-    assert!(json.get("calibration_path").is_some());
-    cleanup_output_dir(&calibration_dir);
+    assert_eq!(json.get("pan_count").and_then(Value::as_i64), Some(1200));
+    assert_eq!(json.get("tilt_count").and_then(Value::as_i64), Some(-80));
 }
 
 fn parse_stdout_json(stdout: &str) -> Value {

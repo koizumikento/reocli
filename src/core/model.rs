@@ -206,12 +206,12 @@ pub struct CalibrationParams {
     pub serial_number: String,
     pub model: String,
     pub firmware: String,
-    pub pan_offset: f64,
-    pub pan_scale: f64,
-    pub pan_deadband: f64,
-    pub tilt_offset: f64,
-    pub tilt_scale: f64,
-    pub tilt_deadband: f64,
+    pub pan_min_count: i64,
+    pub pan_max_count: i64,
+    pub pan_deadband_count: i64,
+    pub tilt_min_count: i64,
+    pub tilt_max_count: i64,
+    pub tilt_deadband_count: i64,
     pub pan_model: AxisModelParams,
     pub tilt_model: AxisModelParams,
     pub created_at: String,
@@ -220,7 +220,7 @@ pub struct CalibrationParams {
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 pub struct CalibrationReport {
     pub samples: usize,
-    pub pan_error_p95_deg: f64,
-    pub tilt_error_p95_deg: f64,
+    pub pan_error_p95_count: i64,
+    pub tilt_error_p95_count: i64,
     pub notes: String,
 }

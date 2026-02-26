@@ -13,17 +13,11 @@ use crate::interfaces::runtime;
 use crate::reolink::client::Client;
 use crate::reolink::{device, ptz};
 
-const CALIBRATION_SCHEMA_VERSION: u32 = 1;
+const CALIBRATION_SCHEMA_VERSION: u32 = 2;
 const CALIBRATION_SOURCE_HEURISTIC: &str = "auto_heuristic";
 const CALIBRATION_SOURCE_MEASURED: &str = "auto_measured";
 const DEFAULT_PAN_SPAN_UNITS: i64 = 3600;
 const DEFAULT_TILT_SPAN_UNITS: i64 = 1800;
-const DEFAULT_PAN_MIN_DEG: f64 = -180.0;
-const DEFAULT_PAN_MAX_DEG: f64 = 180.0;
-const DEFAULT_TILT_MIN_DEG: f64 = -90.0;
-const DEFAULT_TILT_MAX_DEG: f64 = 90.0;
-const DEFAULT_UPWARD_TILT_MIN_DEG: f64 = 0.0;
-const DEFAULT_UPWARD_TILT_MAX_DEG: f64 = 90.0;
 const DEFAULT_MODEL_ALPHA: f64 = 0.9;
 const DEFAULT_MODEL_BETA: f64 = 0.4;
 const CALIBRATION_PULSE_SPEED: u8 = 6;
@@ -35,6 +29,7 @@ const CALIBRATION_STALL_STEPS: usize = 3;
 const CALIBRATION_SWEEP_MAX_STEPS: usize = 48;
 const CALIBRATION_RESTORE_MAX_STEPS: usize = 36;
 const CALIBRATION_RESTORE_TOLERANCE: i64 = 10;
+const DEFAULT_DEADBAND_COUNT: i64 = 6;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct StoredCalibration {
@@ -52,8 +47,8 @@ pub struct PtzCalibrationReport {
     pub calibration_path: String,
     pub reused_existing: bool,
     pub calibrated_state: Option<bool>,
-    pub pan_deg: f64,
-    pub tilt_deg: f64,
+    pub pan_count: i64,
+    pub tilt_count: i64,
     pub params: StoredCalibration,
     pub calibration: CalibrationParams,
     pub report: CalibrationReport,
@@ -67,21 +62,21 @@ pub fn execute(client: &Client, channel: u8) -> AppResult<PtzCalibrationReport> 
     if status.calibrated() == Some(true)
         && let Some((saved_params, _)) = load_saved_params_for_device(&device_info)?
     {
-        let (pan_deg, tilt_deg) = map_status_to_degrees(&status, &saved_params.calibration)?;
+        let (pan_count, tilt_count) = map_status_to_counts(&status)?;
         return Ok(PtzCalibrationReport {
             channel,
             camera_key: saved_params.camera_key.clone(),
             calibration_path: calibration_path.to_string_lossy().into_owned(),
             reused_existing: true,
             calibrated_state: status.calibrated(),
-            pan_deg,
-            tilt_deg,
+            pan_count,
+            tilt_count,
             params: saved_params.clone(),
             calibration: saved_params.calibration,
             report: CalibrationReport {
                 samples: 1,
-                pan_error_p95_deg: 0.0,
-                tilt_error_p95_deg: 0.0,
+                pan_error_p95_count: 0,
+                tilt_error_p95_count: 0,
                 notes: "reused_saved_params".to_string(),
             },
         });
@@ -93,8 +88,8 @@ pub fn execute(client: &Client, channel: u8) -> AppResult<PtzCalibrationReport> 
                 calibration,
                 CalibrationReport {
                     samples: 8,
-                    pan_error_p95_deg: 0.0,
-                    tilt_error_p95_deg: 0.0,
+                    pan_error_p95_count: 0,
+                    tilt_error_p95_count: 0,
                     notes: "created_from_measured_sweep".to_string(),
                 },
                 CALIBRATION_SOURCE_MEASURED,
@@ -103,8 +98,8 @@ pub fn execute(client: &Client, channel: u8) -> AppResult<PtzCalibrationReport> 
                 build_heuristic_calibration(&device_info, &status),
                 CalibrationReport {
                     samples: 1,
-                    pan_error_p95_deg: 0.0,
-                    tilt_error_p95_deg: 0.0,
+                    pan_error_p95_count: 0,
+                    tilt_error_p95_count: 0,
                     notes: format!("fallback_to_heuristic: {}", error.message),
                 },
                 CALIBRATION_SOURCE_HEURISTIC,
@@ -121,7 +116,7 @@ pub fn execute(client: &Client, channel: u8) -> AppResult<PtzCalibrationReport> 
 
     save_stored_calibration(&calibration_path, &stored)?;
     let final_status = ptz::get_ptz_cur_pos(client, channel).unwrap_or(status.clone());
-    let (pan_deg, tilt_deg) = map_status_to_degrees(&final_status, &stored.calibration)?;
+    let (pan_count, tilt_count) = map_status_to_counts(&final_status)?;
 
     Ok(PtzCalibrationReport {
         channel,
@@ -129,25 +124,12 @@ pub fn execute(client: &Client, channel: u8) -> AppResult<PtzCalibrationReport> 
         calibration_path: calibration_path.to_string_lossy().into_owned(),
         reused_existing: false,
         calibrated_state: final_status.calibrated(),
-        pan_deg,
-        tilt_deg,
+        pan_count,
+        tilt_count,
         params: stored.clone(),
         calibration: stored.calibration,
         report,
     })
-}
-
-pub(crate) fn load_or_create_params(
-    client: &Client,
-    channel: u8,
-) -> AppResult<(CalibrationParams, PathBuf)> {
-    let device_info = device::get_dev_info(client)?;
-    if let Some((saved_params, path)) = load_saved_params_for_device(&device_info)? {
-        return Ok((saved_params.calibration, path));
-    }
-
-    let report = execute(client, channel)?;
-    Ok((report.calibration, PathBuf::from(report.calibration_path)))
 }
 
 pub(crate) fn load_saved_params_for_device(
@@ -186,10 +168,7 @@ pub(crate) fn load_saved_params_for_device(
     Ok(Some((stored, calibration_path)))
 }
 
-pub(crate) fn map_status_to_degrees(
-    status: &PtzStatus,
-    calibration: &CalibrationParams,
-) -> AppResult<(f64, f64)> {
+pub(crate) fn map_status_to_counts(status: &PtzStatus) -> AppResult<(i64, i64)> {
     let pan_position = status.pan_position.ok_or_else(|| {
         AppError::new(
             ErrorKind::UnexpectedResponse,
@@ -209,44 +188,7 @@ pub(crate) fn map_status_to_degrees(
             ),
         )
     })?;
-
-    let pan_deg = position_to_degrees(pan_position, calibration.pan_offset, calibration.pan_scale)?;
-    let tilt_deg = position_to_degrees(
-        tilt_position,
-        calibration.tilt_offset,
-        calibration.tilt_scale,
-    )?;
-    Ok((pan_deg, tilt_deg))
-}
-
-pub(crate) fn degrees_to_position(degrees: f64, offset: f64, scale: f64) -> AppResult<i64> {
-    if !degrees.is_finite() {
-        return Err(AppError::new(
-            ErrorKind::InvalidInput,
-            "target degree must be a finite number",
-        ));
-    }
-
-    ensure_valid_linear_mapping(offset, scale)?;
-    let mapped = (degrees - offset) / scale;
-    Ok(mapped.round() as i64)
-}
-
-fn position_to_degrees(position: i64, offset: f64, scale: f64) -> AppResult<f64> {
-    ensure_valid_linear_mapping(offset, scale)?;
-    Ok(position as f64 * scale + offset)
-}
-
-fn ensure_valid_linear_mapping(offset: f64, scale: f64) -> AppResult<()> {
-    if !offset.is_finite() || !scale.is_finite() || scale.abs() <= f64::EPSILON {
-        return Err(AppError::new(
-            ErrorKind::UnexpectedResponse,
-            format!(
-                "invalid calibration mapping: offset={offset} scale={scale}; scale must be finite and non-zero"
-            ),
-        ));
-    }
-    Ok(())
+    Ok((pan_position, tilt_position))
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -279,51 +221,23 @@ fn try_build_measured_calibration(
 
         restore_axis_to_home(client, channel, AxisKind::Pan, home_pan, pan_motion)?;
         restore_axis_to_home(client, channel, AxisKind::Tilt, home_tilt, tilt_motion)?;
-        let reference_pan = read_axis_position(client, channel, AxisKind::Pan).unwrap_or(home_pan);
-        let reference_tilt =
-            read_axis_position(client, channel, AxisKind::Tilt).unwrap_or(home_tilt);
-
-        let pan_span = (pan_max - pan_min).abs().max(1) as f64;
-        let pan_scale_magnitude = (DEFAULT_PAN_MAX_DEG - DEFAULT_PAN_MIN_DEG) / pan_span;
-        let pan_sign = if pan_motion.increase == crate::core::model::PtzDirection::Right {
-            1.0
-        } else {
-            -1.0
-        };
-        let pan_scale = pan_scale_magnitude * pan_sign;
-        let pan_offset = -(reference_pan as f64) * pan_scale;
-
-        let tilt_span = (tilt_max - tilt_min).abs().max(1) as f64;
-        let tilt_deg_span = if tilt_min >= 0 {
-            DEFAULT_UPWARD_TILT_MAX_DEG - DEFAULT_UPWARD_TILT_MIN_DEG
-        } else {
-            DEFAULT_TILT_MAX_DEG - DEFAULT_TILT_MIN_DEG
-        };
-        let tilt_scale_magnitude = tilt_deg_span / tilt_span;
-        let tilt_sign = if tilt_motion.increase == crate::core::model::PtzDirection::Up {
-            1.0
-        } else {
-            -1.0
-        };
-        let tilt_scale = tilt_scale_magnitude * tilt_sign;
-        let tilt_offset = -(reference_tilt as f64) * tilt_scale;
-
-        let pan_deadband = estimate_deadband(client, channel, AxisKind::Pan, pan_motion, pan_scale)
-            .unwrap_or_else(|_| pan_scale.abs().max(0.05));
-        let tilt_deadband =
-            estimate_deadband(client, channel, AxisKind::Tilt, tilt_motion, tilt_scale)
-                .unwrap_or_else(|_| tilt_scale.abs().max(0.05));
+        let pan_deadband_count =
+            estimate_deadband_count(client, channel, AxisKind::Pan, pan_motion)
+                .unwrap_or(DEFAULT_DEADBAND_COUNT);
+        let tilt_deadband_count =
+            estimate_deadband_count(client, channel, AxisKind::Tilt, tilt_motion)
+                .unwrap_or(DEFAULT_DEADBAND_COUNT);
 
         Ok(CalibrationParams {
             serial_number: device_info.serial_number.clone(),
             model: device_info.model.clone(),
             firmware: device_info.firmware.clone(),
-            pan_offset,
-            pan_scale,
-            pan_deadband,
-            tilt_offset,
-            tilt_scale,
-            tilt_deadband,
+            pan_min_count: pan_min,
+            pan_max_count: pan_max,
+            pan_deadband_count,
+            tilt_min_count: tilt_min,
+            tilt_max_count: tilt_max,
+            tilt_deadband_count,
             pan_model: AxisModelParams {
                 alpha: DEFAULT_MODEL_ALPHA,
                 beta: DEFAULT_MODEL_BETA,
@@ -496,13 +410,12 @@ fn restore_axis_to_home(
     Ok(())
 }
 
-fn estimate_deadband(
+fn estimate_deadband_count(
     client: &Client,
     channel: u8,
     axis: AxisKind,
     motion: AxisMotion,
-    scale_deg_per_unit: f64,
-) -> AppResult<f64> {
+) -> AppResult<i64> {
     let before = read_axis_position(client, channel, axis)?;
     ptz::move_ptz(client, channel, motion.increase, 2, Some(80))?;
     thread::sleep(Duration::from_millis(CALIBRATION_SETTLE_MS));
@@ -515,8 +428,7 @@ fn estimate_deadband(
         .abs()
         .max((after_decrease - after_increase).abs())
         .max(1);
-    let deadband = (delta_units as f64 * scale_deg_per_unit.abs()).clamp(0.05, 2.0);
-    Ok(deadband)
+    Ok(delta_units.max(1))
 }
 
 fn pulse(
@@ -564,42 +476,27 @@ fn axis_position(status: &PtzStatus, axis: AxisKind) -> AppResult<i64> {
 }
 
 fn build_heuristic_calibration(device_info: &DeviceInfo, status: &PtzStatus) -> CalibrationParams {
-    let pan_map = build_axis_linear_map(
+    let pan_range = build_axis_count_range(
         status.pan_range.as_ref(),
         status.pan_position,
         DEFAULT_PAN_SPAN_UNITS,
-        DEFAULT_PAN_MIN_DEG,
-        DEFAULT_PAN_MAX_DEG,
     );
-
-    let (tilt_deg_min, tilt_deg_max) = if status
-        .tilt_range
-        .as_ref()
-        .is_some_and(|range| range.min >= 0)
-    {
-        (DEFAULT_UPWARD_TILT_MIN_DEG, DEFAULT_UPWARD_TILT_MAX_DEG)
-    } else {
-        (DEFAULT_TILT_MIN_DEG, DEFAULT_TILT_MAX_DEG)
-    };
-
-    let tilt_map = build_axis_linear_map(
+    let tilt_range = build_axis_count_range(
         status.tilt_range.as_ref(),
         status.tilt_position,
         DEFAULT_TILT_SPAN_UNITS,
-        tilt_deg_min,
-        tilt_deg_max,
     );
 
     CalibrationParams {
         serial_number: device_info.serial_number.clone(),
         model: device_info.model.clone(),
         firmware: device_info.firmware.clone(),
-        pan_offset: pan_map.offset,
-        pan_scale: pan_map.scale,
-        pan_deadband: pan_map.scale.abs().max(0.01),
-        tilt_offset: tilt_map.offset,
-        tilt_scale: tilt_map.scale,
-        tilt_deadband: tilt_map.scale.abs().max(0.01),
+        pan_min_count: pan_range.min_count,
+        pan_max_count: pan_range.max_count,
+        pan_deadband_count: DEFAULT_DEADBAND_COUNT,
+        tilt_min_count: tilt_range.min_count,
+        tilt_max_count: tilt_range.max_count,
+        tilt_deadband_count: DEFAULT_DEADBAND_COUNT,
         pan_model: AxisModelParams {
             alpha: DEFAULT_MODEL_ALPHA,
             beta: DEFAULT_MODEL_BETA,
@@ -613,24 +510,22 @@ fn build_heuristic_calibration(device_info: &DeviceInfo, status: &PtzStatus) -> 
 }
 
 #[derive(Debug, Clone, Copy)]
-struct AxisLinearMap {
-    offset: f64,
-    scale: f64,
+struct AxisCountRange {
+    min_count: i64,
+    max_count: i64,
 }
 
-fn build_axis_linear_map(
+fn build_axis_count_range(
     range: Option<&NumericRange>,
     current_position: Option<i64>,
-    default_span_units: i64,
-    deg_min: f64,
-    deg_max: f64,
-) -> AxisLinearMap {
+    default_span_count: i64,
+) -> AxisCountRange {
     let (mut pos_min, mut pos_max) = match range {
         Some(range) if range.max > range.min => (range.min, range.max),
         Some(range) => (range.min, range.min + 1),
         None => {
             let center = current_position.unwrap_or(0);
-            let half_span = (default_span_units / 2).max(1);
+            let half_span = (default_span_count / 2).max(1);
             (center - half_span, center + half_span)
         }
     };
@@ -644,10 +539,10 @@ fn build_axis_linear_map(
         pos_max = pos_min + 1;
     }
 
-    let scale = (deg_max - deg_min) / (pos_max - pos_min) as f64;
-    let offset = deg_min - pos_min as f64 * scale;
-
-    AxisLinearMap { offset, scale }
+    AxisCountRange {
+        min_count: pos_min,
+        max_count: pos_max,
+    }
 }
 
 fn save_stored_calibration(path: &Path, stored: &StoredCalibration) -> AppResult<()> {
@@ -688,4 +583,41 @@ fn now_epoch_millis() -> u64 {
         .as_millis()
         .try_into()
         .unwrap_or(u64::MAX)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{build_axis_count_range, map_status_to_counts};
+    use crate::core::model::{NumericRange, PtzStatus};
+
+    #[test]
+    fn build_axis_count_range_uses_range_when_present() {
+        let range = NumericRange {
+            min: -3550,
+            max: 3550,
+        };
+        let mapped = build_axis_count_range(Some(&range), Some(120), 3600);
+        assert_eq!(mapped.min_count, -3550);
+        assert_eq!(mapped.max_count, 3550);
+    }
+
+    #[test]
+    fn build_axis_count_range_falls_back_to_default_span() {
+        let mapped = build_axis_count_range(None, Some(500), 2000);
+        assert_eq!(mapped.min_count, -500);
+        assert_eq!(mapped.max_count, 1500);
+    }
+
+    #[test]
+    fn map_status_to_counts_returns_raw_positions() {
+        let status = PtzStatus {
+            channel: 2,
+            pan_position: Some(1500),
+            tilt_position: Some(-180),
+            ..PtzStatus::default()
+        };
+        let (pan_count, tilt_count) = map_status_to_counts(&status).expect("status should map");
+        assert_eq!(pan_count, 1500);
+        assert_eq!(tilt_count, -180);
+    }
 }

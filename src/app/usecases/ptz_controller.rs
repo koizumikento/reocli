@@ -11,6 +11,15 @@ const DEFAULT_EKF_PROCESS_Q_POS: f64 = 0.15;
 const DEFAULT_EKF_PROCESS_Q_VEL: f64 = 0.35;
 const DEFAULT_EKF_PROCESS_Q_BIAS: f64 = 0.01;
 const DEFAULT_EKF_MEASUREMENT_R: f64 = 1.0;
+const EKF_MIN_MEASUREMENT_R: f64 = 0.05;
+const EKF_MAX_MEASUREMENT_R: f64 = 30.0;
+const EKF_MIN_Q_SCALE: f64 = 0.2;
+const EKF_MAX_Q_SCALE: f64 = 8.0;
+const EKF_ADAPTATION_LAMBDA: f64 = 0.08;
+const EKF_NIS_UPPER: f64 = 1.6;
+const EKF_NIS_LOWER: f64 = 0.7;
+const EKF_Q_SCALE_GROWTH: f64 = 1.08;
+const EKF_Q_SCALE_DECAY: f64 = 0.97;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct AxisControllerConfig {
@@ -118,12 +127,16 @@ pub struct AxisEkf {
     model: AxisModelParams,
     state: AxisState,
     covariance: [[f64; 3]; 3],
+    adaptive_r: f64,
+    adaptive_q_scale: f64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct AxisEkfSnapshot {
     pub state: AxisState,
     pub covariance: [[f64; 3]; 3],
+    pub adaptive_r: f64,
+    pub adaptive_q_scale: f64,
 }
 
 impl AxisEkf {
@@ -142,6 +155,10 @@ impl AxisEkf {
                 [0.0, DEFAULT_EKF_VELOCITY_VAR, 0.0],
                 [0.0, 0.0, DEFAULT_EKF_BIAS_VAR],
             ],
+            adaptive_r: config
+                .r_measurement
+                .clamp(EKF_MIN_MEASUREMENT_R, EKF_MAX_MEASUREMENT_R),
+            adaptive_q_scale: 1.0,
         }
     }
 
@@ -157,6 +174,8 @@ impl AxisEkf {
         AxisEkfSnapshot {
             state: self.state,
             covariance: self.covariance,
+            adaptive_r: self.adaptive_r,
+            adaptive_q_scale: self.adaptive_q_scale,
         }
     }
 
@@ -165,7 +184,11 @@ impl AxisEkf {
         model: AxisModelParams,
         snapshot: AxisEkfSnapshot,
     ) -> Option<Self> {
-        if !is_finite_state(snapshot.state) || !is_finite_covariance(snapshot.covariance) {
+        if !is_finite_state(snapshot.state)
+            || !is_finite_covariance(snapshot.covariance)
+            || !snapshot.adaptive_r.is_finite()
+            || !snapshot.adaptive_q_scale.is_finite()
+        {
             return None;
         }
 
@@ -187,12 +210,32 @@ impl AxisEkf {
             model,
             state,
             covariance,
+            adaptive_r: snapshot
+                .adaptive_r
+                .clamp(EKF_MIN_MEASUREMENT_R, EKF_MAX_MEASUREMENT_R),
+            adaptive_q_scale: snapshot
+                .adaptive_q_scale
+                .clamp(EKF_MIN_Q_SCALE, EKF_MAX_Q_SCALE),
         })
     }
 
     pub fn update(&mut self, control_u: f64, measured_position: f64) -> AxisEstimate {
+        self.update_with_dt(control_u, measured_position, self.config.ts_sec)
+    }
+
+    pub fn update_with_dt(
+        &mut self,
+        control_u: f64,
+        measured_position: f64,
+        dt_sec: f64,
+    ) -> AxisEstimate {
         let u = control_u.clamp(-1.0, 1.0);
-        let ts = self.config.ts_sec.max(f64::EPSILON);
+        let base_ts = self.config.ts_sec.max(1e-3);
+        let ts = if dt_sec.is_finite() {
+            dt_sec.clamp(base_ts * 0.25, base_ts * 4.0)
+        } else {
+            base_ts
+        };
         let alpha = self.model.alpha;
         let beta = self.model.beta;
 
@@ -203,19 +246,38 @@ impl AxisEkf {
         };
 
         let a = [[1.0, ts, 0.0], [0.0, alpha, 0.0], [0.0, 0.0, 1.0]];
+        let q_scale = self
+            .adaptive_q_scale
+            .clamp(EKF_MIN_Q_SCALE, EKF_MAX_Q_SCALE);
+        let q_time_scale = (ts / base_ts).clamp(0.25, 4.0);
         let p_pred = add_3x3(
             mul_3x3(mul_3x3(a, self.covariance), transpose_3x3(a)),
             [
-                [self.config.q_position.max(1e-6), 0.0, 0.0],
-                [0.0, self.config.q_velocity.max(1e-6), 0.0],
-                [0.0, 0.0, self.config.q_bias.max(1e-8)],
+                [
+                    self.config.q_position.max(1e-6) * q_scale * q_time_scale,
+                    0.0,
+                    0.0,
+                ],
+                [
+                    0.0,
+                    self.config.q_velocity.max(1e-6) * q_scale * q_time_scale,
+                    0.0,
+                ],
+                [
+                    0.0,
+                    0.0,
+                    self.config.q_bias.max(1e-8) * q_scale * q_time_scale,
+                ],
             ],
         );
 
         let innovation = measured_position - output_from_state(predicted_state);
         let h = [1.0, 0.0, 1.0];
         let ph_t = mul_3x3_3x1(p_pred, h);
-        let s = dot_3(h, ph_t) + self.config.r_measurement.max(1e-6);
+        let measurement_r = self
+            .adaptive_r
+            .clamp(EKF_MIN_MEASUREMENT_R, EKF_MAX_MEASUREMENT_R);
+        let s = dot_3(h, ph_t) + measurement_r.max(1e-6);
         let gain = scale_3(ph_t, 1.0 / s);
 
         let corrected_state = AxisState {
@@ -232,10 +294,40 @@ impl AxisEkf {
 
         self.state = corrected_state;
         self.covariance = p_corr;
+        self.adapt_noise(innovation, s);
 
         AxisEstimate {
             state: corrected_state,
             measured_position,
+        }
+    }
+
+    pub fn reanchor(&mut self, measured_position: f64) {
+        self.state = AxisState {
+            position: measured_position.clamp(self.config.min_position, self.config.max_position),
+            velocity: 0.0,
+            bias: 0.0,
+        };
+        self.covariance = [
+            [DEFAULT_EKF_POSITION_VAR, 0.0, 0.0],
+            [0.0, DEFAULT_EKF_VELOCITY_VAR, 0.0],
+            [0.0, 0.0, DEFAULT_EKF_BIAS_VAR],
+        ];
+    }
+
+    fn adapt_noise(&mut self, innovation: f64, innovation_variance: f64) {
+        let residual_energy = innovation * innovation;
+        let lambda = EKF_ADAPTATION_LAMBDA;
+        self.adaptive_r = ((1.0 - lambda) * self.adaptive_r + lambda * residual_energy)
+            .clamp(EKF_MIN_MEASUREMENT_R, EKF_MAX_MEASUREMENT_R);
+
+        let nis = residual_energy / innovation_variance.max(1e-6);
+        if nis > EKF_NIS_UPPER {
+            self.adaptive_q_scale = (self.adaptive_q_scale * EKF_Q_SCALE_GROWTH)
+                .clamp(EKF_MIN_Q_SCALE, EKF_MAX_Q_SCALE);
+        } else if nis < EKF_NIS_LOWER {
+            self.adaptive_q_scale =
+                (self.adaptive_q_scale * EKF_Q_SCALE_DECAY).clamp(EKF_MIN_Q_SCALE, EKF_MAX_Q_SCALE);
         }
     }
 }

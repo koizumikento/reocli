@@ -1,7 +1,7 @@
 use crate::core::error::{AppError, AppResult, ErrorKind};
 use crate::core::model::PtzDirection;
 
-const DEFAULT_ABSOLUTE_TOL_DEG: f64 = 1.0;
+const DEFAULT_ABSOLUTE_RAW_TOL_COUNT: i64 = 10;
 const DEFAULT_ABSOLUTE_TIMEOUT_MS: u64 = 5_000;
 
 #[derive(Debug, Clone, PartialEq)]
@@ -50,9 +50,9 @@ pub enum CliCommand {
     },
     PtzSetAbsolute {
         channel: u8,
-        pan_deg: f64,
-        tilt_deg: f64,
-        tol_deg: f64,
+        pan_count: i64,
+        tilt_count: i64,
+        tol_count: i64,
         timeout_ms: u64,
     },
     PtzGetAbsolute {
@@ -313,20 +313,20 @@ fn parse_ptz_set_absolute_args(args: &[String]) -> AppResult<CliCommand> {
     let pan_raw = args.first().ok_or_else(|| {
         AppError::new(
             ErrorKind::InvalidInput,
-            "ptz set-absolute requires <pan_deg> <tilt_deg>",
+            "ptz set-absolute requires <pan_count> <tilt_count>",
         )
     })?;
     let tilt_raw = args.get(1).ok_or_else(|| {
         AppError::new(
             ErrorKind::InvalidInput,
-            "ptz set-absolute requires <pan_deg> <tilt_deg>",
+            "ptz set-absolute requires <pan_count> <tilt_count>",
         )
     })?;
-    let pan_deg = parse_f64_arg(pan_raw, "pan_deg")?;
-    let tilt_deg = parse_f64_arg(tilt_raw, "tilt_deg")?;
+    let pan_count = parse_i64_arg(pan_raw, "pan_count")?;
+    let tilt_count = parse_i64_arg(tilt_raw, "tilt_count")?;
 
     let mut channel = 0u8;
-    let mut tol_deg = DEFAULT_ABSOLUTE_TOL_DEG;
+    let mut tol_count = DEFAULT_ABSOLUTE_RAW_TOL_COUNT;
     let mut timeout_ms = DEFAULT_ABSOLUTE_TIMEOUT_MS;
     let mut index = 2;
     while index < args.len() {
@@ -341,14 +341,14 @@ fn parse_ptz_set_absolute_args(args: &[String]) -> AppResult<CliCommand> {
                 channel = parse_u8_arg(value, "channel")?;
                 index += 2;
             }
-            "--tol-deg" => {
+            "--tol-count" => {
                 let value = args.get(index + 1).ok_or_else(|| {
                     AppError::new(
                         ErrorKind::InvalidInput,
-                        "ptz set-absolute --tol-deg requires <f64>",
+                        "ptz set-absolute --tol-count requires <i64>",
                     )
                 })?;
-                tol_deg = parse_f64_arg(value, "tol_deg")?;
+                tol_count = parse_i64_arg(value, "tol_count")?;
                 index += 2;
             }
             "--timeout-ms" => {
@@ -372,9 +372,9 @@ fn parse_ptz_set_absolute_args(args: &[String]) -> AppResult<CliCommand> {
 
     Ok(CliCommand::PtzSetAbsolute {
         channel,
-        pan_deg,
-        tilt_deg,
-        tol_deg,
+        pan_count,
+        tilt_count,
+        tol_count,
         timeout_ms,
     })
 }
@@ -417,22 +417,15 @@ fn parse_u64_arg(raw: &str, name: &str) -> AppResult<u64> {
     })
 }
 
-fn parse_f64_arg(raw: &str, name: &str) -> AppResult<f64> {
-    let parsed = raw.parse::<f64>().map_err(|_| {
+fn parse_i64_arg(raw: &str, name: &str) -> AppResult<i64> {
+    raw.parse::<i64>().map_err(|_| {
         AppError::new(
             ErrorKind::InvalidInput,
-            format!("{name} must be a finite number"),
+            format!("{name} must be an integer"),
         )
-    })?;
-    if parsed.is_finite() {
-        return Ok(parsed);
-    }
-    Err(AppError::new(
-        ErrorKind::InvalidInput,
-        format!("{name} must be a finite number"),
-    ))
+    })
 }
 
 pub fn help_text() -> &'static str {
-    "Usage:\n  reocli help\n  reocli get-user-auth <user> <password>\n  reocli get-ability [user]\n  reocli get-dev-info\n  reocli get-channel-status [channel]\n  reocli get-ptz-status [channel]\n  reocli get-time\n  reocli set-time <iso8601>\n  reocli snap [channel] [--out path]\n  reocli ptz move <direction> [--speed <1-64>] [--duration <ms>] [--channel <0-255>]\n  reocli ptz stop [--channel <0-255>]\n  reocli ptz preset list [--channel <0-255>]\n  reocli ptz preset goto <preset_id> [--channel <0-255>]\n  reocli ptz calibrate auto [--channel <0-255>]\n  reocli ptz set-absolute <pan_deg> <tilt_deg> [--tol-deg <f64>] [--timeout-ms <u64>] [--channel <0-255>]\n  reocli ptz get-absolute [--channel <0-255>]\n  reocli preflight [user]"
+    "Usage:\n  reocli help\n  reocli get-user-auth <user> <password>\n  reocli get-ability [user]\n  reocli get-dev-info\n  reocli get-channel-status [channel]\n  reocli get-ptz-status [channel]\n  reocli get-time\n  reocli set-time <iso8601>\n  reocli snap [channel] [--out path]\n  reocli ptz move <direction> [--speed <1-64>] [--duration <ms>] [--channel <0-255>]\n  reocli ptz stop [--channel <0-255>]\n  reocli ptz preset list [--channel <0-255>]\n  reocli ptz preset goto <preset_id> [--channel <0-255>]\n  reocli ptz calibrate auto [--channel <0-255>]\n  reocli ptz set-absolute <pan_count> <tilt_count> [--tol-count <i64>] [--timeout-ms <u64>] [--channel <0-255>]\n  reocli ptz get-absolute [--channel <0-255>]\n  reocli preflight [user]"
 }
