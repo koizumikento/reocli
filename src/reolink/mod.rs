@@ -3,5 +3,6 @@ pub mod client;
 pub mod device;
 pub mod media;
 pub mod network;
+pub mod onvif;
 pub mod ptz;
 pub mod system;

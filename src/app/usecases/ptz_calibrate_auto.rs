@@ -13,13 +13,19 @@ use crate::interfaces::runtime;
 use crate::reolink::client::Client;
 use crate::reolink::{device, ptz};
 
+use super::ptz_transport;
+
 const CALIBRATION_SCHEMA_VERSION: u32 = 2;
 const CALIBRATION_SOURCE_HEURISTIC: &str = "auto_heuristic";
 const CALIBRATION_SOURCE_MEASURED: &str = "auto_measured";
 const DEFAULT_PAN_SPAN_UNITS: i64 = 3600;
 const DEFAULT_TILT_SPAN_UNITS: i64 = 1800;
 const DEFAULT_MODEL_ALPHA: f64 = 0.9;
-const DEFAULT_MODEL_BETA: f64 = 0.4;
+const DEFAULT_MODEL_BETA_RATIO: f64 = 0.03;
+const MODEL_ALPHA_MIN: f64 = 0.75;
+const MODEL_ALPHA_MAX: f64 = 0.98;
+const MODEL_BETA_MIN: f64 = 20.0;
+const MODEL_BETA_MAX: f64 = 600.0;
 const CALIBRATION_PULSE_SPEED: u8 = 6;
 const CALIBRATION_PULSE_MS: u64 = 220;
 const CALIBRATION_SETTLE_MS: u64 = 80;
@@ -216,11 +222,17 @@ fn try_build_measured_calibration(
         let pan_motion = detect_axis_motion(client, channel, AxisKind::Pan)?;
         let tilt_motion = detect_axis_motion(client, channel, AxisKind::Tilt)?;
 
-        let (pan_min, pan_max) = sweep_axis_bounds(client, channel, AxisKind::Pan, pan_motion)?;
-        let (tilt_min, tilt_max) = sweep_axis_bounds(client, channel, AxisKind::Tilt, tilt_motion)?;
+        let (pan_min, pan_max, pan_sweep_deltas) =
+            sweep_axis_bounds(client, channel, AxisKind::Pan, pan_motion)?;
+        let (tilt_min, tilt_max, tilt_sweep_deltas) =
+            sweep_axis_bounds(client, channel, AxisKind::Tilt, tilt_motion)?;
 
         restore_axis_to_home(client, channel, AxisKind::Pan, home_pan, pan_motion)?;
         restore_axis_to_home(client, channel, AxisKind::Tilt, home_tilt, tilt_motion)?;
+        let pan_span = (pan_max - pan_min).unsigned_abs() as f64;
+        let tilt_span = (tilt_max - tilt_min).unsigned_abs() as f64;
+        let pan_model = estimate_model_from_sweep(pan_span, &pan_sweep_deltas);
+        let tilt_model = estimate_model_from_sweep(tilt_span, &tilt_sweep_deltas);
         let pan_deadband_count =
             estimate_deadband_count(client, channel, AxisKind::Pan, pan_motion)
                 .unwrap_or(DEFAULT_DEADBAND_COUNT);
@@ -238,19 +250,13 @@ fn try_build_measured_calibration(
             tilt_min_count: tilt_min,
             tilt_max_count: tilt_max,
             tilt_deadband_count,
-            pan_model: AxisModelParams {
-                alpha: DEFAULT_MODEL_ALPHA,
-                beta: DEFAULT_MODEL_BETA,
-            },
-            tilt_model: AxisModelParams {
-                alpha: DEFAULT_MODEL_ALPHA,
-                beta: DEFAULT_MODEL_BETA,
-            },
+            pan_model,
+            tilt_model,
             created_at: now_epoch_millis().to_string(),
         })
     })();
 
-    let _ = ptz::stop_ptz(client, channel);
+    let _ = ptz_transport::stop_ptz(client, channel);
     measured
 }
 
@@ -320,9 +326,24 @@ fn sweep_axis_bounds(
     channel: u8,
     axis: AxisKind,
     motion: AxisMotion,
-) -> AppResult<(i64, i64)> {
-    let min = sweep_axis_limit(client, channel, axis, motion.decrease, true)?;
-    let max = sweep_axis_limit(client, channel, axis, motion.increase, false)?;
+) -> AppResult<(i64, i64, Vec<f64>)> {
+    let mut sweep_deltas = Vec::new();
+    let min = sweep_axis_limit(
+        client,
+        channel,
+        axis,
+        motion.decrease,
+        true,
+        &mut sweep_deltas,
+    )?;
+    let max = sweep_axis_limit(
+        client,
+        channel,
+        axis,
+        motion.increase,
+        false,
+        &mut sweep_deltas,
+    )?;
     if max <= min {
         return Err(AppError::new(
             ErrorKind::UnexpectedResponse,
@@ -333,7 +354,7 @@ fn sweep_axis_bounds(
         ));
     }
 
-    Ok((min, max))
+    Ok((min, max, sweep_deltas))
 }
 
 fn sweep_axis_limit(
@@ -342,6 +363,7 @@ fn sweep_axis_limit(
     axis: AxisKind,
     direction: crate::core::model::PtzDirection,
     toward_min: bool,
+    sweep_deltas: &mut Vec<f64>,
 ) -> AppResult<i64> {
     let mut best = read_axis_position(client, channel, axis)?;
     let mut stall_steps = 0usize;
@@ -350,6 +372,15 @@ fn sweep_axis_limit(
         let before = read_axis_position(client, channel, axis)?;
         pulse(client, channel, direction)?;
         let after = read_axis_position(client, channel, axis)?;
+        let delta_signed = after - before;
+        let moved_toward_target = if toward_min {
+            -(delta_signed as f64)
+        } else {
+            delta_signed as f64
+        };
+        if moved_toward_target.is_finite() && moved_toward_target > 0.0 {
+            sweep_deltas.push(moved_toward_target);
+        }
 
         best = if toward_min {
             best.min(after)
@@ -397,7 +428,7 @@ fn restore_axis_to_home(
             CALIBRATION_PULSE_SPEED
         };
 
-        ptz::move_ptz(
+        ptz_transport::move_ptz(
             client,
             channel,
             direction,
@@ -417,10 +448,10 @@ fn estimate_deadband_count(
     motion: AxisMotion,
 ) -> AppResult<i64> {
     let before = read_axis_position(client, channel, axis)?;
-    ptz::move_ptz(client, channel, motion.increase, 2, Some(80))?;
+    ptz_transport::move_ptz(client, channel, motion.increase, 2, Some(80))?;
     thread::sleep(Duration::from_millis(CALIBRATION_SETTLE_MS));
     let after_increase = read_axis_position(client, channel, axis)?;
-    ptz::move_ptz(client, channel, motion.decrease, 2, Some(80))?;
+    ptz_transport::move_ptz(client, channel, motion.decrease, 2, Some(80))?;
     thread::sleep(Duration::from_millis(CALIBRATION_SETTLE_MS));
     let after_decrease = read_axis_position(client, channel, axis)?;
 
@@ -436,7 +467,7 @@ fn pulse(
     channel: u8,
     direction: crate::core::model::PtzDirection,
 ) -> AppResult<()> {
-    ptz::move_ptz(
+    ptz_transport::move_ptz(
         client,
         channel,
         direction,
@@ -487,6 +518,8 @@ fn build_heuristic_calibration(device_info: &DeviceInfo, status: &PtzStatus) -> 
         DEFAULT_TILT_SPAN_UNITS,
     );
 
+    let pan_span = (pan_range.max_count - pan_range.min_count).unsigned_abs() as f64;
+    let tilt_span = (tilt_range.max_count - tilt_range.min_count).unsigned_abs() as f64;
     CalibrationParams {
         serial_number: device_info.serial_number.clone(),
         model: device_info.model.clone(),
@@ -497,14 +530,8 @@ fn build_heuristic_calibration(device_info: &DeviceInfo, status: &PtzStatus) -> 
         tilt_min_count: tilt_range.min_count,
         tilt_max_count: tilt_range.max_count,
         tilt_deadband_count: DEFAULT_DEADBAND_COUNT,
-        pan_model: AxisModelParams {
-            alpha: DEFAULT_MODEL_ALPHA,
-            beta: DEFAULT_MODEL_BETA,
-        },
-        tilt_model: AxisModelParams {
-            alpha: DEFAULT_MODEL_ALPHA,
-            beta: DEFAULT_MODEL_BETA,
-        },
+        pan_model: fallback_model_for_span(pan_span),
+        tilt_model: fallback_model_for_span(tilt_span),
         created_at: now_epoch_millis().to_string(),
     }
 }
@@ -543,6 +570,59 @@ fn build_axis_count_range(
         min_count: pos_min,
         max_count: pos_max,
     }
+}
+
+fn estimate_model_from_sweep(span: f64, sweep_deltas: &[f64]) -> AxisModelParams {
+    let fallback = fallback_model_for_span(span);
+    let samples = sweep_deltas
+        .iter()
+        .copied()
+        .filter(|delta| delta.is_finite() && *delta > 0.0)
+        .collect::<Vec<_>>();
+    if samples.len() < 2 {
+        return fallback;
+    }
+
+    let mut alpha_numer = 0.0f64;
+    let mut alpha_denom = 0.0f64;
+    for window in samples.windows(2) {
+        let prev = window[0];
+        let next = window[1];
+        alpha_numer += prev * next;
+        alpha_denom += prev * prev;
+    }
+    if alpha_denom <= f64::EPSILON {
+        return fallback;
+    }
+
+    let alpha = (alpha_numer / alpha_denom).clamp(MODEL_ALPHA_MIN, MODEL_ALPHA_MAX);
+    let mean_delta = samples.iter().sum::<f64>() / samples.len() as f64;
+    let velocity = mean_delta / calibration_effective_ts_sec();
+    let beta =
+        (velocity * (1.0 - alpha) / calibration_control_u()).clamp(MODEL_BETA_MIN, MODEL_BETA_MAX);
+    if !alpha.is_finite() || !beta.is_finite() {
+        return fallback;
+    }
+
+    AxisModelParams { alpha, beta }
+}
+
+fn fallback_model_for_span(span: f64) -> AxisModelParams {
+    AxisModelParams {
+        alpha: DEFAULT_MODEL_ALPHA,
+        beta: (span.abs().max(1.0) * DEFAULT_MODEL_BETA_RATIO)
+            .clamp(MODEL_BETA_MIN, MODEL_BETA_MAX),
+    }
+}
+
+fn calibration_control_u() -> f64 {
+    let speed_factor = (CALIBRATION_PULSE_SPEED as f64 / 64.0).clamp(0.0, 1.0);
+    let pulse_factor = (CALIBRATION_PULSE_MS as f64 / 120.0).clamp(0.5, 1.5);
+    (speed_factor * pulse_factor).clamp(1e-3, 1.0)
+}
+
+fn calibration_effective_ts_sec() -> f64 {
+    ((CALIBRATION_PULSE_MS + CALIBRATION_SETTLE_MS) as f64 / 1_000.0).clamp(0.05, 0.5)
 }
 
 fn save_stored_calibration(path: &Path, stored: &StoredCalibration) -> AppResult<()> {
@@ -587,7 +667,7 @@ fn now_epoch_millis() -> u64 {
 
 #[cfg(test)]
 mod tests {
-    use super::{build_axis_count_range, map_status_to_counts};
+    use super::{build_axis_count_range, estimate_model_from_sweep, map_status_to_counts};
     use crate::core::model::{NumericRange, PtzStatus};
 
     #[test]
@@ -619,5 +699,21 @@ mod tests {
         let (pan_count, tilt_count) = map_status_to_counts(&status).expect("status should map");
         assert_eq!(pan_count, 1500);
         assert_eq!(tilt_count, -180);
+    }
+
+    #[test]
+    fn estimate_model_from_sweep_uses_fallback_for_insufficient_samples() {
+        let model = estimate_model_from_sweep(7_200.0, &[8.0]);
+        assert!((0.75..=0.98).contains(&model.alpha));
+        assert!((20.0..=600.0).contains(&model.beta));
+    }
+
+    #[test]
+    fn estimate_model_from_sweep_produces_finite_model() {
+        let model = estimate_model_from_sweep(7_200.0, &[80.0, 97.0, 108.0, 114.0, 118.0]);
+        assert!(model.alpha.is_finite());
+        assert!(model.beta.is_finite());
+        assert!((0.75..=0.98).contains(&model.alpha));
+        assert!((20.0..=600.0).contains(&model.beta));
     }
 }

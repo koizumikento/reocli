@@ -17,6 +17,10 @@ Rust ベースの Reolink CLI/MCP 実験用プロジェクトです。
 - `REOCLI_TOKEN_CACHE_PATH`: トークンキャッシュファイルパス。未設定時は `~/.reocli/tokens/<endpoint>.token`。
 - `REOCLI_USER`: ユーザー名。`REOCLI_PASSWORD` が設定されていて未設定/空文字の場合は `admin` を使用。
 - `REOCLI_PASSWORD`: パスワード認証に使用。
+- `REOCLI_PTZ_BACKEND`: PTZ制御バックエンド。`cgi`（既定）または `onvif`。
+- `REOCLI_ONVIF_DEVICE_SERVICE_URL`: ONVIF Device Service URL（例: `http://<camera-ip>:8000/onvif/device_service`）。
+- `REOCLI_ONVIF_PROFILE_TOKEN`: ONVIF ProfileToken の明示指定（未指定時は `GetProfiles` から自動解決）。
+- `REOCLI_ONVIF_PORT`: `REOCLI_ONVIF_DEVICE_SERVICE_URL` 未設定時の既定ポート（既定: `8000`）。
 
 認証の優先順:
 
@@ -95,6 +99,13 @@ reocli ptz preset goto 7 --channel 0
 reocli ptz calibrate auto --channel 0
 reocli ptz set-absolute 1500 -180 --tol-count 12 --timeout-ms 25000 --channel 0
 reocli ptz get-absolute --channel 0
+
+# PTZ (ONVIF ContinuousMove backend)
+REOCLI_PTZ_BACKEND=onvif \
+REOCLI_ENDPOINT=https://192.168.0.220 \
+REOCLI_USER=admin \
+REOCLI_PASSWORD='******' \
+reocli ptz set-absolute 1500 -180 --tol-count 12 --timeout-ms 25000 --channel 0
 ```
 
 ```bash

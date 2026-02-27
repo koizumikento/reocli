@@ -13,5 +13,6 @@ pub mod ptz_preset_goto;
 pub mod ptz_preset_list;
 pub mod ptz_set_absolute_raw;
 pub mod ptz_stop;
+pub mod ptz_transport;
 pub mod set_time;
 pub mod snap;

@@ -1,7 +1,8 @@
 use crate::core::error::AppResult;
 use crate::reolink::client::Client;
-use crate::reolink::ptz;
+
+use super::ptz_transport;
 
 pub fn execute(client: &Client, channel: u8) -> AppResult<()> {
-    ptz::stop_ptz(client, channel)
+    ptz_transport::stop_ptz(client, channel)
 }

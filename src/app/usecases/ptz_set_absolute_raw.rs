@@ -5,9 +5,10 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 
-use crate::app::usecases::ptz_calibrate_auto::load_saved_params_for_device;
+use crate::app::usecases::ptz_calibrate_auto::{StoredCalibration, load_saved_params_for_device};
 use crate::app::usecases::ptz_controller::{AxisEkf, AxisEkfConfig, AxisEkfSnapshot};
 use crate::app::usecases::ptz_get_absolute_raw::{PtzRawPosition, map_status_to_raw_position};
+use crate::app::usecases::ptz_transport;
 use crate::core::error::{AppError, AppResult, ErrorKind};
 use crate::core::model::{AxisModelParams, NumericRange, PtzDirection};
 use crate::interfaces::runtime;
@@ -144,6 +145,7 @@ fn run_closed_loop(
     state_path: &Path,
 ) -> AppResult<PtzRawPosition> {
     let status_with_ranges = ptz::get_ptz_status(client, channel).ok();
+    let saved_calibration = load_saved_calibration_for_channel(client, channel);
     let initial_status = ptz::get_ptz_cur_pos(client, channel)?;
     let initial = map_status_to_raw_position(&initial_status)?;
 
@@ -151,6 +153,12 @@ fn run_closed_loop(
         status_with_ranges
             .as_ref()
             .and_then(|status| status.pan_range.as_ref()),
+        saved_calibration.as_ref().map(|stored| {
+            (
+                stored.calibration.pan_min_count,
+                stored.calibration.pan_max_count,
+            )
+        }),
         initial.pan_count,
         DEFAULT_PAN_MIN_COUNT,
         DEFAULT_PAN_MAX_COUNT,
@@ -159,6 +167,12 @@ fn run_closed_loop(
         status_with_ranges
             .as_ref()
             .and_then(|status| status.tilt_range.as_ref()),
+        saved_calibration.as_ref().map(|stored| {
+            (
+                stored.calibration.tilt_min_count,
+                stored.calibration.tilt_max_count,
+            )
+        }),
         initial.tilt_count,
         DEFAULT_TILT_MIN_COUNT,
         DEFAULT_TILT_MAX_COUNT,
@@ -166,8 +180,14 @@ fn run_closed_loop(
 
     let pan_span = (pan_max_count - pan_min_count).abs().max(1.0);
     let tilt_span = (tilt_max_count - tilt_min_count).abs().max(1.0);
-    let pan_model = model_for_span(pan_span);
-    let tilt_model = model_for_span(tilt_span);
+    let pan_model = saved_calibration
+        .as_ref()
+        .map(|stored| sanitize_model_params(stored.calibration.pan_model, pan_span))
+        .unwrap_or_else(|| model_for_span(pan_span));
+    let tilt_model = saved_calibration
+        .as_ref()
+        .map(|stored| sanitize_model_params(stored.calibration.tilt_model, tilt_span))
+        .unwrap_or_else(|| model_for_span(tilt_span));
     let pan_ekf_config = ekf_config(pan_min_count, pan_max_count);
     let tilt_ekf_config = ekf_config(tilt_min_count, tilt_max_count);
 
@@ -186,7 +206,7 @@ fn run_closed_loop(
     let mut prev_pan_error_measured: Option<f64> = None;
     let mut prev_tilt_error_measured: Option<f64> = None;
     let started = Instant::now();
-    let deadband_hints = load_axis_deadband_hints(client, channel);
+    let deadband_hints = load_axis_deadband_hints(saved_calibration.as_ref());
     let min_updates = if timeout_ms >= 3_000 {
         MIN_ADAPTIVE_UPDATES
     } else {
@@ -382,7 +402,7 @@ fn run_closed_loop(
                 step_error_abs = command_error_abs;
                 let speed = speed_cap_for_error(command_error_abs).max(1);
                 let pulse_ms = control_pulse_ms_for_error(command_error_abs);
-                ptz::move_ptz(client, channel, direction, speed, Some(pulse_ms))?;
+                ptz_transport::move_ptz(client, channel, direction, speed, Some(pulse_ms))?;
                 let elapsed_ms = Instant::now()
                     .saturating_duration_since(started)
                     .as_millis();
@@ -429,21 +449,41 @@ fn model_for_span(span: f64) -> AxisModelParams {
     }
 }
 
-fn load_axis_deadband_hints(client: &Client, channel: u8) -> AxisDeadbandHints {
+fn sanitize_model_params(model: AxisModelParams, span: f64) -> AxisModelParams {
+    let fallback = model_for_span(span);
+    let alpha = if model.alpha.is_finite() {
+        model.alpha.clamp(0.5, 0.999)
+    } else {
+        fallback.alpha
+    };
+    let beta = if model.beta.is_finite() {
+        model.beta.clamp(MODEL_BETA_MIN, MODEL_BETA_MAX)
+    } else {
+        fallback.beta
+    };
+
+    AxisModelParams { alpha, beta }
+}
+
+fn load_saved_calibration_for_channel(client: &Client, channel: u8) -> Option<StoredCalibration> {
+    let device_info = device::get_dev_info(client).ok()?;
+    let (stored, _) = load_saved_params_for_device(&device_info).ok().flatten()?;
+    if stored.channel == channel {
+        Some(stored)
+    } else {
+        None
+    }
+}
+
+fn load_axis_deadband_hints(stored: Option<&StoredCalibration>) -> AxisDeadbandHints {
     let defaults = AxisDeadbandHints {
         pan_count: 0.0,
         tilt_count: 0.0,
     };
 
-    let Some(device_info) = device::get_dev_info(client).ok() else {
+    let Some(stored) = stored else {
         return defaults;
     };
-    let Some((stored, _)) = load_saved_params_for_device(&device_info).ok().flatten() else {
-        return defaults;
-    };
-    if stored.channel != channel {
-        return defaults;
-    }
 
     AxisDeadbandHints {
         pan_count: effective_deadband_hint(stored.calibration.pan_deadband_count),
@@ -479,6 +519,7 @@ fn ekf_config(min_position: f64, max_position: f64) -> AxisEkfConfig {
 
 fn axis_count_bounds(
     range: Option<&NumericRange>,
+    calibration_bounds: Option<(i64, i64)>,
     current_count: i64,
     fallback_min: f64,
     fallback_max: f64,
@@ -486,7 +527,14 @@ fn axis_count_bounds(
     let mut min_count = fallback_min.min(fallback_max);
     let mut max_count = fallback_max.max(fallback_min);
 
-    if let Some(bounds) = range {
+    if let Some((calibration_min, calibration_max)) = calibration_bounds {
+        let raw_min = calibration_min as f64;
+        let raw_max = calibration_max as f64;
+        if raw_min.is_finite() && raw_max.is_finite() {
+            min_count = raw_min.min(raw_max);
+            max_count = raw_min.max(raw_max);
+        }
+    } else if let Some(bounds) = range {
         let raw_min = bounds.min as f64;
         let raw_max = bounds.max as f64;
         if raw_min.is_finite() && raw_max.is_finite() {
@@ -851,7 +899,7 @@ fn finalize_with_best_effort_stop<T>(
     channel: u8,
     result: AppResult<T>,
 ) -> AppResult<T> {
-    let stop_error = ptz::stop_ptz(client, channel).err();
+    let stop_error = ptz_transport::stop_ptz(client, channel).err();
 
     match result {
         Ok(value) => {
@@ -1000,7 +1048,7 @@ mod tests {
             min: -1000,
             max: 2000,
         };
-        let (min_count, max_count) = axis_count_bounds(Some(&range), 3000, -3000.0, 3000.0);
+        let (min_count, max_count) = axis_count_bounds(Some(&range), None, 3000, -3000.0, 3000.0);
         assert!((min_count - -1120.0).abs() < 1e-6);
         assert!((max_count - 3120.0).abs() < 1e-6);
     }

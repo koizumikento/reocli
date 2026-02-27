@@ -10,11 +10,30 @@ const TOKEN_CACHE_PATH_ENV: &str = "REOCLI_TOKEN_CACHE_PATH";
 const USER_ENV: &str = "REOCLI_USER";
 const PASSWORD_ENV: &str = "REOCLI_PASSWORD";
 const CALIBRATION_DIR_ENV: &str = "REOCLI_CALIBRATION_DIR";
+const PTZ_BACKEND_ENV: &str = "REOCLI_PTZ_BACKEND";
+const ONVIF_DEVICE_SERVICE_URL_ENV: &str = "REOCLI_ONVIF_DEVICE_SERVICE_URL";
+const ONVIF_PROFILE_TOKEN_ENV: &str = "REOCLI_ONVIF_PROFILE_TOKEN";
+const ONVIF_PORT_ENV: &str = "REOCLI_ONVIF_PORT";
 const HOME_ENV: &str = "HOME";
 const DEFAULT_USER: &str = "admin";
 const DEFAULT_TOKEN_CACHE_SUBDIR: &str = ".reocli/tokens";
 const DEFAULT_CALIBRATION_SUBDIR: &str = ".reocli/calibration";
+const DEFAULT_ONVIF_PORT: u16 = 8_000;
 const UNKNOWN_KEY_COMPONENT: &str = "unknown";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PtzBackend {
+    Cgi,
+    OnvifContinuous,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct OnvifConfig {
+    pub device_service_url: String,
+    pub user_name: String,
+    pub password: String,
+    pub profile_token: Option<String>,
+}
 
 pub(crate) fn client_from_env() -> Client {
     let endpoint = endpoint_from_env();
@@ -59,8 +78,58 @@ pub(crate) fn calibration_file_path_for_camera(device_info: &DeviceInfo) -> Path
     calibration_dir_from_env().join(format!("{}.json", calibration_camera_key(device_info)))
 }
 
+pub(crate) fn ptz_backend_from_env() -> PtzBackend {
+    let selected = env_var_trimmed(PTZ_BACKEND_ENV)
+        .unwrap_or_else(|| "cgi".to_string())
+        .to_ascii_lowercase();
+    match selected.as_str() {
+        "onvif" | "continuous" | "onvif_continuous" | "onvif-continuous" => {
+            PtzBackend::OnvifContinuous
+        }
+        _ => PtzBackend::Cgi,
+    }
+}
+
+pub(crate) fn onvif_config_from_env() -> Option<OnvifConfig> {
+    let password = env_var_trimmed(PASSWORD_ENV)?;
+    let user_name = env_var_trimmed(USER_ENV).unwrap_or_else(|| DEFAULT_USER.to_string());
+    let profile_token = env_var_trimmed(ONVIF_PROFILE_TOKEN_ENV);
+    let endpoint = endpoint_from_env();
+    let onvif_port = onvif_port_from_env();
+    let device_service_url = env_var_trimmed(ONVIF_DEVICE_SERVICE_URL_ENV)
+        .or_else(|| default_onvif_device_service_url(&endpoint, onvif_port))?;
+
+    Some(OnvifConfig {
+        device_service_url,
+        user_name,
+        password,
+        profile_token,
+    })
+}
+
 fn endpoint_from_env() -> String {
     std::env::var(ENDPOINT_ENV).unwrap_or_else(|_| DEFAULT_ENDPOINT.to_string())
+}
+
+fn onvif_port_from_env() -> u16 {
+    env_var_trimmed(ONVIF_PORT_ENV)
+        .and_then(|raw| raw.parse::<u16>().ok())
+        .filter(|port| *port > 0)
+        .unwrap_or(DEFAULT_ONVIF_PORT)
+}
+
+fn default_onvif_device_service_url(endpoint: &str, onvif_port: u16) -> Option<String> {
+    let parsed = reqwest::Url::parse(endpoint).ok()?;
+    let host = parsed.host_str()?;
+    let mut url = reqwest::Url::parse("http://localhost").ok()?;
+    if url.set_host(Some(host)).is_err() {
+        return None;
+    }
+    if url.set_port(Some(onvif_port)).is_err() {
+        return None;
+    }
+    url.set_path("/onvif/device_service");
+    Some(url.to_string())
 }
 
 fn auth_from_env(token_cache_path: Option<&Path>) -> (Auth, Option<Auth>) {
