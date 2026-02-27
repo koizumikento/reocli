@@ -224,9 +224,17 @@ pub struct CalibrationParams {
     pub pan_min_count: i64,
     pub pan_max_count: i64,
     pub pan_deadband_count: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pan_deadband_increase_count: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pan_deadband_decrease_count: Option<i64>,
     pub tilt_min_count: i64,
     pub tilt_max_count: i64,
     pub tilt_deadband_count: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tilt_deadband_increase_count: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tilt_deadband_decrease_count: Option<i64>,
     pub pan_model: AxisModelParams,
     pub tilt_model: AxisModelParams,
     pub created_at: String,

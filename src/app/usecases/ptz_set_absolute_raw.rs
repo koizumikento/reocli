@@ -25,8 +25,19 @@ const MAX_CONTROL_PULSE_MS: u64 = 220;
 const MICRO_CONTROL_ERROR_COUNT: f64 = 90.0;
 const FINE_CONTROL_ERROR_COUNT: f64 = 180.0;
 const COARSE_CONTROL_ERROR_COUNT: f64 = 320.0;
+const FINE_PHASE_ENTRY_ERROR_COUNT: f64 = 240.0;
+const FINE_RELATIVE_STEP_GAIN: f64 = 0.55;
+const FINE_RELATIVE_STEP_MIN_COUNT: f64 = 4.0;
+const FINE_RELATIVE_STEP_MAX_COUNT: f64 = 96.0;
+const FINE_FEEDFORWARD_GAIN: f64 = 0.28;
+const FINE_FEEDFORWARD_MAX_COUNT: f64 = 72.0;
+const BACKEND_COMPLETION_MIN_AGE_MS: u64 = 120;
 const REVERSAL_GUARD_MULTIPLIER: f64 = 4.0;
 const REVERSAL_GUARD_MIN_COUNT: f64 = 40.0;
+const REVERSAL_GUARD_MOMENTUM_MIN_SCALE: f64 = 0.6;
+const REVERSAL_GUARD_NEAR_TARGET_RATIO: f64 = 1.8;
+const REVERSAL_GUARD_NEAR_TARGET_MIN_COUNT: f64 = 26.0;
+const REVERSAL_GUARD_NEAR_TARGET_MIN_SCALE: f64 = 0.24;
 const DUAL_AXIS_DOMINANCE_RATIO: f64 = 1.2;
 const TIE_BREAK_CLOSE_ERROR_COUNT: f64 = 320.0;
 const OSCILLATION_REVERSAL_THRESHOLD: usize = 4;
@@ -101,6 +112,28 @@ struct BestObservedState {
 struct AxisDeadbandHints {
     pan_count: f64,
     tilt_count: f64,
+    pan_positive_count: f64,
+    pan_negative_count: f64,
+    tilt_positive_count: f64,
+    tilt_negative_count: f64,
+}
+
+impl AxisDeadbandHints {
+    fn pan_for_error(self, error: f64) -> f64 {
+        if error >= 0.0 {
+            self.pan_positive_count
+        } else {
+            self.pan_negative_count
+        }
+    }
+
+    fn tilt_for_error(self, error: f64) -> f64 {
+        if error >= 0.0 {
+            self.tilt_positive_count
+        } else {
+            self.tilt_negative_count
+        }
+    }
 }
 
 pub fn execute(
@@ -206,12 +239,28 @@ fn run_closed_loop(
     let mut prev_pan_error_measured: Option<f64> = None;
     let mut prev_tilt_error_measured: Option<f64> = None;
     let started = Instant::now();
+    let onvif_options = ptz_transport::get_onvif_configuration_options(client, channel)
+        .ok()
+        .flatten();
     let deadband_hints = load_axis_deadband_hints(saved_calibration.as_ref());
+    let supports_relative_move = ptz_transport::supports_relative_move_for_channel(client, channel)
+        .ok()
+        .unwrap_or_else(ptz_transport::supports_relative_move);
+    let backend_completion_min_age_ms = if onvif_options
+        .as_ref()
+        .is_some_and(|options| options.has_timeout_range)
+    {
+        BACKEND_COMPLETION_MIN_AGE_MS
+    } else {
+        BACKEND_COMPLETION_MIN_AGE_MS + 60
+    };
     let min_updates = if timeout_ms >= 3_000 {
         MIN_ADAPTIVE_UPDATES
     } else {
         1
     };
+    let mut previous_pan_measure = Some(initial.pan_count as f64);
+    let mut previous_tilt_measure = Some(initial.tilt_count as f64);
 
     if let Some(stored) = load_stored_ekf_state(state_path, state_key, channel)? {
         if let Some(restored_pan) =
@@ -277,6 +326,49 @@ fn run_closed_loop(
             select_control_error(pan_error_estimated, pan_error_measured, tolerance_count);
         let tilt_error_control =
             select_control_error(tilt_error_estimated, tilt_error_measured, tolerance_count);
+        let pan_observed_delta = previous_pan_measure.map(|previous| pan_measure - previous);
+        let tilt_observed_delta = previous_tilt_measure.map(|previous| tilt_measure - previous);
+        previous_pan_measure = Some(pan_measure);
+        previous_tilt_measure = Some(tilt_measure);
+        let fine_phase_candidate = supports_relative_move
+            && pan_error_measured.abs().max(tilt_error_measured.abs())
+                <= FINE_PHASE_ENTRY_ERROR_COUNT;
+
+        let guarded_pan_error = apply_reversal_guard(
+            pan_error_control,
+            last_pan_u,
+            tolerance_count as f64,
+            deadband_hints.pan_for_error(pan_error_control),
+        );
+        let guarded_tilt_error = apply_reversal_guard(
+            tilt_error_control,
+            last_tilt_u,
+            tolerance_count as f64,
+            deadband_hints.tilt_for_error(tilt_error_control),
+        );
+        let pan_command_error = if fine_phase_candidate {
+            apply_fine_phase_feedforward(
+                guarded_pan_error,
+                pan_model.beta,
+                last_pan_u,
+                pan_observed_delta,
+                tolerance_count as f64,
+            )
+        } else {
+            guarded_pan_error
+        };
+        let tilt_command_error = if fine_phase_candidate {
+            apply_fine_phase_feedforward(
+                guarded_tilt_error,
+                tilt_model.beta,
+                last_tilt_u,
+                tilt_observed_delta,
+                tolerance_count as f64,
+            )
+        } else {
+            guarded_tilt_error
+        };
+
         consider_best(
             &mut best_observed,
             current.pan_count,
@@ -288,7 +380,10 @@ fn run_closed_loop(
 
         let within_tolerance = pan_error_measured.abs() <= pan_tolerance
             && tilt_error_measured.abs() <= tilt_tolerance;
-        if within_tolerance && loop_updates >= min_updates {
+        let backend_motion_hint = ptz_transport::motion_status_hint(client, channel);
+        let backend_completion_ready =
+            completion_gate_allows_success(backend_motion_hint, backend_completion_min_age_ms);
+        if within_tolerance && loop_updates >= min_updates && backend_completion_ready {
             stable_steps += 1;
         } else {
             stable_steps = 0;
@@ -308,7 +403,7 @@ fn run_closed_loop(
         }
 
         if Instant::now() >= deadline {
-            if within_tolerance {
+            if within_tolerance && backend_completion_ready {
                 save_stored_ekf_state(
                     state_path,
                     state_key,
@@ -343,7 +438,7 @@ fn run_closed_loop(
             return Err(AppError::new(
                 ErrorKind::UnexpectedResponse,
                 format!(
-                    "set_absolute_raw timeout after {}ms on channel {channel}: target=({},{}) current=({},{}) measured_error=({:.1},{:.1}) estimated_error=({:.1},{:.1}) control_error=({:.1},{:.1}) tolerance={} effective_tolerance=({:.1},{:.1}) reversals=({},{}) updates={} stable_steps={} last_dt_sec={:.3} best=({},{}) best_error=({},{}) trace=[{}]{}",
+                    "set_absolute_raw timeout after {}ms on channel {channel}: target=({},{}) current=({},{}) measured_error=({:.1},{:.1}) estimated_error=({:.1},{:.1}) control_error=({:.1},{:.1}) command_error=({:.1},{:.1}) tolerance={} effective_tolerance=({:.1},{:.1}) reversals=({},{}) updates={} stable_steps={} last_dt_sec={:.3} backend_hint={} best=({},{}) best_error=({},{}) trace=[{}]{}",
                     timeout_ms,
                     target_pan_count,
                     target_tilt_count,
@@ -355,6 +450,8 @@ fn run_closed_loop(
                     tilt_error_estimated,
                     pan_error_control,
                     tilt_error_control,
+                    pan_command_error,
+                    tilt_command_error,
                     tolerance_count,
                     pan_tolerance,
                     tilt_tolerance,
@@ -363,6 +460,7 @@ fn run_closed_loop(
                     loop_updates,
                     stable_steps,
                     effective_dt_sec,
+                    format_transport_hint(backend_motion_hint),
                     best.pan_count,
                     best.tilt_count,
                     best.pan_abs_error,
@@ -373,56 +471,93 @@ fn run_closed_loop(
             ));
         }
 
-        let guarded_pan_error = apply_reversal_guard(
-            pan_error_control,
-            last_pan_u,
-            tolerance_count as f64,
-            deadband_hints.pan_count,
-        );
-        let guarded_tilt_error = apply_reversal_guard(
-            tilt_error_control,
-            last_tilt_u,
-            tolerance_count as f64,
-            deadband_hints.tilt_count,
-        );
-        let dual_axis_active = guarded_pan_error.abs() > tolerance_count as f64
-            && guarded_tilt_error.abs() > tolerance_count as f64;
+        let dual_axis_active = pan_command_error.abs() > tolerance_count as f64
+            && tilt_command_error.abs() > tolerance_count as f64;
         let dual_axis_close = dual_axis_active
-            && guarded_pan_error.abs() <= TIE_BREAK_CLOSE_ERROR_COUNT
-            && guarded_tilt_error.abs() <= TIE_BREAK_CLOSE_ERROR_COUNT;
-        let mut step_error_abs = guarded_pan_error.abs().max(guarded_tilt_error.abs());
+            && pan_command_error.abs() <= TIE_BREAK_CLOSE_ERROR_COUNT
+            && tilt_command_error.abs() <= TIE_BREAK_CLOSE_ERROR_COUNT;
+        let mut step_error_abs = pan_command_error.abs().max(tilt_command_error.abs());
+        let mut relative_command_applied = false;
 
-        match command_from_errors(
-            guarded_pan_error,
-            guarded_tilt_error,
-            tolerance_count as f64,
-            tie_break_pan,
-        ) {
-            Some((direction, command_error_abs)) => {
-                step_error_abs = command_error_abs;
-                let speed = speed_cap_for_error(command_error_abs).max(1);
-                let pulse_ms = control_pulse_ms_for_error(command_error_abs);
-                ptz_transport::move_ptz(client, channel, direction, speed, Some(pulse_ms))?;
-                let elapsed_ms = Instant::now()
-                    .saturating_duration_since(started)
-                    .as_millis();
-                command_trace.push(format!(
-                    "t={}ms:{:?}/s{}/{}ms e=({:.1},{:.1})",
-                    elapsed_ms, direction, speed, pulse_ms, guarded_pan_error, guarded_tilt_error
-                ));
-                if command_trace.len() > 24 {
-                    command_trace.remove(0);
-                }
-                let (pan_u, tilt_u) = control_components_from_command(direction, speed, pulse_ms);
-                last_pan_u = pan_u;
-                last_tilt_u = tilt_u;
-                if dual_axis_close {
-                    tie_break_pan = !tie_break_pan;
+        if fine_phase_candidate {
+            let pan_relative_delta =
+                relative_delta_from_error(pan_command_error, tolerance_count as f64);
+            let tilt_relative_delta =
+                relative_delta_from_error(tilt_command_error, tolerance_count as f64);
+            if pan_relative_delta != 0 || tilt_relative_delta != 0 {
+                relative_command_applied = ptz_transport::move_relative_ptz(
+                    client,
+                    channel,
+                    pan_relative_delta,
+                    tilt_relative_delta,
+                )?;
+                if relative_command_applied {
+                    let elapsed_ms = Instant::now()
+                        .saturating_duration_since(started)
+                        .as_millis();
+                    command_trace.push(format!(
+                        "t={}ms:rel=({},{}) e=({:.1},{:.1})",
+                        elapsed_ms,
+                        pan_relative_delta,
+                        tilt_relative_delta,
+                        pan_command_error,
+                        tilt_command_error
+                    ));
+                    if command_trace.len() > 24 {
+                        command_trace.remove(0);
+                    }
+                    let (pan_u, tilt_u) = control_components_from_relative_step(
+                        pan_relative_delta,
+                        tilt_relative_delta,
+                    );
+                    last_pan_u = pan_u;
+                    last_tilt_u = tilt_u;
+                    if pan_relative_delta != 0 && tilt_relative_delta != 0 {
+                        tie_break_pan = !tie_break_pan;
+                    }
                 }
             }
-            None => {
-                last_pan_u = 0.0;
-                last_tilt_u = 0.0;
+        }
+
+        if !relative_command_applied {
+            match command_from_errors(
+                pan_command_error,
+                tilt_command_error,
+                tolerance_count as f64,
+                tie_break_pan,
+            ) {
+                Some((direction, command_error_abs)) => {
+                    step_error_abs = command_error_abs;
+                    let speed = speed_cap_for_error(command_error_abs).max(1);
+                    let pulse_ms = control_pulse_ms_for_error(command_error_abs);
+                    ptz_transport::move_ptz(client, channel, direction, speed, Some(pulse_ms))?;
+                    let elapsed_ms = Instant::now()
+                        .saturating_duration_since(started)
+                        .as_millis();
+                    command_trace.push(format!(
+                        "t={}ms:{:?}/s{}/{}ms e=({:.1},{:.1})",
+                        elapsed_ms,
+                        direction,
+                        speed,
+                        pulse_ms,
+                        pan_command_error,
+                        tilt_command_error
+                    ));
+                    if command_trace.len() > 24 {
+                        command_trace.remove(0);
+                    }
+                    let (pan_u, tilt_u) =
+                        control_components_from_command(direction, speed, pulse_ms);
+                    last_pan_u = pan_u;
+                    last_tilt_u = tilt_u;
+                    if dual_axis_close {
+                        tie_break_pan = !tie_break_pan;
+                    }
+                }
+                None => {
+                    last_pan_u = 0.0;
+                    last_tilt_u = 0.0;
+                }
             }
         }
 
@@ -479,15 +614,48 @@ fn load_axis_deadband_hints(stored: Option<&StoredCalibration>) -> AxisDeadbandH
     let defaults = AxisDeadbandHints {
         pan_count: 0.0,
         tilt_count: 0.0,
+        pan_positive_count: 0.0,
+        pan_negative_count: 0.0,
+        tilt_positive_count: 0.0,
+        tilt_negative_count: 0.0,
     };
 
     let Some(stored) = stored else {
         return defaults;
     };
 
+    let pan_positive_count = effective_deadband_hint(
+        stored
+            .calibration
+            .pan_deadband_increase_count
+            .unwrap_or(stored.calibration.pan_deadband_count),
+    );
+    let pan_negative_count = effective_deadband_hint(
+        stored
+            .calibration
+            .pan_deadband_decrease_count
+            .unwrap_or(stored.calibration.pan_deadband_count),
+    );
+    let tilt_positive_count = effective_deadband_hint(
+        stored
+            .calibration
+            .tilt_deadband_increase_count
+            .unwrap_or(stored.calibration.tilt_deadband_count),
+    );
+    let tilt_negative_count = effective_deadband_hint(
+        stored
+            .calibration
+            .tilt_deadband_decrease_count
+            .unwrap_or(stored.calibration.tilt_deadband_count),
+    );
+
     AxisDeadbandHints {
-        pan_count: effective_deadband_hint(stored.calibration.pan_deadband_count),
-        tilt_count: effective_deadband_hint(stored.calibration.tilt_deadband_count),
+        pan_count: pan_positive_count.max(pan_negative_count),
+        tilt_count: tilt_positive_count.max(tilt_negative_count),
+        pan_positive_count,
+        pan_negative_count,
+        tilt_positive_count,
+        tilt_negative_count,
     }
 }
 
@@ -677,6 +845,101 @@ fn control_step_ms_for_error(error_abs: f64) -> u64 {
     base.max(SETTLE_STEP_MS)
 }
 
+fn completion_gate_allows_success(
+    hint: Option<ptz_transport::TransportMotionHint>,
+    min_age_ms: u64,
+) -> bool {
+    let Some(hint) = hint else {
+        return true;
+    };
+
+    if hint.moving == Some(true) {
+        return false;
+    }
+    hint.move_age_ms.is_none_or(|age_ms| age_ms >= min_age_ms)
+}
+
+fn format_transport_hint(hint: Option<ptz_transport::TransportMotionHint>) -> String {
+    let Some(hint) = hint else {
+        return "none".to_string();
+    };
+
+    let moving = match hint.moving {
+        Some(true) => "moving",
+        Some(false) => "stopped",
+        None => "unknown",
+    };
+    let age = hint
+        .move_age_ms
+        .map(|value| format!("{value}ms"))
+        .unwrap_or_else(|| "n/a".to_string());
+    format!("{moving}@{age}")
+}
+
+fn apply_fine_phase_feedforward(
+    command_error: f64,
+    model_beta: f64,
+    last_u: f64,
+    observed_delta: Option<f64>,
+    tolerance_count: f64,
+) -> f64 {
+    if !command_error.is_finite()
+        || !model_beta.is_finite()
+        || !last_u.is_finite()
+        || last_u.abs() <= f64::EPSILON
+    {
+        return command_error;
+    }
+    let Some(observed_delta) = observed_delta.filter(|value| value.is_finite()) else {
+        return command_error;
+    };
+
+    let predicted_delta = model_beta * last_u;
+    let residual_bias = predicted_delta - observed_delta;
+    let feedforward_limit = (tolerance_count * 2.2).clamp(14.0, FINE_FEEDFORWARD_MAX_COUNT);
+    let feedforward =
+        (residual_bias * FINE_FEEDFORWARD_GAIN).clamp(-feedforward_limit, feedforward_limit);
+    command_error + feedforward
+}
+
+fn relative_delta_from_error(command_error: f64, tolerance_count: f64) -> i64 {
+    if !command_error.is_finite() || command_error.abs() <= tolerance_count {
+        return 0;
+    }
+
+    let magnitude = (command_error.abs() * FINE_RELATIVE_STEP_GAIN)
+        .clamp(FINE_RELATIVE_STEP_MIN_COUNT, FINE_RELATIVE_STEP_MAX_COUNT)
+        .round() as i64;
+    if command_error.is_sign_positive() {
+        magnitude
+    } else {
+        -magnitude
+    }
+}
+
+fn control_components_from_relative_step(
+    pan_delta_count: i64,
+    tilt_delta_count: i64,
+) -> (f64, f64) {
+    let axis_component = |delta_count: i64| -> f64 {
+        if delta_count == 0 {
+            return 0.0;
+        }
+        let magnitude =
+            ((delta_count.unsigned_abs() as f64) / FINE_RELATIVE_STEP_MAX_COUNT).clamp(0.2, 0.9);
+        if delta_count.is_positive() {
+            magnitude
+        } else {
+            -magnitude
+        }
+    };
+
+    (
+        axis_component(pan_delta_count),
+        axis_component(tilt_delta_count),
+    )
+}
+
 fn apply_reversal_guard(
     error: f64,
     last_u: f64,
@@ -698,14 +961,36 @@ fn apply_reversal_guard(
         return error;
     }
 
+    let momentum_scale = last_u.abs().clamp(REVERSAL_GUARD_MOMENTUM_MIN_SCALE, 1.0);
+    let deadband_ratio = dynamic_guard_deadband_ratio(deadband_hint_count, tolerance_count);
     let guard_threshold = (tolerance_count * REVERSAL_GUARD_MULTIPLIER)
         .max(REVERSAL_GUARD_MIN_COUNT)
-        .max(deadband_hint_count * CALIBRATION_GUARD_DEADBAND_RATIO);
+        .max(deadband_hint_count * deadband_ratio)
+        * momentum_scale;
+    let near_target_threshold = (tolerance_count * REVERSAL_GUARD_NEAR_TARGET_RATIO)
+        .max(REVERSAL_GUARD_NEAR_TARGET_MIN_COUNT)
+        .min(guard_threshold);
+    if error.abs() <= near_target_threshold {
+        let blend = ((error.abs() - tolerance_count)
+            / (near_target_threshold - tolerance_count).max(1.0))
+        .clamp(0.0, 1.0);
+        let scale = REVERSAL_GUARD_NEAR_TARGET_MIN_SCALE
+            + ((1.0 - REVERSAL_GUARD_NEAR_TARGET_MIN_SCALE) * blend);
+        return error * scale;
+    }
     if error.abs() <= guard_threshold {
         0.0
     } else {
         error
     }
+}
+
+fn dynamic_guard_deadband_ratio(deadband_hint_count: f64, tolerance_count: f64) -> f64 {
+    if deadband_hint_count <= 0.0 {
+        return CALIBRATION_GUARD_DEADBAND_RATIO;
+    }
+    let hint_ratio = (deadband_hint_count / tolerance_count.max(1.0)).clamp(0.5, 3.0);
+    (CALIBRATION_GUARD_DEADBAND_RATIO + ((hint_ratio - 1.0) * 0.1)).clamp(0.25, 0.75)
 }
 
 fn update_reversal_counter(
@@ -1029,11 +1314,13 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use super::{
-        adaptive_axis_tolerance, apply_reversal_guard, axis_count_bounds, command_from_errors,
-        control_pulse_ms_for_error, ekf_config, load_stored_ekf_state, save_stored_ekf_state,
-        select_control_error, update_reversal_counter,
+        adaptive_axis_tolerance, apply_fine_phase_feedforward, apply_reversal_guard,
+        axis_count_bounds, command_from_errors, completion_gate_allows_success,
+        control_pulse_ms_for_error, ekf_config, load_stored_ekf_state, relative_delta_from_error,
+        save_stored_ekf_state, select_control_error, update_reversal_counter,
     };
     use crate::app::usecases::ptz_controller::AxisEkf;
+    use crate::app::usecases::ptz_transport::TransportMotionHint;
     use crate::core::model::{AxisModelParams, NumericRange, PtzDirection};
 
     #[test]
@@ -1075,14 +1362,56 @@ mod tests {
 
     #[test]
     fn apply_reversal_guard_blocks_small_reverse_commands() {
-        let blocked = apply_reversal_guard(-80.0, 0.5, 20.0, 0.0);
-        assert_eq!(blocked, 0.0);
+        let blocked = apply_reversal_guard(-30.0, 0.5, 20.0, 0.0);
+        assert!(blocked < -5.0 && blocked > -30.0);
 
         let allowed = apply_reversal_guard(-220.0, 0.5, 20.0, 0.0);
         assert_eq!(allowed, -220.0);
 
         let blocked_by_deadband = apply_reversal_guard(-70.0, 0.5, 10.0, 180.0);
         assert_eq!(blocked_by_deadband, 0.0);
+    }
+
+    #[test]
+    fn apply_fine_phase_feedforward_is_bounded_and_biases_command() {
+        let boosted = apply_fine_phase_feedforward(60.0, 120.0, 0.6, Some(20.0), 20.0);
+        assert!(boosted > 60.0);
+
+        let bounded = apply_fine_phase_feedforward(20.0, 600.0, 1.0, Some(-400.0), 20.0);
+        assert!(bounded <= 64.0);
+    }
+
+    #[test]
+    fn relative_delta_from_error_uses_tolerance_window() {
+        assert_eq!(relative_delta_from_error(8.0, 10.0), 0);
+        assert_eq!(relative_delta_from_error(18.0, 10.0), 10);
+        assert_eq!(relative_delta_from_error(-45.0, 10.0), -25);
+    }
+
+    #[test]
+    fn completion_gate_respects_backend_motion_hint() {
+        assert!(completion_gate_allows_success(None, 120));
+        assert!(!completion_gate_allows_success(
+            Some(TransportMotionHint {
+                moving: Some(true),
+                move_age_ms: Some(250),
+            }),
+            120
+        ));
+        assert!(!completion_gate_allows_success(
+            Some(TransportMotionHint {
+                moving: Some(false),
+                move_age_ms: Some(70),
+            }),
+            120
+        ));
+        assert!(completion_gate_allows_success(
+            Some(TransportMotionHint {
+                moving: Some(false),
+                move_age_ms: Some(260),
+            }),
+            120
+        ));
     }
 
     #[test]

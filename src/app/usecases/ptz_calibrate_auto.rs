@@ -37,6 +37,13 @@ const CALIBRATION_RESTORE_MAX_STEPS: usize = 36;
 const CALIBRATION_RESTORE_TOLERANCE: i64 = 10;
 const CALIBRATION_MODEL_SAMPLE_COUNT: usize = 50;
 const DEFAULT_DEADBAND_COUNT: i64 = 6;
+const CALIBRATION_DEADBAND_PROBE_SPEED: u8 = 2;
+const CALIBRATION_DEADBAND_PROBE_MS: u64 = 80;
+const CALIBRATION_DEADBAND_PROBE_COUNT: usize = 7;
+const CALIBRATION_DEADBAND_TRIM_RATIO: f64 = 0.2;
+const CALIBRATION_DEADBAND_SPAN_CLIP_RATIO: f64 = 0.05;
+const CALIBRATION_DEADBAND_SPAN_CLIP_MIN: i64 = DEFAULT_DEADBAND_COUNT;
+const CALIBRATION_DEADBAND_SPAN_CLIP_MAX: i64 = 240;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct StoredCalibration {
@@ -210,6 +217,26 @@ struct AxisMotion {
     decrease: crate::core::model::PtzDirection,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct DirectionalDeadband {
+    increase_count: i64,
+    decrease_count: i64,
+}
+
+impl DirectionalDeadband {
+    fn uniform(count: i64) -> Self {
+        let clamped = count.max(1);
+        Self {
+            increase_count: clamped,
+            decrease_count: clamped,
+        }
+    }
+
+    fn compatibility_count(self) -> i64 {
+        self.increase_count.max(self.decrease_count)
+    }
+}
+
 fn try_build_measured_calibration(
     client: &Client,
     channel: u8,
@@ -234,12 +261,24 @@ fn try_build_measured_calibration(
         let tilt_span = (tilt_max - tilt_min).unsigned_abs() as f64;
         let pan_model = estimate_model_from_sweep(pan_span, &pan_sweep_deltas);
         let tilt_model = estimate_model_from_sweep(tilt_span, &tilt_sweep_deltas);
-        let pan_deadband_count =
-            estimate_deadband_count(client, channel, AxisKind::Pan, pan_motion)
-                .unwrap_or(DEFAULT_DEADBAND_COUNT);
-        let tilt_deadband_count =
-            estimate_deadband_count(client, channel, AxisKind::Tilt, tilt_motion)
-                .unwrap_or(DEFAULT_DEADBAND_COUNT);
+        let pan_deadband = estimate_directional_deadband_count(
+            client,
+            channel,
+            AxisKind::Pan,
+            pan_motion,
+            pan_span,
+        )
+        .unwrap_or_else(|_| DirectionalDeadband::uniform(DEFAULT_DEADBAND_COUNT));
+        let tilt_deadband = estimate_directional_deadband_count(
+            client,
+            channel,
+            AxisKind::Tilt,
+            tilt_motion,
+            tilt_span,
+        )
+        .unwrap_or_else(|_| DirectionalDeadband::uniform(DEFAULT_DEADBAND_COUNT));
+        let pan_deadband_count = pan_deadband.compatibility_count();
+        let tilt_deadband_count = tilt_deadband.compatibility_count();
 
         Ok(CalibrationParams {
             serial_number: device_info.serial_number.clone(),
@@ -248,9 +287,13 @@ fn try_build_measured_calibration(
             pan_min_count: pan_min,
             pan_max_count: pan_max,
             pan_deadband_count,
+            pan_deadband_increase_count: Some(pan_deadband.increase_count),
+            pan_deadband_decrease_count: Some(pan_deadband.decrease_count),
             tilt_min_count: tilt_min,
             tilt_max_count: tilt_max,
             tilt_deadband_count,
+            tilt_deadband_increase_count: Some(tilt_deadband.increase_count),
+            tilt_deadband_decrease_count: Some(tilt_deadband.decrease_count),
             pan_model,
             tilt_model,
             created_at: now_epoch_millis().to_string(),
@@ -442,25 +485,121 @@ fn restore_axis_to_home(
     Ok(())
 }
 
-fn estimate_deadband_count(
+fn estimate_directional_deadband_count(
     client: &Client,
     channel: u8,
     axis: AxisKind,
     motion: AxisMotion,
-) -> AppResult<i64> {
+    span: f64,
+) -> AppResult<DirectionalDeadband> {
+    let mut increase_samples = Vec::with_capacity(CALIBRATION_DEADBAND_PROBE_COUNT);
+    let mut decrease_samples = Vec::with_capacity(CALIBRATION_DEADBAND_PROBE_COUNT);
+
+    for _ in 0..CALIBRATION_DEADBAND_PROBE_COUNT {
+        let sample = measure_directional_deadband_probe(client, channel, axis, motion)?;
+        increase_samples.push(sample.increase_count);
+        decrease_samples.push(sample.decrease_count);
+    }
+
+    Ok(DirectionalDeadband {
+        increase_count: estimate_deadband_from_samples(&increase_samples, span),
+        decrease_count: estimate_deadband_from_samples(&decrease_samples, span),
+    })
+}
+
+fn measure_directional_deadband_probe(
+    client: &Client,
+    channel: u8,
+    axis: AxisKind,
+    motion: AxisMotion,
+) -> AppResult<DirectionalDeadband> {
     let before = read_axis_position(client, channel, axis)?;
-    ptz_transport::move_ptz(client, channel, motion.increase, 2, Some(80))?;
+    ptz_transport::move_ptz(
+        client,
+        channel,
+        motion.increase,
+        CALIBRATION_DEADBAND_PROBE_SPEED,
+        Some(CALIBRATION_DEADBAND_PROBE_MS),
+    )?;
     thread::sleep(Duration::from_millis(CALIBRATION_SETTLE_MS));
     let after_increase = read_axis_position(client, channel, axis)?;
-    ptz_transport::move_ptz(client, channel, motion.decrease, 2, Some(80))?;
+    ptz_transport::move_ptz(
+        client,
+        channel,
+        motion.decrease,
+        CALIBRATION_DEADBAND_PROBE_SPEED,
+        Some(CALIBRATION_DEADBAND_PROBE_MS),
+    )?;
     thread::sleep(Duration::from_millis(CALIBRATION_SETTLE_MS));
     let after_decrease = read_axis_position(client, channel, axis)?;
 
-    let delta_units = (after_increase - before)
-        .abs()
-        .max((after_decrease - after_increase).abs())
-        .max(1);
-    Ok(delta_units.max(1))
+    Ok(DirectionalDeadband {
+        increase_count: (after_increase - before).abs().max(1),
+        decrease_count: (after_decrease - after_increase).abs().max(1),
+    })
+}
+
+fn estimate_deadband_from_samples(samples: &[i64], span: f64) -> i64 {
+    let robust = robust_deadband_from_samples(samples).unwrap_or(DEFAULT_DEADBAND_COUNT);
+    clip_deadband_estimate(robust, span)
+}
+
+fn robust_deadband_from_samples(samples: &[i64]) -> Option<i64> {
+    let mut sorted = samples
+        .iter()
+        .copied()
+        .filter(|sample| *sample > 0)
+        .collect::<Vec<_>>();
+    if sorted.is_empty() {
+        return None;
+    }
+    sorted.sort_unstable();
+
+    let median = median_of_sorted_i64(&sorted);
+    let trimmed_mean = trimmed_mean_of_sorted_i64(&sorted, CALIBRATION_DEADBAND_TRIM_RATIO);
+    let blended = ((median + trimmed_mean) * 0.5).round() as i64;
+    Some(blended.max(1))
+}
+
+fn median_of_sorted_i64(sorted: &[i64]) -> f64 {
+    if sorted.is_empty() {
+        return 0.0;
+    }
+
+    let mid = sorted.len() / 2;
+    if sorted.len() % 2 == 1 {
+        sorted[mid] as f64
+    } else {
+        (sorted[mid - 1] as f64 + sorted[mid] as f64) * 0.5
+    }
+}
+
+fn trimmed_mean_of_sorted_i64(sorted: &[i64], trim_ratio: f64) -> f64 {
+    if sorted.is_empty() {
+        return 0.0;
+    }
+
+    let max_trim = sorted.len().saturating_sub(1) / 2;
+    let requested_trim = (sorted.len() as f64 * trim_ratio).floor() as usize;
+    let trim = requested_trim.min(max_trim);
+    let trimmed = &sorted[trim..(sorted.len() - trim)];
+    let sum = trimmed.iter().sum::<i64>();
+    sum as f64 / trimmed.len() as f64
+}
+
+fn clip_deadband_estimate(raw_deadband: i64, span: f64) -> i64 {
+    let upper_bound = deadband_upper_bound_for_span(span);
+    raw_deadband.abs().max(1).min(upper_bound)
+}
+
+fn deadband_upper_bound_for_span(span: f64) -> i64 {
+    let span_based_cap = (span.abs() * CALIBRATION_DEADBAND_SPAN_CLIP_RATIO).round() as i64;
+    span_based_cap
+        .clamp(
+            CALIBRATION_DEADBAND_SPAN_CLIP_MIN,
+            CALIBRATION_DEADBAND_SPAN_CLIP_MAX,
+        )
+        .max(1)
 }
 
 fn pulse(
@@ -528,9 +667,13 @@ fn build_heuristic_calibration(device_info: &DeviceInfo, status: &PtzStatus) -> 
         pan_min_count: pan_range.min_count,
         pan_max_count: pan_range.max_count,
         pan_deadband_count: DEFAULT_DEADBAND_COUNT,
+        pan_deadband_increase_count: Some(DEFAULT_DEADBAND_COUNT),
+        pan_deadband_decrease_count: Some(DEFAULT_DEADBAND_COUNT),
         tilt_min_count: tilt_range.min_count,
         tilt_max_count: tilt_range.max_count,
         tilt_deadband_count: DEFAULT_DEADBAND_COUNT,
+        tilt_deadband_increase_count: Some(DEFAULT_DEADBAND_COUNT),
+        tilt_deadband_decrease_count: Some(DEFAULT_DEADBAND_COUNT),
         pan_model: fallback_model_for_span(pan_span),
         tilt_model: fallback_model_for_span(tilt_span),
         created_at: now_epoch_millis().to_string(),
@@ -692,8 +835,9 @@ fn now_epoch_millis() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::{
-        build_axis_count_range, estimate_model_from_sweep, evenly_spaced_samples,
-        map_status_to_counts,
+        DirectionalDeadband, build_axis_count_range, deadband_upper_bound_for_span,
+        estimate_deadband_from_samples, estimate_model_from_sweep, evenly_spaced_samples,
+        map_status_to_counts, robust_deadband_from_samples,
     };
     use crate::core::model::{NumericRange, PtzStatus};
 
@@ -751,5 +895,28 @@ mod tests {
         assert_eq!(sampled.len(), 50);
         assert_eq!(sampled.first().copied(), Some(0.0));
         assert_eq!(sampled.last().copied(), Some(99.0));
+    }
+
+    #[test]
+    fn robust_deadband_from_samples_resists_large_outliers() {
+        let estimate =
+            robust_deadband_from_samples(&[7, 8, 7, 6, 140, 7, 8]).expect("estimate should exist");
+        assert_eq!(estimate, 7);
+    }
+
+    #[test]
+    fn estimate_deadband_from_samples_clips_to_span_upper_bound() {
+        let span = 1_000.0;
+        let clipped = estimate_deadband_from_samples(&[240, 250, 260, 270, 280], span);
+        assert_eq!(clipped, deadband_upper_bound_for_span(span));
+    }
+
+    #[test]
+    fn directional_deadband_compatibility_uses_max_direction() {
+        let directional = DirectionalDeadband {
+            increase_count: 9,
+            decrease_count: 14,
+        };
+        assert_eq!(directional.compatibility_count(), 14);
     }
 }
