@@ -641,6 +641,202 @@ fn reocli_ptz_get_absolute_works() {
     assert!(stdout.contains("tilt_count=-80"));
 }
 
+#[test]
+fn reocli_ptz_onvif_status_works() {
+    let mut server = Server::new();
+    setup_onvif_service_discovery_mocks(&mut server, "Profile000", Some("Ptz000"));
+    let _status_mock = server
+        .mock("POST", "/onvif/ptz_service")
+        .match_body(Matcher::AllOf(vec![
+            Matcher::Regex("GetStatus".to_string()),
+            Matcher::Regex("Profile000".to_string()),
+        ]))
+        .with_status(200)
+        .with_header("content-type", "application/soap+xml; charset=utf-8")
+        .with_body(
+            r#"
+            <s:Envelope xmlns:s="http://www.w3.org/2003/05/soap-envelope">
+              <s:Body>
+                <tptz:GetStatusResponse xmlns:tptz="http://www.onvif.org/ver20/ptz/wsdl">
+                  <tptz:PTZStatus>
+                    <tt:Position xmlns:tt="http://www.onvif.org/ver10/schema">
+                      <tt:PanTilt x="0.250000" y="-0.125000"/>
+                    </tt:Position>
+                    <tt:MoveStatus xmlns:tt="http://www.onvif.org/ver10/schema">
+                      <tt:PanTilt>MOVING</tt:PanTilt>
+                    </tt:MoveStatus>
+                    <tt:UtcTime xmlns:tt="http://www.onvif.org/ver10/schema">2026-02-28T00:00:00Z</tt:UtcTime>
+                  </tptz:PTZStatus>
+                </tptz:GetStatusResponse>
+              </s:Body>
+            </s:Envelope>
+            "#,
+        )
+        .expect(1)
+        .create();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_reocli"))
+        .arg("ptz")
+        .arg("onvif")
+        .arg("status")
+        .arg("--channel")
+        .arg("0")
+        .env("REOCLI_PTZ_BACKEND", "onvif")
+        .env("REOCLI_ENDPOINT", server.url())
+        .env(
+            "REOCLI_ONVIF_DEVICE_SERVICE_URL",
+            format!("{}/onvif/device_service", server.url()),
+        )
+        .env("REOCLI_USER", "admin")
+        .env("REOCLI_PASSWORD", "secret")
+        .output()
+        .expect("failed to run reocli ptz onvif status");
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("operation=onvif_status"));
+    assert!(stdout.contains("pan=0.250000"));
+    assert!(stdout.contains("tilt=-0.125000"));
+    assert!(stdout.contains("pan_tilt_move_status=moving"));
+}
+
+#[test]
+fn reocli_ptz_onvif_options_works() {
+    let mut server = Server::new();
+    setup_onvif_service_discovery_mocks(&mut server, "Profile000", Some("Ptz000"));
+    let _options_mock = server
+        .mock("POST", "/onvif/ptz_service")
+        .match_body(Matcher::AllOf(vec![
+            Matcher::Regex("GetConfigurationOptions".to_string()),
+            Matcher::Regex("Ptz000".to_string()),
+        ]))
+        .with_status(200)
+        .with_header("content-type", "application/soap+xml; charset=utf-8")
+        .with_body(
+            r#"
+            <s:Envelope xmlns:s="http://www.w3.org/2003/05/soap-envelope">
+              <s:Body>
+                <tptz:GetConfigurationOptionsResponse xmlns:tptz="http://www.onvif.org/ver20/ptz/wsdl">
+                  <tptz:PTZConfigurationOptions>
+                    <tt:Spaces xmlns:tt="http://www.onvif.org/ver10/schema">
+                      <tt:ContinuousPanTiltVelocitySpace/>
+                      <tt:RelativePanTiltTranslationSpace/>
+                      <tt:PanTiltSpeedSpace/>
+                    </tt:Spaces>
+                    <tt:PTZTimeout xmlns:tt="http://www.onvif.org/ver10/schema">
+                      <tt:Min>PT0S</tt:Min>
+                      <tt:Max>PT10S</tt:Max>
+                    </tt:PTZTimeout>
+                  </tptz:PTZConfigurationOptions>
+                </tptz:GetConfigurationOptionsResponse>
+              </s:Body>
+            </s:Envelope>
+            "#,
+        )
+        .expect(1)
+        .create();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_reocli"))
+        .arg("ptz")
+        .arg("onvif")
+        .arg("options")
+        .arg("--channel")
+        .arg("0")
+        .env("REOCLI_PTZ_BACKEND", "onvif")
+        .env("REOCLI_ENDPOINT", server.url())
+        .env(
+            "REOCLI_ONVIF_DEVICE_SERVICE_URL",
+            format!("{}/onvif/device_service", server.url()),
+        )
+        .env("REOCLI_USER", "admin")
+        .env("REOCLI_PASSWORD", "secret")
+        .output()
+        .expect("failed to run reocli ptz onvif options");
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("operation=onvif_options"));
+    assert!(stdout.contains("supports_relative_pan_tilt_translation=true"));
+    assert!(stdout.contains("timeout_min=PT0S"));
+    assert!(stdout.contains("timeout_max=PT10S"));
+}
+
+#[test]
+fn reocli_ptz_onvif_relative_move_works() {
+    let mut server = Server::new();
+    setup_onvif_service_discovery_mocks(&mut server, "Profile000", Some("Ptz000"));
+    let _options_mock = server
+        .mock("POST", "/onvif/ptz_service")
+        .match_body(Matcher::AllOf(vec![
+            Matcher::Regex("GetConfigurationOptions".to_string()),
+            Matcher::Regex("Ptz000".to_string()),
+        ]))
+        .with_status(200)
+        .with_header("content-type", "application/soap+xml; charset=utf-8")
+        .with_body(
+            r#"
+            <s:Envelope xmlns:s="http://www.w3.org/2003/05/soap-envelope">
+              <s:Body>
+                <tptz:GetConfigurationOptionsResponse xmlns:tptz="http://www.onvif.org/ver20/ptz/wsdl">
+                  <tptz:PTZConfigurationOptions>
+                    <tt:Spaces xmlns:tt="http://www.onvif.org/ver10/schema">
+                      <tt:RelativePanTiltTranslationSpace/>
+                    </tt:Spaces>
+                  </tptz:PTZConfigurationOptions>
+                </tptz:GetConfigurationOptionsResponse>
+              </s:Body>
+            </s:Envelope>
+            "#,
+        )
+        .expect(1)
+        .create();
+    let _relative_move_mock = server
+        .mock("POST", "/onvif/ptz_service")
+        .match_body(Matcher::AllOf(vec![
+            Matcher::Regex("RelativeMove".to_string()),
+            Matcher::Regex("Profile000".to_string()),
+        ]))
+        .with_status(200)
+        .with_header("content-type", "application/soap+xml; charset=utf-8")
+        .with_body(
+            r#"
+            <s:Envelope xmlns:s="http://www.w3.org/2003/05/soap-envelope">
+              <s:Body>
+                <tptz:RelativeMoveResponse xmlns:tptz="http://www.onvif.org/ver20/ptz/wsdl"/>
+              </s:Body>
+            </s:Envelope>
+            "#,
+        )
+        .expect(1)
+        .create();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_reocli"))
+        .arg("ptz")
+        .arg("onvif")
+        .arg("relative-move")
+        .arg("40")
+        .arg("-12")
+        .arg("--channel")
+        .arg("0")
+        .env("REOCLI_PTZ_BACKEND", "onvif")
+        .env("REOCLI_ENDPOINT", server.url())
+        .env(
+            "REOCLI_ONVIF_DEVICE_SERVICE_URL",
+            format!("{}/onvif/device_service", server.url()),
+        )
+        .env("REOCLI_USER", "admin")
+        .env("REOCLI_PASSWORD", "secret")
+        .output()
+        .expect("failed to run reocli ptz onvif relative-move");
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("operation=onvif_relative_move"));
+    assert!(stdout.contains("pan_delta_count=40"));
+    assert!(stdout.contains("tilt_delta_count=-12"));
+    assert!(stdout.contains("applied=true"));
+}
+
 fn unique_temp_file_path(prefix: &str, file_name: &str) -> PathBuf {
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -766,4 +962,58 @@ fn cleanup_output_dir(path: &Path) {
     if path.exists() {
         let _ = fs::remove_dir_all(path);
     }
+}
+
+fn setup_onvif_service_discovery_mocks(
+    server: &mut Server,
+    profile_token: &str,
+    ptz_configuration_token: Option<&str>,
+) {
+    let media_service_url = format!("{}/onvif/media_service", server.url());
+    let ptz_service_url = format!("{}/onvif/ptz_service", server.url());
+    let mut profiles_body = format!(r#"<trt:Profiles token="{profile_token}">"#);
+    if let Some(token) = ptz_configuration_token {
+        profiles_body.push_str(&format!(r#"<tt:PTZConfiguration token="{token}"/>"#));
+    }
+    profiles_body.push_str("</trt:Profiles>");
+
+    let _capabilities_mock = server
+        .mock("POST", "/onvif/device_service")
+        .match_body(Matcher::Regex("GetCapabilities".to_string()))
+        .with_status(200)
+        .with_header("content-type", "application/soap+xml; charset=utf-8")
+        .with_body(format!(
+            r#"
+            <s:Envelope xmlns:s="http://www.w3.org/2003/05/soap-envelope" xmlns:tds="http://www.onvif.org/ver10/device/wsdl" xmlns:tt="http://www.onvif.org/ver10/schema">
+              <s:Body>
+                <tds:GetCapabilitiesResponse>
+                  <tds:Capabilities>
+                    <tt:Media><tt:XAddr>{media_service_url}</tt:XAddr></tt:Media>
+                    <tt:PTZ><tt:XAddr>{ptz_service_url}</tt:XAddr></tt:PTZ>
+                  </tds:Capabilities>
+                </tds:GetCapabilitiesResponse>
+              </s:Body>
+            </s:Envelope>
+            "#
+        ))
+        .expect(1)
+        .create();
+    let _profiles_mock = server
+        .mock("POST", "/onvif/media_service")
+        .match_body(Matcher::Regex("GetProfiles".to_string()))
+        .with_status(200)
+        .with_header("content-type", "application/soap+xml; charset=utf-8")
+        .with_body(format!(
+            r#"
+            <s:Envelope xmlns:s="http://www.w3.org/2003/05/soap-envelope" xmlns:trt="http://www.onvif.org/ver10/media/wsdl" xmlns:tt="http://www.onvif.org/ver10/schema">
+              <s:Body>
+                <trt:GetProfilesResponse>
+                  {profiles_body}
+                </trt:GetProfilesResponse>
+              </s:Body>
+            </s:Envelope>
+            "#
+        ))
+        .expect(1)
+        .create();
 }

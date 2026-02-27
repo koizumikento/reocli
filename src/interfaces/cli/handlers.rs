@@ -5,6 +5,7 @@ use crate::core::error::{AppError, AppResult, ErrorKind};
 use crate::core::model::NumericRange;
 use crate::interfaces::cli::args::{CliCommand, help_text, parse_args};
 use crate::interfaces::runtime::{ability_user_from_env, client_from_env};
+use crate::reolink::onvif::OnvifMoveStatus;
 
 pub fn run(args: &[String]) -> AppResult<String> {
     let command = parse_args(args)?;
@@ -227,6 +228,74 @@ pub fn run(args: &[String]) -> AppResult<String> {
                 format_optional_i64(pose.focus_count),
             ))
         }
+        CliCommand::PtzOnvifStatus { channel } => {
+            ensure_onvif_backend_selected()?;
+            let status = usecases::ptz_transport::get_onvif_status(&client, channel)?.ok_or_else(
+                || {
+                    AppError::new(
+                        ErrorKind::UnexpectedResponse,
+                        format!(
+                            "ONVIF PTZ status is unavailable for channel {channel}; check ONVIF settings and credentials"
+                        ),
+                    )
+                },
+            )?;
+            Ok(format!(
+                "channel={channel}; operation=onvif_status; pan={}; tilt={}; zoom={}; pan_tilt_move_status={}; zoom_move_status={}; utc_time={}",
+                format_optional_f64(status.pan),
+                format_optional_f64(status.tilt),
+                format_optional_f64(status.zoom),
+                format_optional_onvif_move_status(status.pan_tilt_move_status),
+                format_optional_onvif_move_status(status.zoom_move_status),
+                status.utc_time.unwrap_or_else(|| "unknown".to_string()),
+            ))
+        }
+        CliCommand::PtzOnvifOptions { channel } => {
+            ensure_onvif_backend_selected()?;
+            let options = usecases::ptz_transport::get_onvif_configuration_options(&client, channel)?
+                .ok_or_else(|| {
+                AppError::new(
+                    ErrorKind::UnexpectedResponse,
+                    format!(
+                        "ONVIF PTZ configuration options are unavailable for channel {channel}; check ONVIF settings and credentials"
+                    ),
+                )
+            })?;
+            Ok(format!(
+                "channel={channel}; operation=onvif_options; supports_continuous_pan_tilt_velocity={}; supports_relative_pan_tilt_translation={}; supports_relative_pan_tilt_speed={}; has_timeout_range={}; timeout_min={}; timeout_max={}",
+                options.supports_continuous_pan_tilt_velocity,
+                options.supports_relative_pan_tilt_translation,
+                options.supports_relative_pan_tilt_speed,
+                options.has_timeout_range,
+                options.timeout_min.unwrap_or_else(|| "unknown".to_string()),
+                options.timeout_max.unwrap_or_else(|| "unknown".to_string()),
+            ))
+        }
+        CliCommand::PtzOnvifRelativeMove {
+            channel,
+            pan_delta_count,
+            tilt_delta_count,
+        } => {
+            ensure_onvif_backend_selected()?;
+            let applied = usecases::ptz_transport::move_relative_ptz(
+                &client,
+                channel,
+                pan_delta_count,
+                tilt_delta_count,
+            )?;
+            if !applied {
+                return Err(AppError::new(
+                    ErrorKind::UnsupportedCommand,
+                    format!(
+                        "ONVIF RelativeMove is not supported on channel {channel} (pan_delta_count={pan_delta_count}, tilt_delta_count={tilt_delta_count})"
+                    ),
+                ));
+            }
+
+            Ok(format!(
+                "channel={channel}; operation=onvif_relative_move; pan_delta_count={pan_delta_count}; tilt_delta_count={tilt_delta_count}; applied={applied}",
+            ))
+        }
         CliCommand::Preflight { user_name } => {
             let report = run_preflight(&client, &user_name)?;
             Ok(format!(
@@ -260,6 +329,31 @@ fn format_optional_range(range: Option<&NumericRange>) -> String {
     range
         .map(|bounds| format!("{}..{}", bounds.min, bounds.max))
         .unwrap_or_else(|| "unknown".to_string())
+}
+
+fn format_optional_f64(value: Option<f64>) -> String {
+    value
+        .map(|raw| format!("{raw:.6}"))
+        .unwrap_or_else(|| "unknown".to_string())
+}
+
+fn format_optional_onvif_move_status(status: Option<OnvifMoveStatus>) -> &'static str {
+    match status {
+        Some(OnvifMoveStatus::Idle) => "idle",
+        Some(OnvifMoveStatus::Moving) => "moving",
+        Some(OnvifMoveStatus::Unknown) | None => "unknown",
+    }
+}
+
+fn ensure_onvif_backend_selected() -> AppResult<()> {
+    if usecases::ptz_transport::supports_relative_move() {
+        return Ok(());
+    }
+
+    Err(AppError::new(
+        ErrorKind::InvalidInput,
+        "ONVIF PTZ command requires REOCLI_PTZ_BACKEND=onvif",
+    ))
 }
 
 fn ensure_command_supported(

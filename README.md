@@ -50,6 +50,9 @@ Rust ベースの Reolink CLI/MCP 実験用プロジェクトです。
 - `reocli ptz calibrate auto [--channel <0-255>]`
 - `reocli ptz set-absolute <pan_count> <tilt_count> [--tol-count <i64>] [--timeout-ms <u64>] [--channel <0-255>]`
 - `reocli ptz get-absolute [--channel <0-255>]`
+- `reocli ptz onvif status [--channel <0-255>]`
+- `reocli ptz onvif options [--channel <0-255>]`
+- `reocli ptz onvif relative-move <pan_delta_count> <tilt_delta_count> [--channel <0-255>]`
 - `reocli preflight [user]`
 
 `snap` と PTZ 制御系コマンド（`move` / `stop` / `preset goto` / `calibrate auto` / `set-absolute`）は実行前に `GetAbility` でサポート確認し、未対応なら `UnsupportedCommand` で失敗します。
@@ -99,6 +102,9 @@ reocli ptz preset goto 7 --channel 0
 reocli ptz calibrate auto --channel 0
 reocli ptz set-absolute 1500 -180 --tol-count 12 --timeout-ms 25000 --channel 0
 reocli ptz get-absolute --channel 0
+REOCLI_PTZ_BACKEND=onvif reocli ptz onvif status --channel 0
+REOCLI_PTZ_BACKEND=onvif reocli ptz onvif options --channel 0
+REOCLI_PTZ_BACKEND=onvif reocli ptz onvif relative-move 40 -12 --channel 0
 
 # PTZ (ONVIF ContinuousMove backend)
 REOCLI_PTZ_BACKEND=onvif \

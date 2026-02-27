@@ -63,6 +63,17 @@ pub enum CliCommand {
     PtzGetAbsolute {
         channel: u8,
     },
+    PtzOnvifStatus {
+        channel: u8,
+    },
+    PtzOnvifOptions {
+        channel: u8,
+    },
+    PtzOnvifRelativeMove {
+        channel: u8,
+        pan_delta_count: i64,
+        tilt_delta_count: i64,
+    },
     Preflight {
         user_name: String,
     },
@@ -219,7 +230,7 @@ fn parse_ptz_args(args: &[String]) -> AppResult<CliCommand> {
     let Some(action) = args.first() else {
         return Err(AppError::new(
             ErrorKind::InvalidInput,
-            "ptz requires one of: move, stop, preset, calibrate, set-absolute, get-absolute",
+            "ptz requires one of: move, stop, preset, calibrate, set-absolute, get-absolute, onvif",
         ));
     };
 
@@ -230,11 +241,61 @@ fn parse_ptz_args(args: &[String]) -> AppResult<CliCommand> {
         "calibrate" => parse_ptz_calibrate_args(&args[1..]),
         "set-absolute" => parse_ptz_set_absolute_args(&args[1..]),
         "get-absolute" => parse_ptz_get_absolute_args(&args[1..]),
+        "onvif" => parse_ptz_onvif_args(&args[1..]),
         _ => Err(AppError::new(
             ErrorKind::InvalidInput,
             format!("unknown ptz action: {action}"),
         )),
     }
+}
+
+fn parse_ptz_onvif_args(args: &[String]) -> AppResult<CliCommand> {
+    let Some(action) = args.first() else {
+        return Err(AppError::new(
+            ErrorKind::InvalidInput,
+            "ptz onvif requires one of: status, options, relative-move",
+        ));
+    };
+
+    match action.as_str() {
+        "status" => {
+            let channel = parse_ptz_channel_flag(&args[1..], "ptz onvif status")?;
+            Ok(CliCommand::PtzOnvifStatus { channel })
+        }
+        "options" => {
+            let channel = parse_ptz_channel_flag(&args[1..], "ptz onvif options")?;
+            Ok(CliCommand::PtzOnvifOptions { channel })
+        }
+        "relative-move" => parse_ptz_onvif_relative_move_args(&args[1..]),
+        _ => Err(AppError::new(
+            ErrorKind::InvalidInput,
+            format!("unknown ptz onvif action: {action}"),
+        )),
+    }
+}
+
+fn parse_ptz_onvif_relative_move_args(args: &[String]) -> AppResult<CliCommand> {
+    let pan_delta_raw = args.first().ok_or_else(|| {
+        AppError::new(
+            ErrorKind::InvalidInput,
+            "ptz onvif relative-move requires <pan_delta_count> <tilt_delta_count>",
+        )
+    })?;
+    let tilt_delta_raw = args.get(1).ok_or_else(|| {
+        AppError::new(
+            ErrorKind::InvalidInput,
+            "ptz onvif relative-move requires <pan_delta_count> <tilt_delta_count>",
+        )
+    })?;
+    let pan_delta_count = parse_i64_arg(pan_delta_raw, "pan_delta_count")?;
+    let tilt_delta_count = parse_i64_arg(tilt_delta_raw, "tilt_delta_count")?;
+    let channel = parse_ptz_channel_flag(&args[2..], "ptz onvif relative-move")?;
+
+    Ok(CliCommand::PtzOnvifRelativeMove {
+        channel,
+        pan_delta_count,
+        tilt_delta_count,
+    })
 }
 
 fn parse_ptz_move_args(args: &[String]) -> AppResult<CliCommand> {
@@ -492,5 +553,65 @@ fn parse_i64_arg(raw: &str, name: &str) -> AppResult<i64> {
 }
 
 pub fn help_text() -> &'static str {
-    "Usage:\n  reocli help\n  reocli get-user-auth <user> <password>\n  reocli get-ability [user]\n  reocli get-dev-info\n  reocli get-channel-status [channel]\n  reocli get-ptz-status [channel]\n  reocli get-time\n  reocli get-net-port\n  reocli set-time <iso8601>\n  reocli set-onvif <on|off> [--port <1-65535>]\n  reocli snap [channel] [--out path]\n  reocli ptz move <direction> [--speed <1-64>] [--duration <ms>] [--channel <0-255>]\n  reocli ptz stop [--channel <0-255>]\n  reocli ptz preset list [--channel <0-255>]\n  reocli ptz preset goto <preset_id> [--channel <0-255>]\n  reocli ptz calibrate auto [--channel <0-255>]\n  reocli ptz set-absolute <pan_count> <tilt_count> [--tol-count <i64>] [--timeout-ms <u64>] [--channel <0-255>]\n  reocli ptz get-absolute [--channel <0-255>]\n  reocli preflight [user]"
+    "Usage:\n  reocli help\n  reocli get-user-auth <user> <password>\n  reocli get-ability [user]\n  reocli get-dev-info\n  reocli get-channel-status [channel]\n  reocli get-ptz-status [channel]\n  reocli get-time\n  reocli get-net-port\n  reocli set-time <iso8601>\n  reocli set-onvif <on|off> [--port <1-65535>]\n  reocli snap [channel] [--out path]\n  reocli ptz move <direction> [--speed <1-64>] [--duration <ms>] [--channel <0-255>]\n  reocli ptz stop [--channel <0-255>]\n  reocli ptz preset list [--channel <0-255>]\n  reocli ptz preset goto <preset_id> [--channel <0-255>]\n  reocli ptz calibrate auto [--channel <0-255>]\n  reocli ptz set-absolute <pan_count> <tilt_count> [--tol-count <i64>] [--timeout-ms <u64>] [--channel <0-255>]\n  reocli ptz get-absolute [--channel <0-255>]\n  reocli ptz onvif status [--channel <0-255>]\n  reocli ptz onvif options [--channel <0-255>]\n  reocli ptz onvif relative-move <pan_delta_count> <tilt_delta_count> [--channel <0-255>]\n  reocli preflight [user]"
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn parse(raw: &[&str]) -> AppResult<CliCommand> {
+        parse_args(
+            &raw.iter()
+                .map(|value| value.to_string())
+                .collect::<Vec<_>>(),
+        )
+    }
+
+    #[test]
+    fn parse_ptz_onvif_status_with_default_channel() {
+        let command = parse(&["ptz", "onvif", "status"]).expect("status command should parse");
+        assert_eq!(command, CliCommand::PtzOnvifStatus { channel: 0 });
+    }
+
+    #[test]
+    fn parse_ptz_onvif_options_with_channel_flag() {
+        let command = parse(&["ptz", "onvif", "options", "--channel", "7"])
+            .expect("options command should parse");
+        assert_eq!(command, CliCommand::PtzOnvifOptions { channel: 7 });
+    }
+
+    #[test]
+    fn parse_ptz_onvif_relative_move_with_channel_flag() {
+        let command = parse(&[
+            "ptz",
+            "onvif",
+            "relative-move",
+            "55",
+            "-12",
+            "--channel",
+            "3",
+        ])
+        .expect("relative-move command should parse");
+        assert_eq!(
+            command,
+            CliCommand::PtzOnvifRelativeMove {
+                channel: 3,
+                pan_delta_count: 55,
+                tilt_delta_count: -12,
+            }
+        );
+    }
+
+    #[test]
+    fn parse_ptz_onvif_relative_move_requires_two_deltas() {
+        let error = parse(&["ptz", "onvif", "relative-move", "55"])
+            .expect_err("relative-move should fail without tilt delta");
+        assert_eq!(error.kind, ErrorKind::InvalidInput);
+        assert!(
+            error
+                .message
+                .contains("requires <pan_delta_count> <tilt_delta_count>")
+        );
+    }
 }
