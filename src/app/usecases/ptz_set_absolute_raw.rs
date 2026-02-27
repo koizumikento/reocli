@@ -15,11 +15,19 @@ use crate::reolink::ptz;
 
 const EKF_TS_SEC: f64 = 0.08;
 const EKF_STATE_SCHEMA_VERSION: u32 = 1;
-const MIN_ADAPTIVE_UPDATES: usize = 10;
+const MIN_ADAPTIVE_UPDATES: usize = 2;
 const REQUIRED_STABLE_STEPS: usize = 2;
 const SETTLE_STEP_MS: u64 = 100;
 const MIN_CONTROL_PULSE_MS: u64 = 60;
 const MAX_CONTROL_PULSE_MS: u64 = 220;
+const REVERSAL_GUARD_MULTIPLIER: f64 = 4.0;
+const REVERSAL_GUARD_MIN_COUNT: f64 = 40.0;
+const DUAL_AXIS_DOMINANCE_RATIO: f64 = 1.2;
+const TIE_BREAK_CLOSE_ERROR_COUNT: f64 = 320.0;
+const OSCILLATION_REVERSAL_THRESHOLD: usize = 4;
+const OSCILLATION_DETECT_RANGE_MULTIPLIER: f64 = 4.0;
+const OSCILLATION_MIN_DETECT_COUNT: f64 = 120.0;
+const OSCILLATION_TOLERANCE_FLOOR_COUNT: f64 = 120.0;
 
 const DEFAULT_PAN_MIN_COUNT: f64 = -3000.0;
 const DEFAULT_PAN_MAX_COUNT: f64 = 3000.0;
@@ -159,8 +167,13 @@ fn run_closed_loop(
     let mut best_observed: Option<BestObservedState> = None;
     let mut command_trace: Vec<String> = Vec::new();
     let mut last_update_at = Instant::now();
+    let mut tie_break_pan = true;
+    let mut pan_reversals = 0usize;
+    let mut tilt_reversals = 0usize;
+    let mut prev_pan_error_measured: Option<f64> = None;
+    let mut prev_tilt_error_measured: Option<f64> = None;
     let started = Instant::now();
-    let min_updates = if timeout_ms >= 1_200 {
+    let min_updates = if timeout_ms >= 3_000 {
         MIN_ADAPTIVE_UPDATES
     } else {
         1
@@ -203,6 +216,21 @@ fn run_closed_loop(
         let tilt_error_measured = target_tilt_count as f64 - tilt_measure;
         let pan_error_estimated = target_pan_count as f64 - estimated_pan;
         let tilt_error_estimated = target_tilt_count as f64 - estimated_tilt;
+        update_reversal_counter(
+            &mut pan_reversals,
+            &mut prev_pan_error_measured,
+            pan_error_measured,
+            tolerance_count as f64,
+        );
+        update_reversal_counter(
+            &mut tilt_reversals,
+            &mut prev_tilt_error_measured,
+            tilt_error_measured,
+            tolerance_count as f64,
+        );
+        let pan_tolerance = adaptive_axis_tolerance(tolerance_count as f64, pan_reversals);
+        let tilt_tolerance = adaptive_axis_tolerance(tolerance_count as f64, tilt_reversals);
+
         let pan_error_control =
             select_control_error(pan_error_estimated, pan_error_measured, tolerance_count);
         let tilt_error_control =
@@ -216,8 +244,8 @@ fn run_closed_loop(
         );
         loop_updates += 1;
 
-        let within_tolerance = pan_error_measured.abs() <= tolerance_count as f64
-            && tilt_error_measured.abs() <= tolerance_count as f64;
+        let within_tolerance = pan_error_measured.abs() <= pan_tolerance
+            && tilt_error_measured.abs() <= tilt_tolerance;
         if within_tolerance && loop_updates >= min_updates {
             stable_steps += 1;
         } else {
@@ -238,6 +266,18 @@ fn run_closed_loop(
         }
 
         if Instant::now() >= deadline {
+            if within_tolerance {
+                save_stored_ekf_state(
+                    state_path,
+                    state_key,
+                    channel,
+                    &pan_filter,
+                    &tilt_filter,
+                    0.0,
+                    0.0,
+                )?;
+                return Ok(current);
+            }
             let best = best_observed.unwrap_or(BestObservedState {
                 pan_count: current.pan_count,
                 tilt_count: current.tilt_count,
@@ -261,7 +301,7 @@ fn run_closed_loop(
             return Err(AppError::new(
                 ErrorKind::UnexpectedResponse,
                 format!(
-                    "set_absolute_raw timeout after {}ms on channel {channel}: target=({},{}) current=({},{}) measured_error=({:.1},{:.1}) estimated_error=({:.1},{:.1}) control_error=({:.1},{:.1}) tolerance={} updates={} stable_steps={} last_dt_sec={:.3} best=({},{}) best_error=({},{}) trace=[{}]{}",
+                    "set_absolute_raw timeout after {}ms on channel {channel}: target=({},{}) current=({},{}) measured_error=({:.1},{:.1}) estimated_error=({:.1},{:.1}) control_error=({:.1},{:.1}) tolerance={} effective_tolerance=({:.1},{:.1}) reversals=({},{}) updates={} stable_steps={} last_dt_sec={:.3} best=({},{}) best_error=({},{}) trace=[{}]{}",
                     timeout_ms,
                     target_pan_count,
                     target_tilt_count,
@@ -274,6 +314,10 @@ fn run_closed_loop(
                     pan_error_control,
                     tilt_error_control,
                     tolerance_count,
+                    pan_tolerance,
+                    tilt_tolerance,
+                    pan_reversals,
+                    tilt_reversals,
                     loop_updates,
                     stable_steps,
                     effective_dt_sec,
@@ -287,20 +331,34 @@ fn run_closed_loop(
             ));
         }
 
+        let guarded_pan_error =
+            apply_reversal_guard(pan_error_control, last_pan_u, tolerance_count as f64);
+        let guarded_tilt_error =
+            apply_reversal_guard(tilt_error_control, last_tilt_u, tolerance_count as f64);
+        let dual_axis_active = guarded_pan_error.abs() > tolerance_count as f64
+            && guarded_tilt_error.abs() > tolerance_count as f64;
+        let dual_axis_close = dual_axis_active
+            && guarded_pan_error.abs() <= TIE_BREAK_CLOSE_ERROR_COUNT
+            && guarded_tilt_error.abs() <= TIE_BREAK_CLOSE_ERROR_COUNT;
+        let mut step_error_abs = guarded_pan_error.abs().max(guarded_tilt_error.abs());
+
         match command_from_errors(
-            pan_error_control,
-            tilt_error_control,
+            guarded_pan_error,
+            guarded_tilt_error,
             tolerance_count as f64,
+            tie_break_pan,
         ) {
-            Some((direction, speed)) => {
-                let pulse_ms = control_pulse_ms_for_error(pan_error_control, tilt_error_control);
+            Some((direction, command_error_abs)) => {
+                step_error_abs = command_error_abs;
+                let speed = speed_cap_for_error(command_error_abs).max(1);
+                let pulse_ms = control_pulse_ms_for_error(command_error_abs);
                 ptz::move_ptz(client, channel, direction, speed, Some(pulse_ms))?;
                 let elapsed_ms = Instant::now()
                     .saturating_duration_since(started)
                     .as_millis();
                 command_trace.push(format!(
                     "t={}ms:{:?}/s{}/{}ms e=({:.1},{:.1})",
-                    elapsed_ms, direction, speed, pulse_ms, pan_error_control, tilt_error_control
+                    elapsed_ms, direction, speed, pulse_ms, guarded_pan_error, guarded_tilt_error
                 ));
                 if command_trace.len() > 24 {
                     command_trace.remove(0);
@@ -308,6 +366,9 @@ fn run_closed_loop(
                 let (pan_u, tilt_u) = control_components_from_command(direction, speed, pulse_ms);
                 last_pan_u = pan_u;
                 last_tilt_u = tilt_u;
+                if dual_axis_close {
+                    tie_break_pan = !tie_break_pan;
+                }
             }
             None => {
                 last_pan_u = 0.0;
@@ -326,8 +387,7 @@ fn run_closed_loop(
         )?;
 
         thread::sleep(Duration::from_millis(control_step_ms_for_error(
-            pan_error_control,
-            tilt_error_control,
+            step_error_abs,
         )));
     }
 }
@@ -416,88 +476,159 @@ fn command_from_errors(
     pan_error: f64,
     tilt_error: f64,
     tolerance_count: f64,
-) -> Option<(PtzDirection, u8)> {
-    if pan_error.abs() <= tolerance_count && tilt_error.abs() <= tolerance_count {
+    tie_break_pan: bool,
+) -> Option<(PtzDirection, f64)> {
+    let pan_active = pan_error.abs() > tolerance_count;
+    let tilt_active = tilt_error.abs() > tolerance_count;
+    if !pan_active && !tilt_active {
         return None;
     }
+    if pan_active && tilt_active {
+        let pan_abs = pan_error.abs();
+        let tilt_abs = tilt_error.abs();
+        let prefer_pan =
+            if pan_abs > TIE_BREAK_CLOSE_ERROR_COUNT || tilt_abs > TIE_BREAK_CLOSE_ERROR_COUNT {
+                pan_abs >= tilt_abs
+            } else if pan_abs > tilt_abs * DUAL_AXIS_DOMINANCE_RATIO {
+                true
+            } else if tilt_abs > pan_abs * DUAL_AXIS_DOMINANCE_RATIO {
+                false
+            } else {
+                tie_break_pan
+            };
+        if prefer_pan {
+            if pan_error > 0.0 {
+                return Some((PtzDirection::Right, pan_abs));
+            }
+            return Some((PtzDirection::Left, pan_abs));
+        }
+        if tilt_error > 0.0 {
+            return Some((PtzDirection::Up, tilt_abs));
+        }
+        return Some((PtzDirection::Down, tilt_abs));
+    }
 
-    let speed = speed_cap_from_error(pan_error, tilt_error).max(1);
-    if pan_error.abs() >= tilt_error.abs() {
+    if pan_active {
         if pan_error > 0.0 {
-            Some((PtzDirection::Right, speed))
-        } else if pan_error < 0.0 {
-            Some((PtzDirection::Left, speed))
-        } else if tilt_error > 0.0 {
-            Some((PtzDirection::Up, speed))
-        } else if tilt_error < 0.0 {
-            Some((PtzDirection::Down, speed))
+            Some((PtzDirection::Right, pan_error.abs()))
         } else {
-            None
+            Some((PtzDirection::Left, pan_error.abs()))
         }
     } else if tilt_error > 0.0 {
-        Some((PtzDirection::Up, speed))
-    } else if tilt_error < 0.0 {
-        Some((PtzDirection::Down, speed))
-    } else if pan_error > 0.0 {
-        Some((PtzDirection::Right, speed))
-    } else if pan_error < 0.0 {
-        Some((PtzDirection::Left, speed))
+        Some((PtzDirection::Up, tilt_error.abs()))
+    } else if tilt_active {
+        Some((PtzDirection::Down, tilt_error.abs()))
     } else {
         None
     }
 }
 
-fn speed_cap_from_error(pan_error: f64, tilt_error: f64) -> u8 {
-    let max_error = pan_error.abs().max(tilt_error.abs());
-    if max_error <= 40.0 {
+fn speed_cap_for_error(error_abs: f64) -> u8 {
+    if error_abs <= 220.0 {
+        1
+    } else if error_abs <= 480.0 {
         2
-    } else if max_error <= 120.0 {
+    } else if error_abs <= 900.0 {
         3
-    } else if max_error <= 240.0 {
+    } else if error_abs <= 1_500.0 {
         4
-    } else if max_error <= 480.0 {
-        5
-    } else if max_error <= 900.0 {
+    } else if error_abs <= 2_500.0 {
         6
-    } else if max_error <= 1_600.0 {
-        8
     } else {
-        12
+        8
     }
 }
 
-fn control_pulse_ms_for_error(pan_error: f64, tilt_error: f64) -> u64 {
-    let max_error = pan_error.abs().max(tilt_error.abs());
-    let pulse_ms = if max_error <= 60.0 {
+fn control_pulse_ms_for_error(error_abs: f64) -> u64 {
+    let pulse_ms = if error_abs <= 120.0 {
         60
-    } else if max_error <= 180.0 {
-        80
-    } else if max_error <= 360.0 {
-        100
-    } else if max_error <= 720.0 {
-        120
-    } else if max_error <= 1_400.0 {
-        150
+    } else if error_abs <= 260.0 {
+        65
+    } else if error_abs <= 520.0 {
+        75
+    } else if error_abs <= 900.0 {
+        90
+    } else if error_abs <= 1_500.0 {
+        110
     } else {
-        180
+        140
     };
     pulse_ms.clamp(MIN_CONTROL_PULSE_MS, MAX_CONTROL_PULSE_MS)
 }
 
-fn control_step_ms_for_error(pan_error: f64, tilt_error: f64) -> u64 {
-    let max_error = pan_error.abs().max(tilt_error.abs());
-    let base = if max_error <= 60.0 {
-        90
-    } else if max_error <= 180.0 {
-        110
-    } else if max_error <= 360.0 {
-        130
-    } else if max_error <= 720.0 {
-        160
-    } else {
+fn control_step_ms_for_error(error_abs: f64) -> u64 {
+    let base = if error_abs <= 120.0 {
+        170
+    } else if error_abs <= 260.0 {
         190
+    } else if error_abs <= 520.0 {
+        210
+    } else if error_abs <= 900.0 {
+        230
+    } else {
+        250
     };
     base.max(SETTLE_STEP_MS)
+}
+
+fn apply_reversal_guard(error: f64, last_u: f64, tolerance_count: f64) -> f64 {
+    if !error.is_finite() {
+        return error;
+    }
+    if error.abs() <= tolerance_count {
+        return error;
+    }
+    if !last_u.is_finite() || last_u.abs() <= f64::EPSILON {
+        return error;
+    }
+
+    let reversing = error.signum() != last_u.signum();
+    if !reversing {
+        return error;
+    }
+
+    let guard_threshold =
+        (tolerance_count * REVERSAL_GUARD_MULTIPLIER).max(REVERSAL_GUARD_MIN_COUNT);
+    if error.abs() <= guard_threshold {
+        0.0
+    } else {
+        error
+    }
+}
+
+fn update_reversal_counter(
+    counter: &mut usize,
+    previous_error: &mut Option<f64>,
+    current_error: f64,
+    tolerance_count: f64,
+) {
+    let previous = previous_error.unwrap_or(current_error);
+    let detect_range =
+        (tolerance_count * OSCILLATION_DETECT_RANGE_MULTIPLIER).max(OSCILLATION_MIN_DETECT_COUNT);
+
+    let previous_in_band = previous.abs() > tolerance_count && previous.abs() <= detect_range;
+    let current_in_band =
+        current_error.abs() > tolerance_count && current_error.abs() <= detect_range;
+    let sign_flipped = previous.signum() != current_error.signum()
+        && previous.abs() > f64::EPSILON
+        && current_error.abs() > f64::EPSILON;
+
+    if sign_flipped && previous_in_band && current_in_band {
+        *counter = counter.saturating_add(1);
+    } else if current_error.abs() > detect_range {
+        *counter = 0;
+    } else {
+        *counter = counter.saturating_sub(1);
+    }
+    *previous_error = Some(current_error);
+}
+
+fn adaptive_axis_tolerance(base_tolerance: f64, reversal_count: usize) -> f64 {
+    if reversal_count >= OSCILLATION_REVERSAL_THRESHOLD {
+        base_tolerance.max(OSCILLATION_TOLERANCE_FLOOR_COUNT)
+    } else {
+        base_tolerance
+    }
 }
 
 fn control_components_from_command(
@@ -780,11 +911,12 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use super::{
-        axis_count_bounds, ekf_config, load_stored_ekf_state, save_stored_ekf_state,
-        select_control_error,
+        adaptive_axis_tolerance, apply_reversal_guard, axis_count_bounds, command_from_errors,
+        ekf_config, load_stored_ekf_state, save_stored_ekf_state, select_control_error,
+        update_reversal_counter,
     };
     use crate::app::usecases::ptz_controller::AxisEkf;
-    use crate::core::model::{AxisModelParams, NumericRange};
+    use crate::core::model::{AxisModelParams, NumericRange, PtzDirection};
 
     #[test]
     fn select_control_error_uses_measured_when_sign_conflicts() {
@@ -801,6 +933,53 @@ mod tests {
         let (min_count, max_count) = axis_count_bounds(Some(&range), 3000, -3000.0, 3000.0);
         assert!((min_count - -1120.0).abs() < 1e-6);
         assert!((max_count - 3120.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn command_from_errors_prioritizes_dominant_axis_and_uses_tie_break() {
+        let dominant =
+            command_from_errors(220.0, -100.0, 10.0, true).expect("command should be produced");
+        assert_eq!(dominant.0, PtzDirection::Right);
+
+        let tie_break_pan =
+            command_from_errors(120.0, -110.0, 10.0, true).expect("command should be produced");
+        assert_eq!(tie_break_pan.0, PtzDirection::Right);
+
+        let tie_break_tilt =
+            command_from_errors(120.0, -110.0, 10.0, false).expect("command should be produced");
+        assert_eq!(tie_break_tilt.0, PtzDirection::Down);
+
+        let single_axis =
+            command_from_errors(0.0, -110.0, 10.0, true).expect("command should be produced");
+        assert_eq!(single_axis.0, PtzDirection::Down);
+        assert!(dominant.1 >= 1.0);
+    }
+
+    #[test]
+    fn apply_reversal_guard_blocks_small_reverse_commands() {
+        let blocked = apply_reversal_guard(-80.0, 0.5, 20.0);
+        assert_eq!(blocked, 0.0);
+
+        let allowed = apply_reversal_guard(-220.0, 0.5, 20.0);
+        assert_eq!(allowed, -220.0);
+    }
+
+    #[test]
+    fn update_reversal_counter_detects_near_target_sign_flips() {
+        let mut counter = 0usize;
+        let mut previous = None;
+        update_reversal_counter(&mut counter, &mut previous, 140.0, 50.0);
+        update_reversal_counter(&mut counter, &mut previous, -130.0, 50.0);
+        assert_eq!(counter, 1);
+        update_reversal_counter(&mut counter, &mut previous, 800.0, 50.0);
+        assert_eq!(counter, 0);
+    }
+
+    #[test]
+    fn adaptive_axis_tolerance_relaxes_after_repeated_reversals() {
+        assert_eq!(adaptive_axis_tolerance(50.0, 0), 50.0);
+        assert_eq!(adaptive_axis_tolerance(50.0, 4), 120.0);
+        assert_eq!(adaptive_axis_tolerance(180.0, 8), 180.0);
     }
 
     #[test]
