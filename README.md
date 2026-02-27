@@ -83,14 +83,14 @@ reocli ptz stop --channel 0
 reocli ptz preset list --channel 0
 reocli ptz preset goto 7 --channel 0
 reocli ptz calibrate auto --channel 0
-reocli ptz set-absolute 1500 -180 --tol-count 12 --timeout-ms 4000 --channel 0
+reocli ptz set-absolute 1500 -180 --tol-count 12 --timeout-ms 25000 --channel 0
 reocli ptz get-absolute --channel 0
 ```
 
 ```bash
 # MCP
 reocli-mcp reolink.ptz_calibrate_auto 0
-reocli-mcp reolink.ptz_set_absolute 0 1500 -180 12 4000
+reocli-mcp reolink.ptz_set_absolute 0 1500 -180 12 25000
 reocli-mcp reolink.ptz_get_absolute 0
 ```
 

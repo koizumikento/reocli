@@ -2,7 +2,7 @@ use crate::core::error::{AppError, AppResult, ErrorKind};
 use crate::core::model::PtzDirection;
 
 const DEFAULT_ABSOLUTE_RAW_TOL_COUNT: i64 = 10;
-const DEFAULT_ABSOLUTE_TIMEOUT_MS: u64 = 5_000;
+const DEFAULT_ABSOLUTE_TIMEOUT_MS: u64 = 25_000;
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum CliCommand {

@@ -8,7 +8,7 @@ use serde_json::{Value, json};
 use super::tools::supported_tools;
 
 const DEFAULT_ABSOLUTE_RAW_TOL_COUNT: i64 = 10;
-const DEFAULT_ABSOLUTE_TIMEOUT_MS: u64 = 5_000;
+const DEFAULT_ABSOLUTE_TIMEOUT_MS: u64 = 25_000;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct McpRequest {
