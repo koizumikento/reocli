@@ -1,3 +1,8 @@
+use std::fs::{self, OpenOptions};
+use std::io::{ErrorKind as IoErrorKind, Write};
+#[cfg(unix)]
+use std::os::unix::fs::OpenOptionsExt;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -22,6 +27,7 @@ pub struct Client {
     fallback_auth: Option<Auth>,
     allow_insecure_tls: bool,
     session_token: Arc<Mutex<Option<String>>>,
+    token_cache_path: Option<PathBuf>,
 }
 
 impl Client {
@@ -32,6 +38,7 @@ impl Client {
             fallback_auth: None,
             allow_insecure_tls: true,
             session_token: Arc::new(Mutex::new(None)),
+            token_cache_path: None,
         }
     }
 
@@ -50,6 +57,7 @@ impl Client {
             fallback_auth: self.fallback_auth.clone(),
             allow_insecure_tls: self.allow_insecure_tls,
             session_token: Arc::new(Mutex::new(None)),
+            token_cache_path: self.token_cache_path.clone(),
         }
     }
 
@@ -60,6 +68,18 @@ impl Client {
             fallback_auth: Some(fallback_auth),
             allow_insecure_tls: self.allow_insecure_tls,
             session_token: Arc::clone(&self.session_token),
+            token_cache_path: self.token_cache_path.clone(),
+        }
+    }
+
+    pub fn with_token_cache_path(&self, token_cache_path: PathBuf) -> Self {
+        Self {
+            endpoint: self.endpoint.clone(),
+            auth: self.auth.clone(),
+            fallback_auth: self.fallback_auth.clone(),
+            allow_insecure_tls: self.allow_insecure_tls,
+            session_token: Arc::clone(&self.session_token),
+            token_cache_path: Some(token_cache_path),
         }
     }
 
@@ -298,13 +318,39 @@ impl Client {
 
     fn set_session_token(&self, token: String) {
         if let Ok(mut guard) = self.session_token.lock() {
-            *guard = Some(token);
+            *guard = Some(token.clone());
         }
+        self.write_token_cache(&token);
     }
 
     fn clear_session_token(&self) {
         if let Ok(mut guard) = self.session_token.lock() {
             *guard = None;
+        }
+        self.remove_token_cache();
+    }
+
+    fn write_token_cache(&self, token: &str) {
+        let Some(path) = self.token_cache_path.as_ref() else {
+            return;
+        };
+
+        if let Some(parent) = path.parent() {
+            let _ = fs::create_dir_all(parent);
+        }
+
+        let _ = write_private_token_file(path, token);
+    }
+
+    fn remove_token_cache(&self) {
+        let Some(path) = self.token_cache_path.as_ref() else {
+            return;
+        };
+
+        if let Err(error) = fs::remove_file(path)
+            && error.kind() != IoErrorKind::NotFound
+        {
+            // best effort cache cleanup
         }
     }
 }
@@ -315,6 +361,7 @@ impl PartialEq for Client {
             && self.auth == other.auth
             && self.fallback_auth == other.fallback_auth
             && self.allow_insecure_tls == other.allow_insecure_tls
+            && self.token_cache_path == other.token_cache_path
     }
 }
 
@@ -443,6 +490,22 @@ fn as_i64(value: &Value) -> Option<i64> {
         Value::String(text) => text.trim().parse::<i64>().ok(),
         _ => None,
     }
+}
+
+#[cfg(unix)]
+fn write_private_token_file(path: &Path, token: &str) -> std::io::Result<()> {
+    let mut file = OpenOptions::new()
+        .create(true)
+        .truncate(true)
+        .write(true)
+        .mode(0o600)
+        .open(path)?;
+    file.write_all(token.as_bytes())
+}
+
+#[cfg(not(unix))]
+fn write_private_token_file(path: &Path, token: &str) -> std::io::Result<()> {
+    fs::write(path, token)
 }
 
 #[derive(Debug, Serialize)]

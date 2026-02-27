@@ -14,14 +14,18 @@ Rust ベースの Reolink CLI/MCP 実験用プロジェクトです。
 
 - `REOCLI_ENDPOINT`: API エンドポイント。未設定時は `https://camera.local`。
 - `REOCLI_TOKEN`: トークン認証に使用。
+- `REOCLI_TOKEN_CACHE_PATH`: トークンキャッシュファイルパス。未設定時は `~/.reocli/tokens/<endpoint>.token`。
 - `REOCLI_USER`: ユーザー名。`REOCLI_PASSWORD` が設定されていて未設定/空文字の場合は `admin` を使用。
 - `REOCLI_PASSWORD`: パスワード認証に使用。
 
 認証の優先順:
 
 1. `REOCLI_TOKEN`
-2. `REOCLI_USER` + `REOCLI_PASSWORD`（`REOCLI_USER` が空なら `admin`）
-3. 匿名認証
+2. `REOCLI_TOKEN_CACHE_PATH`（または既定パス）のキャッシュトークン
+3. `REOCLI_USER` + `REOCLI_PASSWORD`（`REOCLI_USER` が空なら `admin`）
+4. 匿名認証
+
+`REOCLI_PASSWORD` がある状態でログインが発生すると、取得したトークンはキャッシュファイルへ更新されます。認証失敗で再ログインが必要になった場合は古いキャッシュを削除してから更新します。
 
 ## Implemented CLI Commands
 

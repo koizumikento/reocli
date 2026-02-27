@@ -111,6 +111,157 @@ fn reocli_uses_admin_when_only_password_env_is_set() {
 }
 
 #[test]
+fn reocli_uses_token_cache_file_without_login() {
+    let mut server = Server::new();
+    let _ability_mock = server
+        .mock("POST", "/cgi-bin/api.cgi")
+        .match_query(Matcher::AllOf(vec![
+            Matcher::UrlEncoded("cmd".to_string(), "GetAbility".to_string()),
+            Matcher::UrlEncoded("token".to_string(), "cached-token".to_string()),
+        ]))
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(
+            r#"[{"cmd":"GetAbility","code":0,"value":{"Ability":{"GetDevInfo":{"permit":1}}}}]"#,
+        )
+        .expect(1)
+        .create();
+    let _dev_info_mock = server
+        .mock("POST", "/cgi-bin/api.cgi")
+        .match_query(Matcher::AllOf(vec![
+            Matcher::UrlEncoded("cmd".to_string(), "GetDevInfo".to_string()),
+            Matcher::UrlEncoded("token".to_string(), "cached-token".to_string()),
+        ]))
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(r#"[{"cmd":"GetDevInfo","code":0,"value":{"DevInfo":{"name":"cam"}}}]"#)
+        .expect(1)
+        .create();
+
+    let token_cache_path = unique_temp_file_path("cli-token-cache", "session.token");
+    cleanup_output_file(&token_cache_path);
+    fs::create_dir_all(
+        token_cache_path
+            .parent()
+            .expect("token cache path should include parent"),
+    )
+    .expect("token cache parent should be created");
+    fs::write(&token_cache_path, "cached-token").expect("token cache should be created");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_reocli"))
+        .arg("get-dev-info")
+        .env("REOCLI_ENDPOINT", server.url())
+        .env(
+            "REOCLI_TOKEN_CACHE_PATH",
+            token_cache_path.to_string_lossy().to_string(),
+        )
+        .env_remove("REOCLI_TOKEN")
+        .env_remove("REOCLI_PASSWORD")
+        .output()
+        .expect("failed to run reocli get-dev-info with token cache");
+
+    assert!(output.status.success());
+    cleanup_output_file(&token_cache_path);
+}
+
+#[test]
+fn reocli_refreshes_expired_token_cache_when_password_env_is_set() {
+    let mut server = Server::new();
+    let _ability_expired_mock = server
+        .mock("POST", "/cgi-bin/api.cgi")
+        .match_query(Matcher::AllOf(vec![
+            Matcher::UrlEncoded("cmd".to_string(), "GetAbility".to_string()),
+            Matcher::UrlEncoded("token".to_string(), "expired-token".to_string()),
+        ]))
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(
+            r#"[{"cmd":"GetAbility","code":1,"error":{"detail":"please login first","rspCode":-6}}]"#,
+        )
+        .expect(1)
+        .create();
+    let _login_mock = server
+        .mock("POST", "/cgi-bin/api.cgi")
+        .match_query(Matcher::UrlEncoded("cmd".to_string(), "Login".to_string()))
+        .match_body(Matcher::AllOf(vec![
+            Matcher::Regex(r#""userName":"admin""#.to_string()),
+            Matcher::Regex(r#""password":"secret""#.to_string()),
+        ]))
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(r#"[{"cmd":"Login","code":0,"value":{"Token":{"name":"fresh-token"}}}]"#)
+        .expect(1)
+        .create();
+    let _ability_fresh_mock = server
+        .mock("POST", "/cgi-bin/api.cgi")
+        .match_query(Matcher::AllOf(vec![
+            Matcher::UrlEncoded("cmd".to_string(), "GetAbility".to_string()),
+            Matcher::UrlEncoded("token".to_string(), "fresh-token".to_string()),
+        ]))
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(
+            r#"[{"cmd":"GetAbility","code":0,"value":{"Ability":{"GetDevInfo":{"permit":1}}}}]"#,
+        )
+        .expect(1)
+        .create();
+    let _dev_info_expired_mock = server
+        .mock("POST", "/cgi-bin/api.cgi")
+        .match_query(Matcher::AllOf(vec![
+            Matcher::UrlEncoded("cmd".to_string(), "GetDevInfo".to_string()),
+            Matcher::UrlEncoded("token".to_string(), "expired-token".to_string()),
+        ]))
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(
+            r#"[{"cmd":"GetDevInfo","code":1,"error":{"detail":"please login first","rspCode":-6}}]"#,
+        )
+        .expect(1)
+        .create();
+    let _dev_info_fresh_mock = server
+        .mock("POST", "/cgi-bin/api.cgi")
+        .match_query(Matcher::AllOf(vec![
+            Matcher::UrlEncoded("cmd".to_string(), "GetDevInfo".to_string()),
+            Matcher::UrlEncoded("token".to_string(), "fresh-token".to_string()),
+        ]))
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(r#"[{"cmd":"GetDevInfo","code":0,"value":{"DevInfo":{"name":"cam"}}}]"#)
+        .expect(1)
+        .create();
+
+    let token_cache_path = unique_temp_file_path("cli-token-refresh", "session.token");
+    cleanup_output_file(&token_cache_path);
+    fs::create_dir_all(
+        token_cache_path
+            .parent()
+            .expect("token cache path should include parent"),
+    )
+    .expect("token cache parent should be created");
+    fs::write(&token_cache_path, "expired-token").expect("token cache should be created");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_reocli"))
+        .arg("get-dev-info")
+        .env("REOCLI_ENDPOINT", server.url())
+        .env(
+            "REOCLI_TOKEN_CACHE_PATH",
+            token_cache_path.to_string_lossy().to_string(),
+        )
+        .env("REOCLI_PASSWORD", "secret")
+        .env_remove("REOCLI_TOKEN")
+        .env_remove("REOCLI_USER")
+        .output()
+        .expect("failed to run reocli get-dev-info with token cache refresh");
+
+    assert!(output.status.success());
+    assert_eq!(
+        fs::read_to_string(&token_cache_path).expect("token cache should be readable"),
+        "fresh-token"
+    );
+    cleanup_output_file(&token_cache_path);
+}
+
+#[test]
 fn reocli_get_ptz_status_works() {
     let mut server = Server::new();
     let _cur_pos_mock = server

@@ -6,17 +6,25 @@ use crate::reolink::client::{Auth, Client};
 const DEFAULT_ENDPOINT: &str = "https://camera.local";
 const ENDPOINT_ENV: &str = "REOCLI_ENDPOINT";
 const TOKEN_ENV: &str = "REOCLI_TOKEN";
+const TOKEN_CACHE_PATH_ENV: &str = "REOCLI_TOKEN_CACHE_PATH";
 const USER_ENV: &str = "REOCLI_USER";
 const PASSWORD_ENV: &str = "REOCLI_PASSWORD";
 const CALIBRATION_DIR_ENV: &str = "REOCLI_CALIBRATION_DIR";
 const HOME_ENV: &str = "HOME";
 const DEFAULT_USER: &str = "admin";
+const DEFAULT_TOKEN_CACHE_SUBDIR: &str = ".reocli/tokens";
 const DEFAULT_CALIBRATION_SUBDIR: &str = ".reocli/calibration";
 const UNKNOWN_KEY_COMPONENT: &str = "unknown";
 
 pub(crate) fn client_from_env() -> Client {
-    let (primary_auth, fallback_auth) = auth_from_env();
-    let client = Client::new(endpoint_from_env(), primary_auth);
+    let endpoint = endpoint_from_env();
+    let token_cache_path = token_cache_path_from_env(&endpoint);
+    let (primary_auth, fallback_auth) = auth_from_env(token_cache_path.as_deref());
+    let client = Client::new(endpoint, primary_auth);
+    let client = match token_cache_path {
+        Some(path) => client.with_token_cache_path(path),
+        None => client,
+    };
 
     match fallback_auth {
         Some(auth) => client.with_fallback_auth(auth),
@@ -55,7 +63,7 @@ fn endpoint_from_env() -> String {
     std::env::var(ENDPOINT_ENV).unwrap_or_else(|_| DEFAULT_ENDPOINT.to_string())
 }
 
-fn auth_from_env() -> (Auth, Option<Auth>) {
+fn auth_from_env(token_cache_path: Option<&Path>) -> (Auth, Option<Auth>) {
     let user = env_var_trimmed(USER_ENV);
     let password = env_var_trimmed(PASSWORD_ENV);
 
@@ -73,10 +81,36 @@ fn auth_from_env() -> (Auth, Option<Auth>) {
         return (Auth::Token(token), fallback_auth);
     }
 
+    if let Some(token) = token_from_cache_file(token_cache_path) {
+        return (Auth::Token(token), fallback_auth);
+    }
+
     match fallback_auth {
         Some(user_password_auth) => (user_password_auth, None),
         None => (Auth::Anonymous, None),
     }
+}
+
+fn token_cache_path_from_env(endpoint: &str) -> Option<PathBuf> {
+    if let Some(explicit_path) = env_var_trimmed(TOKEN_CACHE_PATH_ENV) {
+        return Some(PathBuf::from(explicit_path));
+    }
+
+    let home = env_var_trimmed(HOME_ENV)?;
+    let endpoint_key = sanitize_key_component(endpoint);
+    Some(
+        Path::new(&home)
+            .join(DEFAULT_TOKEN_CACHE_SUBDIR)
+            .join(format!("{endpoint_key}.token")),
+    )
+}
+
+fn token_from_cache_file(token_cache_path: Option<&Path>) -> Option<String> {
+    let path = token_cache_path?;
+    std::fs::read_to_string(path)
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
 }
 
 fn env_var_trimmed(name: &str) -> Option<String> {
