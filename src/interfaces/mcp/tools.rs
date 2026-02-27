@@ -39,6 +39,14 @@ pub fn supported_tools() -> Vec<McpTool> {
             description: "Set camera time.",
         },
         McpTool {
+            name: "reolink.get_net_port",
+            description: "Get network port and protocol enablement settings.",
+        },
+        McpTool {
+            name: "reolink.set_onvif_enabled",
+            description: "Enable/disable ONVIF and optionally update ONVIF port.",
+        },
+        McpTool {
             name: "reolink.snap",
             description: "Capture a snapshot for a channel and save it.",
         },

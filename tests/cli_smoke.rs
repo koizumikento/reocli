@@ -57,6 +57,97 @@ fn reocli_get_dev_info_works() {
 }
 
 #[test]
+fn reocli_get_net_port_works() {
+    let mut server = Server::new();
+    let _mock = server
+        .mock("POST", "/cgi-bin/api.cgi")
+        .match_query(Matcher::UrlEncoded(
+            "cmd".to_string(),
+            "GetNetPort".to_string(),
+        ))
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(
+            r#"[{"cmd":"GetNetPort","code":0,"value":{"NetPort":{"httpEnable":0,"httpPort":80,"httpsEnable":1,"httpsPort":443,"mediaPort":9000,"onvifEnable":1,"onvifPort":8000}}}]"#,
+        )
+        .expect(1)
+        .create();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_reocli"))
+        .arg("get-net-port")
+        .env("REOCLI_ENDPOINT", server.url())
+        .output()
+        .expect("failed to run reocli get-net-port");
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("onvif_enable=true"));
+    assert!(stdout.contains("onvif_port=8000"));
+}
+
+#[test]
+fn reocli_set_onvif_works() {
+    let mut server = Server::new();
+    let _get_before_mock = server
+        .mock("POST", "/cgi-bin/api.cgi")
+        .match_query(Matcher::UrlEncoded(
+            "cmd".to_string(),
+            "GetNetPort".to_string(),
+        ))
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(
+            r#"[{"cmd":"GetNetPort","code":0,"value":{"NetPort":{"onvifEnable":0,"onvifPort":8000}}}]"#,
+        )
+        .expect(1)
+        .create();
+    let _set_mock = server
+        .mock("POST", "/cgi-bin/api.cgi")
+        .match_query(Matcher::UrlEncoded(
+            "cmd".to_string(),
+            "SetNetPort".to_string(),
+        ))
+        .match_body(Matcher::AllOf(vec![
+            Matcher::Regex(r#""action":1"#.to_string()),
+            Matcher::Regex(r#""onvifEnable":1"#.to_string()),
+            Matcher::Regex(r#""onvifPort":8000"#.to_string()),
+        ]))
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(r#"[{"cmd":"SetNetPort","code":0,"value":{"rspCode":200}}]"#)
+        .expect(1)
+        .create();
+    let _get_after_mock = server
+        .mock("POST", "/cgi-bin/api.cgi")
+        .match_query(Matcher::UrlEncoded(
+            "cmd".to_string(),
+            "GetNetPort".to_string(),
+        ))
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(
+            r#"[{"cmd":"GetNetPort","code":0,"value":{"NetPort":{"onvifEnable":1,"onvifPort":8000}}}]"#,
+        )
+        .expect(1)
+        .create();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_reocli"))
+        .arg("set-onvif")
+        .arg("on")
+        .arg("--port")
+        .arg("8000")
+        .env("REOCLI_ENDPOINT", server.url())
+        .output()
+        .expect("failed to run reocli set-onvif");
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("operation=set_onvif"));
+    assert!(stdout.contains("onvif_enable=true"));
+    assert!(stdout.contains("onvif_port=8000"));
+}
+
+#[test]
 fn reocli_uses_admin_when_only_password_env_is_set() {
     let mut server = Server::new();
     let _login_mock = server

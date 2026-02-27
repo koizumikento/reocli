@@ -20,6 +20,8 @@ fn reocli_mcp_lists_tools() {
         .and_then(Value::as_array)
         .expect("tools should be an array");
     assert!(tools.contains(&Value::String("mcp.list_tools".to_string())));
+    assert!(tools.contains(&Value::String("reolink.get_net_port".to_string())));
+    assert!(tools.contains(&Value::String("reolink.set_onvif_enabled".to_string())));
     assert!(tools.contains(&Value::String("reolink.ptz_calibrate_auto".to_string())));
     assert!(tools.contains(&Value::String("reolink.ptz_set_absolute".to_string())));
     assert!(tools.contains(&Value::String("reolink.ptz_get_absolute".to_string())));
@@ -168,6 +170,104 @@ fn reocli_mcp_get_and_set_time_work() {
     assert_eq!(
         set_time_json.get("time").and_then(Value::as_str),
         Some(target_time)
+    );
+}
+
+#[test]
+fn reocli_mcp_get_net_port_works() {
+    let mut server = Server::new();
+    let _mock = server
+        .mock("POST", "/cgi-bin/api.cgi")
+        .match_query(Matcher::UrlEncoded(
+            "cmd".to_string(),
+            "GetNetPort".to_string(),
+        ))
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(
+            r#"[{"cmd":"GetNetPort","code":0,"value":{"NetPort":{"httpEnable":0,"httpPort":80,"httpsEnable":1,"httpsPort":443,"mediaPort":9000,"onvifEnable":1,"onvifPort":8000,"rtspEnable":0,"rtspPort":554,"rtmpEnable":0,"rtmpPort":1935}}}]"#,
+        )
+        .expect(1)
+        .create();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_reocli-mcp"))
+        .arg("reolink.get_net_port")
+        .env("REOCLI_ENDPOINT", server.url())
+        .output()
+        .expect("failed to run reocli-mcp reolink.get_net_port");
+
+    assert!(output.status.success());
+    let json = parse_stdout_json(&String::from_utf8_lossy(&output.stdout));
+    assert_eq!(
+        json.get("onvif_enable").and_then(Value::as_bool),
+        Some(true)
+    );
+    assert_eq!(json.get("onvif_port").and_then(Value::as_u64), Some(8000));
+}
+
+#[test]
+fn reocli_mcp_set_onvif_enabled_works() {
+    let mut server = Server::new();
+    let _get_before_mock = server
+        .mock("POST", "/cgi-bin/api.cgi")
+        .match_query(Matcher::UrlEncoded(
+            "cmd".to_string(),
+            "GetNetPort".to_string(),
+        ))
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(
+            r#"[{"cmd":"GetNetPort","code":0,"value":{"NetPort":{"onvifEnable":0,"onvifPort":8000}}}]"#,
+        )
+        .expect(1)
+        .create();
+    let _set_mock = server
+        .mock("POST", "/cgi-bin/api.cgi")
+        .match_query(Matcher::UrlEncoded(
+            "cmd".to_string(),
+            "SetNetPort".to_string(),
+        ))
+        .match_body(Matcher::AllOf(vec![
+            Matcher::Regex(r#""action":1"#.to_string()),
+            Matcher::Regex(r#""onvifEnable":1"#.to_string()),
+            Matcher::Regex(r#""onvifPort":8000"#.to_string()),
+        ]))
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(r#"[{"cmd":"SetNetPort","code":0,"value":{"rspCode":200}}]"#)
+        .expect(1)
+        .create();
+    let _get_after_mock = server
+        .mock("POST", "/cgi-bin/api.cgi")
+        .match_query(Matcher::UrlEncoded(
+            "cmd".to_string(),
+            "GetNetPort".to_string(),
+        ))
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(
+            r#"[{"cmd":"GetNetPort","code":0,"value":{"NetPort":{"onvifEnable":1,"onvifPort":8000}}}]"#,
+        )
+        .expect(1)
+        .create();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_reocli-mcp"))
+        .arg("reolink.set_onvif_enabled")
+        .arg("on")
+        .arg("8000")
+        .env("REOCLI_ENDPOINT", server.url())
+        .output()
+        .expect("failed to run reocli-mcp reolink.set_onvif_enabled");
+
+    assert!(output.status.success());
+    let json = parse_stdout_json(&String::from_utf8_lossy(&output.stdout));
+    assert_eq!(
+        json.get("requested_enabled").and_then(Value::as_bool),
+        Some(true)
+    );
+    assert_eq!(
+        json.get("onvif_enable").and_then(Value::as_bool),
+        Some(true)
     );
 }
 

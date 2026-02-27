@@ -86,10 +86,42 @@ pub fn run(args: &[String]) -> AppResult<String> {
             let time = usecases::get_time::execute(&client)?;
             Ok(format!("time={}", time.iso8601))
         }
+        CliCommand::GetNetPort => {
+            let net_port = usecases::net_port::get(&client)?;
+            Ok(format!(
+                "http_enable={}; http_port={}; https_enable={}; https_port={}; media_port={}; onvif_enable={}; onvif_port={}; rtsp_enable={}; rtsp_port={}; rtmp_enable={}; rtmp_port={}",
+                format_optional_bool(net_port.http_enable),
+                format_optional_u16(net_port.http_port),
+                format_optional_bool(net_port.https_enable),
+                format_optional_u16(net_port.https_port),
+                format_optional_u16(net_port.media_port),
+                format_optional_bool(net_port.onvif_enable),
+                format_optional_u16(net_port.onvif_port),
+                format_optional_bool(net_port.rtsp_enable),
+                format_optional_u16(net_port.rtsp_port),
+                format_optional_bool(net_port.rtmp_enable),
+                format_optional_u16(net_port.rtmp_port),
+            ))
+        }
         CliCommand::SetTime { iso8601 } => {
             ensure_command_supported(&client, CgiCommand::SetTime)?;
             let time = usecases::set_time::execute(&client, &iso8601)?;
             Ok(format!("time={}", time.iso8601))
+        }
+        CliCommand::SetOnvif {
+            enabled,
+            onvif_port,
+        } => {
+            let net_port = usecases::net_port::set_onvif_enabled(&client, enabled, onvif_port)?;
+            Ok(format!(
+                "operation=set_onvif; requested_enabled={enabled}; requested_port={}; onvif_enable={}; onvif_port={}; http_port={}; https_port={}; media_port={}",
+                format_optional_u16(onvif_port),
+                format_optional_bool(net_port.onvif_enable),
+                format_optional_u16(net_port.onvif_port),
+                format_optional_u16(net_port.http_port),
+                format_optional_u16(net_port.https_port),
+                format_optional_u16(net_port.media_port),
+            ))
         }
         CliCommand::Snap { channel, out } => {
             ensure_command_supported(&client, CgiCommand::Snap)?;
@@ -207,6 +239,12 @@ pub fn run(args: &[String]) -> AppResult<String> {
 }
 
 fn format_optional_i64(value: Option<i64>) -> String {
+    value
+        .map(|raw| raw.to_string())
+        .unwrap_or_else(|| "unknown".to_string())
+}
+
+fn format_optional_u16(value: Option<u16>) -> String {
     value
         .map(|raw| raw.to_string())
         .unwrap_or_else(|| "unknown".to_string())

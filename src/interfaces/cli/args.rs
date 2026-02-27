@@ -22,8 +22,13 @@ pub enum CliCommand {
         channel: u8,
     },
     GetTime,
+    GetNetPort,
     SetTime {
         iso8601: String,
+    },
+    SetOnvif {
+        enabled: bool,
+        onvif_port: Option<u16>,
     },
     Snap {
         channel: u8,
@@ -100,12 +105,14 @@ pub fn parse_args(args: &[String]) -> AppResult<CliCommand> {
             channel: parse_optional_channel(args.get(1), 0)?,
         }),
         "get-time" => Ok(CliCommand::GetTime),
+        "get-net-port" => Ok(CliCommand::GetNetPort),
         "set-time" => {
             let iso8601 = args.get(1).cloned().ok_or_else(|| {
                 AppError::new(ErrorKind::InvalidInput, "set-time requires <iso8601>")
             })?;
             Ok(CliCommand::SetTime { iso8601 })
         }
+        "set-onvif" => parse_set_onvif_args(&args[1..]),
         "snap" => parse_snap_args(&args[1..]),
         "ptz" => parse_ptz_args(&args[1..]),
         "preflight" => {
@@ -117,6 +124,44 @@ pub fn parse_args(args: &[String]) -> AppResult<CliCommand> {
             format!("unknown subcommand: {subcommand}"),
         )),
     }
+}
+
+fn parse_set_onvif_args(args: &[String]) -> AppResult<CliCommand> {
+    let enabled_raw = args.first().ok_or_else(|| {
+        AppError::new(
+            ErrorKind::InvalidInput,
+            "set-onvif requires <on|off> [--port <1-65535>]",
+        )
+    })?;
+    let enabled = parse_bool_on_off(enabled_raw)?;
+
+    let mut onvif_port = None;
+    let mut index = 1;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--port" => {
+                let value = args.get(index + 1).ok_or_else(|| {
+                    AppError::new(
+                        ErrorKind::InvalidInput,
+                        "set-onvif --port requires <1-65535>",
+                    )
+                })?;
+                onvif_port = Some(parse_u16_arg(value, "onvif_port")?);
+                index += 2;
+            }
+            unknown => {
+                return Err(AppError::new(
+                    ErrorKind::InvalidInput,
+                    format!("unknown set-onvif option: {unknown}"),
+                ));
+            }
+        }
+    }
+
+    Ok(CliCommand::SetOnvif {
+        enabled,
+        onvif_port,
+    })
 }
 
 fn parse_optional_channel(raw: Option<&String>, default_channel: u8) -> AppResult<u8> {
@@ -417,6 +462,26 @@ fn parse_u64_arg(raw: &str, name: &str) -> AppResult<u64> {
     })
 }
 
+fn parse_u16_arg(raw: &str, name: &str) -> AppResult<u16> {
+    raw.parse::<u16>().map_err(|_| {
+        AppError::new(
+            ErrorKind::InvalidInput,
+            format!("{name} must be an integer between 0 and 65535"),
+        )
+    })
+}
+
+fn parse_bool_on_off(raw: &str) -> AppResult<bool> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "1" | "true" | "on" | "enable" | "enabled" => Ok(true),
+        "0" | "false" | "off" | "disable" | "disabled" => Ok(false),
+        _ => Err(AppError::new(
+            ErrorKind::InvalidInput,
+            "set-onvif requires <on|off>",
+        )),
+    }
+}
+
 fn parse_i64_arg(raw: &str, name: &str) -> AppResult<i64> {
     raw.parse::<i64>().map_err(|_| {
         AppError::new(
@@ -427,5 +492,5 @@ fn parse_i64_arg(raw: &str, name: &str) -> AppResult<i64> {
 }
 
 pub fn help_text() -> &'static str {
-    "Usage:\n  reocli help\n  reocli get-user-auth <user> <password>\n  reocli get-ability [user]\n  reocli get-dev-info\n  reocli get-channel-status [channel]\n  reocli get-ptz-status [channel]\n  reocli get-time\n  reocli set-time <iso8601>\n  reocli snap [channel] [--out path]\n  reocli ptz move <direction> [--speed <1-64>] [--duration <ms>] [--channel <0-255>]\n  reocli ptz stop [--channel <0-255>]\n  reocli ptz preset list [--channel <0-255>]\n  reocli ptz preset goto <preset_id> [--channel <0-255>]\n  reocli ptz calibrate auto [--channel <0-255>]\n  reocli ptz set-absolute <pan_count> <tilt_count> [--tol-count <i64>] [--timeout-ms <u64>] [--channel <0-255>]\n  reocli ptz get-absolute [--channel <0-255>]\n  reocli preflight [user]"
+    "Usage:\n  reocli help\n  reocli get-user-auth <user> <password>\n  reocli get-ability [user]\n  reocli get-dev-info\n  reocli get-channel-status [channel]\n  reocli get-ptz-status [channel]\n  reocli get-time\n  reocli get-net-port\n  reocli set-time <iso8601>\n  reocli set-onvif <on|off> [--port <1-65535>]\n  reocli snap [channel] [--out path]\n  reocli ptz move <direction> [--speed <1-64>] [--duration <ms>] [--channel <0-255>]\n  reocli ptz stop [--channel <0-255>]\n  reocli ptz preset list [--channel <0-255>]\n  reocli ptz preset goto <preset_id> [--channel <0-255>]\n  reocli ptz calibrate auto [--channel <0-255>]\n  reocli ptz set-absolute <pan_count> <tilt_count> [--tol-count <i64>] [--timeout-ms <u64>] [--channel <0-255>]\n  reocli ptz get-absolute [--channel <0-255>]\n  reocli preflight [user]"
 }

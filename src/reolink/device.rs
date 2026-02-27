@@ -97,7 +97,7 @@ pub fn get_channel_status(client: &Client, channel: u8) -> AppResult<ChannelStat
     Ok(ChannelStatus { channel, online })
 }
 
-fn ordered_known_commands() -> [CgiCommand; 13] {
+fn ordered_known_commands() -> [CgiCommand; 15] {
     [
         CgiCommand::GetAbility,
         CgiCommand::GetDevInfo,
@@ -111,6 +111,8 @@ fn ordered_known_commands() -> [CgiCommand; 13] {
         CgiCommand::GetTime,
         CgiCommand::SetTime,
         CgiCommand::GetNetwork,
+        CgiCommand::GetNetPort,
+        CgiCommand::SetNetPort,
         CgiCommand::GetUserAuth,
     ]
 }
@@ -244,6 +246,8 @@ fn command_from_name(name: &str) -> Option<CgiCommand> {
         "GetTime" | "time" => Some(CgiCommand::GetTime),
         "SetTime" => Some(CgiCommand::SetTime),
         "GetNetwork" | "network" => Some(CgiCommand::GetNetwork),
+        "GetNetPort" | "netPort" => Some(CgiCommand::GetNetPort),
+        "SetNetPort" => Some(CgiCommand::SetNetPort),
         "GetUserAuth" | "userAuth" => Some(CgiCommand::GetUserAuth),
         _ => None,
     }

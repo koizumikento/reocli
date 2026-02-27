@@ -5,21 +5,25 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 
+use crate::app::usecases::ptz_calibrate_auto::load_saved_params_for_device;
 use crate::app::usecases::ptz_controller::{AxisEkf, AxisEkfConfig, AxisEkfSnapshot};
 use crate::app::usecases::ptz_get_absolute_raw::{PtzRawPosition, map_status_to_raw_position};
 use crate::core::error::{AppError, AppResult, ErrorKind};
 use crate::core::model::{AxisModelParams, NumericRange, PtzDirection};
 use crate::interfaces::runtime;
 use crate::reolink::client::Client;
-use crate::reolink::ptz;
+use crate::reolink::{device, ptz};
 
 const EKF_TS_SEC: f64 = 0.08;
 const EKF_STATE_SCHEMA_VERSION: u32 = 1;
 const MIN_ADAPTIVE_UPDATES: usize = 2;
 const REQUIRED_STABLE_STEPS: usize = 2;
 const SETTLE_STEP_MS: u64 = 100;
-const MIN_CONTROL_PULSE_MS: u64 = 60;
+const MIN_CONTROL_PULSE_MS: u64 = 0;
 const MAX_CONTROL_PULSE_MS: u64 = 220;
+const MICRO_CONTROL_ERROR_COUNT: f64 = 90.0;
+const FINE_CONTROL_ERROR_COUNT: f64 = 180.0;
+const COARSE_CONTROL_ERROR_COUNT: f64 = 320.0;
 const REVERSAL_GUARD_MULTIPLIER: f64 = 4.0;
 const REVERSAL_GUARD_MIN_COUNT: f64 = 40.0;
 const DUAL_AXIS_DOMINANCE_RATIO: f64 = 1.2;
@@ -27,7 +31,10 @@ const TIE_BREAK_CLOSE_ERROR_COUNT: f64 = 320.0;
 const OSCILLATION_REVERSAL_THRESHOLD: usize = 4;
 const OSCILLATION_DETECT_RANGE_MULTIPLIER: f64 = 4.0;
 const OSCILLATION_MIN_DETECT_COUNT: f64 = 120.0;
-const OSCILLATION_TOLERANCE_FLOOR_COUNT: f64 = 120.0;
+const OSCILLATION_TOLERANCE_RELAX_RATIO: f64 = 0.22;
+const OSCILLATION_TOLERANCE_RELAX_MAX_COUNT: f64 = 48.0;
+const CALIBRATION_DEADBAND_HINT_MAX_COUNT: f64 = 200.0;
+const CALIBRATION_GUARD_DEADBAND_RATIO: f64 = 0.45;
 
 const DEFAULT_PAN_MIN_COUNT: f64 = -3000.0;
 const DEFAULT_PAN_MAX_COUNT: f64 = 3000.0;
@@ -87,6 +94,12 @@ struct BestObservedState {
     tilt_count: i64,
     pan_abs_error: i64,
     tilt_abs_error: i64,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct AxisDeadbandHints {
+    pan_count: f64,
+    tilt_count: f64,
 }
 
 pub fn execute(
@@ -173,6 +186,7 @@ fn run_closed_loop(
     let mut prev_pan_error_measured: Option<f64> = None;
     let mut prev_tilt_error_measured: Option<f64> = None;
     let started = Instant::now();
+    let deadband_hints = load_axis_deadband_hints(client, channel);
     let min_updates = if timeout_ms >= 3_000 {
         MIN_ADAPTIVE_UPDATES
     } else {
@@ -228,8 +242,16 @@ fn run_closed_loop(
             tilt_error_measured,
             tolerance_count as f64,
         );
-        let pan_tolerance = adaptive_axis_tolerance(tolerance_count as f64, pan_reversals);
-        let tilt_tolerance = adaptive_axis_tolerance(tolerance_count as f64, tilt_reversals);
+        let pan_tolerance = adaptive_axis_tolerance(
+            tolerance_count as f64,
+            pan_reversals,
+            deadband_hints.pan_count,
+        );
+        let tilt_tolerance = adaptive_axis_tolerance(
+            tolerance_count as f64,
+            tilt_reversals,
+            deadband_hints.tilt_count,
+        );
 
         let pan_error_control =
             select_control_error(pan_error_estimated, pan_error_measured, tolerance_count);
@@ -331,10 +353,18 @@ fn run_closed_loop(
             ));
         }
 
-        let guarded_pan_error =
-            apply_reversal_guard(pan_error_control, last_pan_u, tolerance_count as f64);
-        let guarded_tilt_error =
-            apply_reversal_guard(tilt_error_control, last_tilt_u, tolerance_count as f64);
+        let guarded_pan_error = apply_reversal_guard(
+            pan_error_control,
+            last_pan_u,
+            tolerance_count as f64,
+            deadband_hints.pan_count,
+        );
+        let guarded_tilt_error = apply_reversal_guard(
+            tilt_error_control,
+            last_tilt_u,
+            tolerance_count as f64,
+            deadband_hints.tilt_count,
+        );
         let dual_axis_active = guarded_pan_error.abs() > tolerance_count as f64
             && guarded_tilt_error.abs() > tolerance_count as f64;
         let dual_axis_close = dual_axis_active
@@ -397,6 +427,32 @@ fn model_for_span(span: f64) -> AxisModelParams {
         alpha: MODEL_ALPHA_DEFAULT,
         beta: (span * MODEL_BETA_RATIO).clamp(MODEL_BETA_MIN, MODEL_BETA_MAX),
     }
+}
+
+fn load_axis_deadband_hints(client: &Client, channel: u8) -> AxisDeadbandHints {
+    let defaults = AxisDeadbandHints {
+        pan_count: 0.0,
+        tilt_count: 0.0,
+    };
+
+    let Some(device_info) = device::get_dev_info(client).ok() else {
+        return defaults;
+    };
+    let Some((stored, _)) = load_saved_params_for_device(&device_info).ok().flatten() else {
+        return defaults;
+    };
+    if stored.channel != channel {
+        return defaults;
+    }
+
+    AxisDeadbandHints {
+        pan_count: effective_deadband_hint(stored.calibration.pan_deadband_count),
+        tilt_count: effective_deadband_hint(stored.calibration.tilt_deadband_count),
+    }
+}
+
+fn effective_deadband_hint(deadband_count: i64) -> f64 {
+    ((deadband_count.unsigned_abs().max(1)) as f64).clamp(0.0, CALIBRATION_DEADBAND_HINT_MAX_COUNT)
 }
 
 fn ekf_config(min_position: f64, max_position: f64) -> AxisEkfConfig {
@@ -524,9 +580,9 @@ fn command_from_errors(
 }
 
 fn speed_cap_for_error(error_abs: f64) -> u8 {
-    if error_abs <= 220.0 {
+    if error_abs <= FINE_CONTROL_ERROR_COUNT {
         1
-    } else if error_abs <= 480.0 {
+    } else if error_abs <= COARSE_CONTROL_ERROR_COUNT {
         2
     } else if error_abs <= 900.0 {
         3
@@ -540,12 +596,14 @@ fn speed_cap_for_error(error_abs: f64) -> u8 {
 }
 
 fn control_pulse_ms_for_error(error_abs: f64) -> u64 {
-    let pulse_ms = if error_abs <= 120.0 {
-        60
-    } else if error_abs <= 260.0 {
-        65
+    let pulse_ms = if error_abs <= MICRO_CONTROL_ERROR_COUNT {
+        0
+    } else if error_abs <= FINE_CONTROL_ERROR_COUNT {
+        20
+    } else if error_abs <= COARSE_CONTROL_ERROR_COUNT {
+        35
     } else if error_abs <= 520.0 {
-        75
+        55
     } else if error_abs <= 900.0 {
         90
     } else if error_abs <= 1_500.0 {
@@ -557,12 +615,12 @@ fn control_pulse_ms_for_error(error_abs: f64) -> u64 {
 }
 
 fn control_step_ms_for_error(error_abs: f64) -> u64 {
-    let base = if error_abs <= 120.0 {
-        170
-    } else if error_abs <= 260.0 {
-        190
-    } else if error_abs <= 520.0 {
-        210
+    let base = if error_abs <= MICRO_CONTROL_ERROR_COUNT {
+        320
+    } else if error_abs <= FINE_CONTROL_ERROR_COUNT {
+        300
+    } else if error_abs <= COARSE_CONTROL_ERROR_COUNT {
+        260
     } else if error_abs <= 900.0 {
         230
     } else {
@@ -571,7 +629,12 @@ fn control_step_ms_for_error(error_abs: f64) -> u64 {
     base.max(SETTLE_STEP_MS)
 }
 
-fn apply_reversal_guard(error: f64, last_u: f64, tolerance_count: f64) -> f64 {
+fn apply_reversal_guard(
+    error: f64,
+    last_u: f64,
+    tolerance_count: f64,
+    deadband_hint_count: f64,
+) -> f64 {
     if !error.is_finite() {
         return error;
     }
@@ -587,8 +650,9 @@ fn apply_reversal_guard(error: f64, last_u: f64, tolerance_count: f64) -> f64 {
         return error;
     }
 
-    let guard_threshold =
-        (tolerance_count * REVERSAL_GUARD_MULTIPLIER).max(REVERSAL_GUARD_MIN_COUNT);
+    let guard_threshold = (tolerance_count * REVERSAL_GUARD_MULTIPLIER)
+        .max(REVERSAL_GUARD_MIN_COUNT)
+        .max(deadband_hint_count * CALIBRATION_GUARD_DEADBAND_RATIO);
     if error.abs() <= guard_threshold {
         0.0
     } else {
@@ -623,9 +687,15 @@ fn update_reversal_counter(
     *previous_error = Some(current_error);
 }
 
-fn adaptive_axis_tolerance(base_tolerance: f64, reversal_count: usize) -> f64 {
+fn adaptive_axis_tolerance(
+    base_tolerance: f64,
+    reversal_count: usize,
+    deadband_hint_count: f64,
+) -> f64 {
     if reversal_count >= OSCILLATION_REVERSAL_THRESHOLD {
-        base_tolerance.max(OSCILLATION_TOLERANCE_FLOOR_COUNT)
+        let relaxation = (deadband_hint_count * OSCILLATION_TOLERANCE_RELAX_RATIO)
+            .min(OSCILLATION_TOLERANCE_RELAX_MAX_COUNT);
+        base_tolerance + relaxation
     } else {
         base_tolerance
     }
@@ -912,8 +982,8 @@ mod tests {
 
     use super::{
         adaptive_axis_tolerance, apply_reversal_guard, axis_count_bounds, command_from_errors,
-        ekf_config, load_stored_ekf_state, save_stored_ekf_state, select_control_error,
-        update_reversal_counter,
+        control_pulse_ms_for_error, ekf_config, load_stored_ekf_state, save_stored_ekf_state,
+        select_control_error, update_reversal_counter,
     };
     use crate::app::usecases::ptz_controller::AxisEkf;
     use crate::core::model::{AxisModelParams, NumericRange, PtzDirection};
@@ -957,11 +1027,14 @@ mod tests {
 
     #[test]
     fn apply_reversal_guard_blocks_small_reverse_commands() {
-        let blocked = apply_reversal_guard(-80.0, 0.5, 20.0);
+        let blocked = apply_reversal_guard(-80.0, 0.5, 20.0, 0.0);
         assert_eq!(blocked, 0.0);
 
-        let allowed = apply_reversal_guard(-220.0, 0.5, 20.0);
+        let allowed = apply_reversal_guard(-220.0, 0.5, 20.0, 0.0);
         assert_eq!(allowed, -220.0);
+
+        let blocked_by_deadband = apply_reversal_guard(-70.0, 0.5, 10.0, 180.0);
+        assert_eq!(blocked_by_deadband, 0.0);
     }
 
     #[test]
@@ -977,9 +1050,16 @@ mod tests {
 
     #[test]
     fn adaptive_axis_tolerance_relaxes_after_repeated_reversals() {
-        assert_eq!(adaptive_axis_tolerance(50.0, 0), 50.0);
-        assert_eq!(adaptive_axis_tolerance(50.0, 4), 120.0);
-        assert_eq!(adaptive_axis_tolerance(180.0, 8), 180.0);
+        assert_eq!(adaptive_axis_tolerance(50.0, 0, 120.0), 50.0);
+        assert_eq!(adaptive_axis_tolerance(50.0, 4, 200.0), 94.0);
+        assert_eq!(adaptive_axis_tolerance(180.0, 8, 200.0), 224.0);
+    }
+
+    #[test]
+    fn control_pulse_ms_uses_micro_pulses_near_target() {
+        assert_eq!(control_pulse_ms_for_error(80.0), 0);
+        assert_eq!(control_pulse_ms_for_error(150.0), 20);
+        assert_eq!(control_pulse_ms_for_error(300.0), 35);
     }
 
     #[test]

@@ -99,6 +99,41 @@ pub fn handle_request(request: McpRequest) -> AppResult<String> {
             let updated = usecases::set_time::execute(&client, &iso8601)?;
             json_response(json!({ "time": updated.iso8601 }))
         }
+        "reolink.get_net_port" => {
+            let net_port = usecases::net_port::get(&client)?;
+            json_response(json!({
+                "http_enable": net_port.http_enable,
+                "http_port": net_port.http_port,
+                "https_enable": net_port.https_enable,
+                "https_port": net_port.https_port,
+                "media_port": net_port.media_port,
+                "onvif_enable": net_port.onvif_enable,
+                "onvif_port": net_port.onvif_port,
+                "rtsp_enable": net_port.rtsp_enable,
+                "rtsp_port": net_port.rtsp_port,
+                "rtmp_enable": net_port.rtmp_enable,
+                "rtmp_port": net_port.rtmp_port
+            }))
+        }
+        "reolink.set_onvif_enabled" => {
+            let (enabled, onvif_port) = parse_set_onvif_args(&request.arguments)?;
+            let net_port = usecases::net_port::set_onvif_enabled(&client, enabled, onvif_port)?;
+            json_response(json!({
+                "requested_enabled": enabled,
+                "requested_port": onvif_port,
+                "http_enable": net_port.http_enable,
+                "http_port": net_port.http_port,
+                "https_enable": net_port.https_enable,
+                "https_port": net_port.https_port,
+                "media_port": net_port.media_port,
+                "onvif_enable": net_port.onvif_enable,
+                "onvif_port": net_port.onvif_port,
+                "rtsp_enable": net_port.rtsp_enable,
+                "rtsp_port": net_port.rtsp_port,
+                "rtmp_enable": net_port.rtmp_enable,
+                "rtmp_port": net_port.rtmp_port
+            }))
+        }
         "reolink.snap" => {
             ensure_command_supported(&client, CgiCommand::Snap)?;
             let (channel, out_path) = parse_snap_args(&request.arguments)?;
@@ -402,6 +437,47 @@ fn parse_i64(raw: &str, field: &str) -> AppResult<i64> {
             format!("{field} must be an integer"),
         )
     })
+}
+
+fn parse_u16(raw: &str, field: &str) -> AppResult<u16> {
+    raw.parse::<u16>().map_err(|_| {
+        AppError::new(
+            ErrorKind::InvalidInput,
+            format!("{field} must be an integer between 0 and 65535"),
+        )
+    })
+}
+
+fn parse_bool_on_off(raw: &str, field: &str) -> AppResult<bool> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "1" | "true" | "on" | "enable" | "enabled" => Ok(true),
+        "0" | "false" | "off" | "disable" | "disabled" => Ok(false),
+        _ => Err(AppError::new(
+            ErrorKind::InvalidInput,
+            format!("{field} must be one of on/off"),
+        )),
+    }
+}
+
+fn parse_set_onvif_args(arguments: &[String]) -> AppResult<(bool, Option<u16>)> {
+    let enabled_raw = arguments.first().ok_or_else(|| {
+        AppError::new(
+            ErrorKind::InvalidInput,
+            "reolink.set_onvif_enabled requires <on|off> [onvif_port]",
+        )
+    })?;
+    let enabled = parse_bool_on_off(enabled_raw, "enabled")?;
+    let onvif_port = match arguments.get(1) {
+        Some(raw) => Some(parse_u16(raw, "onvif_port")?),
+        None => None,
+    };
+    if arguments.len() > 2 {
+        return Err(AppError::new(
+            ErrorKind::InvalidInput,
+            "reolink.set_onvif_enabled accepts <on|off> [onvif_port]",
+        ));
+    }
+    Ok((enabled, onvif_port))
 }
 
 fn ensure_command_supported(

@@ -35,7 +35,9 @@ Rust ベースの Reolink CLI/MCP 実験用プロジェクトです。
 - `reocli get-channel-status [channel]`
 - `reocli get-ptz-status [channel]`
 - `reocli get-time`
+- `reocli get-net-port`
 - `reocli set-time <iso8601>`
+- `reocli set-onvif <on|off> [--port <1-65535>]`
 - `reocli snap [channel] [--out path]`
 - `reocli ptz move <direction> [--speed <1-64>] [--duration <ms>] [--channel <0-255>]`
 - `reocli ptz stop [--channel <0-255>]`
@@ -58,6 +60,8 @@ Rust ベースの Reolink CLI/MCP 実験用プロジェクトです。
 - `reolink.get_ptz_status`
 - `reolink.get_time`
 - `reolink.set_time`
+- `reolink.get_net_port`
+- `reolink.set_onvif_enabled`
 - `reolink.snap`
 - `reolink.ptz_move`
 - `reolink.ptz_stop`
@@ -76,7 +80,9 @@ reocli get-user-auth admin secret
 # Device / time
 reocli get-dev-info
 reocli get-time
+reocli get-net-port
 reocli set-time 2026-02-25T10:00:00Z
+reocli set-onvif on --port 8000
 
 # Snap
 reocli snap 0 --out snapshots/front-door.jpg
@@ -93,6 +99,8 @@ reocli ptz get-absolute --channel 0
 
 ```bash
 # MCP
+reocli-mcp reolink.get_net_port
+reocli-mcp reolink.set_onvif_enabled on 8000
 reocli-mcp reolink.ptz_calibrate_auto 0
 reocli-mcp reolink.ptz_set_absolute 0 1500 -180 12 25000
 reocli-mcp reolink.ptz_get_absolute 0

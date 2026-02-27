@@ -13,6 +13,8 @@ pub enum CgiCommand {
     GetTime,
     SetTime,
     GetNetwork,
+    GetNetPort,
+    SetNetPort,
     GetUserAuth,
 }
 
@@ -32,6 +34,8 @@ impl CgiCommand {
             Self::GetTime => "GetTime",
             Self::SetTime => "SetTime",
             Self::GetNetwork => "GetNetwork",
+            Self::GetNetPort => "GetNetPort",
+            Self::SetNetPort => "SetNetPort",
             Self::GetUserAuth => "GetUserAuth",
         }
     }
@@ -47,6 +51,7 @@ pub struct CommandParams {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CommandRequest {
     pub command: CgiCommand,
+    pub action: u8,
     pub params: CommandParams,
 }
 
@@ -54,6 +59,7 @@ impl CommandRequest {
     pub fn new(command: CgiCommand) -> Self {
         Self {
             command,
+            action: 0,
             params: CommandParams::default(),
         }
     }

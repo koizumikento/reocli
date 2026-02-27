@@ -47,6 +47,21 @@ pub struct NetworkInfo {
     pub http_port: u16,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct NetPortSettings {
+    pub http_enable: Option<bool>,
+    pub http_port: Option<u16>,
+    pub https_enable: Option<bool>,
+    pub https_port: Option<u16>,
+    pub media_port: Option<u16>,
+    pub onvif_enable: Option<bool>,
+    pub onvif_port: Option<u16>,
+    pub rtsp_enable: Option<bool>,
+    pub rtsp_port: Option<u16>,
+    pub rtmp_enable: Option<bool>,
+    pub rtmp_port: Option<u16>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NumericRange {
     pub min: i64,

@@ -519,7 +519,7 @@ struct CgiBody {
 fn build_request_body(request: &CommandRequest) -> Vec<CgiBody> {
     vec![CgiBody {
         cmd: request.command.as_str().to_string(),
-        action: 0,
+        action: request.action,
         param: build_param(&request.params),
     }]
 }

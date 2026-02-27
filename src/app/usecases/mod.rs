@@ -4,6 +4,7 @@ pub mod get_dev_info;
 pub mod get_ptz_status;
 pub mod get_time;
 pub mod get_user_auth;
+pub mod net_port;
 pub mod ptz_calibrate_auto;
 pub mod ptz_controller;
 pub mod ptz_get_absolute_raw;
