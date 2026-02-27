@@ -35,6 +35,7 @@ const CALIBRATION_STALL_STEPS: usize = 3;
 const CALIBRATION_SWEEP_MAX_STEPS: usize = 48;
 const CALIBRATION_RESTORE_MAX_STEPS: usize = 36;
 const CALIBRATION_RESTORE_TOLERANCE: i64 = 10;
+const CALIBRATION_MODEL_SAMPLE_COUNT: usize = 50;
 const DEFAULT_DEADBAND_COUNT: i64 = 6;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -93,7 +94,7 @@ pub fn execute(client: &Client, channel: u8) -> AppResult<PtzCalibrationReport> 
             Ok(calibration) => (
                 calibration,
                 CalibrationReport {
-                    samples: 8,
+                    samples: CALIBRATION_MODEL_SAMPLE_COUNT,
                     pan_error_p95_count: 0,
                     tilt_error_p95_count: 0,
                     notes: "created_from_measured_sweep".to_string(),
@@ -574,11 +575,14 @@ fn build_axis_count_range(
 
 fn estimate_model_from_sweep(span: f64, sweep_deltas: &[f64]) -> AxisModelParams {
     let fallback = fallback_model_for_span(span);
-    let samples = sweep_deltas
+    let mut samples = sweep_deltas
         .iter()
         .copied()
         .filter(|delta| delta.is_finite() && *delta > 0.0)
         .collect::<Vec<_>>();
+    if samples.len() > CALIBRATION_MODEL_SAMPLE_COUNT {
+        samples = evenly_spaced_samples(&samples, CALIBRATION_MODEL_SAMPLE_COUNT);
+    }
     if samples.len() < 2 {
         return fallback;
     }
@@ -605,6 +609,26 @@ fn estimate_model_from_sweep(span: f64, sweep_deltas: &[f64]) -> AxisModelParams
     }
 
     AxisModelParams { alpha, beta }
+}
+
+fn evenly_spaced_samples(samples: &[f64], target_count: usize) -> Vec<f64> {
+    if samples.len() <= target_count {
+        return samples.to_vec();
+    }
+    if target_count == 0 {
+        return Vec::new();
+    }
+    if target_count == 1 {
+        return vec![samples[samples.len() / 2]];
+    }
+
+    let last_index = samples.len() - 1;
+    let mut selected = Vec::with_capacity(target_count);
+    for i in 0..target_count {
+        let index = i * last_index / (target_count - 1);
+        selected.push(samples[index]);
+    }
+    selected
 }
 
 fn fallback_model_for_span(span: f64) -> AxisModelParams {
@@ -667,7 +691,10 @@ fn now_epoch_millis() -> u64 {
 
 #[cfg(test)]
 mod tests {
-    use super::{build_axis_count_range, estimate_model_from_sweep, map_status_to_counts};
+    use super::{
+        build_axis_count_range, estimate_model_from_sweep, evenly_spaced_samples,
+        map_status_to_counts,
+    };
     use crate::core::model::{NumericRange, PtzStatus};
 
     #[test]
@@ -715,5 +742,14 @@ mod tests {
         assert!(model.beta.is_finite());
         assert!((0.75..=0.98).contains(&model.alpha));
         assert!((20.0..=600.0).contains(&model.beta));
+    }
+
+    #[test]
+    fn evenly_spaced_samples_caps_to_target_count() {
+        let source = (0..100).map(|value| value as f64).collect::<Vec<_>>();
+        let sampled = evenly_spaced_samples(&source, 50);
+        assert_eq!(sampled.len(), 50);
+        assert_eq!(sampled.first().copied(), Some(0.0));
+        assert_eq!(sampled.last().copied(), Some(99.0));
     }
 }
