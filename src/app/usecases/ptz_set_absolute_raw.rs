@@ -7,7 +7,12 @@ use serde::{Deserialize, Serialize};
 
 use crate::app::usecases::ptz_calibrate_auto::{StoredCalibration, load_saved_params_for_device};
 use crate::app::usecases::ptz_controller::{AxisEkf, AxisEkfConfig, AxisEkfSnapshot};
+use crate::app::usecases::ptz_deadband::scale_directional_deadband;
 use crate::app::usecases::ptz_get_absolute_raw::{PtzRawPosition, map_status_to_raw_position};
+use crate::app::usecases::ptz_pulse_lut::{AxisDirection, AxisPulseLut};
+use crate::app::usecases::ptz_settle_gate::{
+    PositionSettlingTracker, completion_gate_allows_success,
+};
 use crate::app::usecases::ptz_transport;
 use crate::core::error::{AppError, AppResult, ErrorKind};
 use crate::core::model::{AxisModelParams, NumericRange, PtzDirection};
@@ -26,12 +31,22 @@ const MICRO_CONTROL_ERROR_COUNT: f64 = 90.0;
 const FINE_CONTROL_ERROR_COUNT: f64 = 180.0;
 const COARSE_CONTROL_ERROR_COUNT: f64 = 320.0;
 const FINE_PHASE_ENTRY_ERROR_COUNT: f64 = 240.0;
+const PULSE_LUT_ENTRY_ERROR_COUNT: f64 = 360.0;
+const PULSE_LUT_TARGET_GAIN: f64 = 0.55;
+const PULSE_LUT_TARGET_MIN_COUNT: f64 = 4.0;
+const PULSE_LUT_TARGET_MAX_COUNT: f64 = 110.0;
+const PULSE_LUT_MIN_MS: u64 = 10;
+const PULSE_LUT_MAX_MS: u64 = 140;
 const FINE_RELATIVE_STEP_GAIN: f64 = 0.55;
 const FINE_RELATIVE_STEP_MIN_COUNT: f64 = 4.0;
 const FINE_RELATIVE_STEP_MAX_COUNT: f64 = 96.0;
 const FINE_FEEDFORWARD_GAIN: f64 = 0.28;
 const FINE_FEEDFORWARD_MAX_COUNT: f64 = 72.0;
 const BACKEND_COMPLETION_MIN_AGE_MS: u64 = 120;
+const BACKEND_POSITION_STABLE_REQUIRED_STEPS: usize = 2;
+const BACKEND_POSITION_STABLE_TOLERANCE_RATIO: f64 = 0.35;
+const BACKEND_POSITION_STABLE_MIN_COUNT: f64 = 2.0;
+const BACKEND_POSITION_STABLE_MAX_COUNT: f64 = 24.0;
 const REVERSAL_GUARD_MULTIPLIER: f64 = 4.0;
 const REVERSAL_GUARD_MIN_COUNT: f64 = 40.0;
 const REVERSAL_GUARD_MOMENTUM_MIN_SCALE: f64 = 0.6;
@@ -136,6 +151,19 @@ impl AxisDeadbandHints {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ControlAxis {
+    Pan,
+    Tilt,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PendingPulseObservation {
+    axis: ControlAxis,
+    direction: AxisDirection,
+    pulse_ms: u64,
+}
+
 pub fn execute(
     client: &Client,
     channel: u8,
@@ -226,6 +254,10 @@ fn run_closed_loop(
 
     let mut pan_filter = AxisEkf::new(pan_ekf_config, pan_model, initial.pan_count as f64);
     let mut tilt_filter = AxisEkf::new(tilt_ekf_config, tilt_model, initial.tilt_count as f64);
+    let mut pan_pulse_lut = AxisPulseLut::seeded(pan_model.beta);
+    let mut tilt_pulse_lut = AxisPulseLut::seeded(tilt_model.beta);
+    let mut pending_pulse_observation = None;
+    let mut position_settling = PositionSettlingTracker::new();
     let mut last_pan_u = 0.0;
     let mut last_tilt_u = 0.0;
     let mut loop_updates = 0usize;
@@ -314,12 +346,22 @@ fn run_closed_loop(
         let pan_tolerance = adaptive_axis_tolerance(
             tolerance_count as f64,
             pan_reversals,
-            deadband_hints.pan_count,
+            scale_directional_deadband(
+                deadband_hints.pan_count,
+                pan_measure,
+                pan_min_count,
+                pan_max_count,
+            ),
         );
         let tilt_tolerance = adaptive_axis_tolerance(
             tolerance_count as f64,
             tilt_reversals,
-            deadband_hints.tilt_count,
+            scale_directional_deadband(
+                deadband_hints.tilt_count,
+                tilt_measure,
+                tilt_min_count,
+                tilt_max_count,
+            ),
         );
 
         let pan_error_control =
@@ -330,21 +372,53 @@ fn run_closed_loop(
         let tilt_observed_delta = previous_tilt_measure.map(|previous| tilt_measure - previous);
         previous_pan_measure = Some(pan_measure);
         previous_tilt_measure = Some(tilt_measure);
+        apply_pending_pulse_observation(
+            &mut pending_pulse_observation,
+            pan_observed_delta,
+            tilt_observed_delta,
+            &mut pan_pulse_lut,
+            &mut tilt_pulse_lut,
+        );
+        let stable_threshold_count = position_stable_threshold_count(
+            tolerance_count as f64,
+            deadband_hints.pan_count,
+            deadband_hints.tilt_count,
+        );
+        position_settling.observe(
+            pan_observed_delta,
+            tilt_observed_delta,
+            stable_threshold_count,
+        );
         let fine_phase_candidate = supports_relative_move
             && pan_error_measured.abs().max(tilt_error_measured.abs())
                 <= FINE_PHASE_ENTRY_ERROR_COUNT;
+        let pulse_lut_candidate = !supports_relative_move
+            && pan_error_measured.abs().max(tilt_error_measured.abs())
+                <= PULSE_LUT_ENTRY_ERROR_COUNT;
 
+        let pan_guard_deadband = scale_directional_deadband(
+            deadband_hints.pan_for_error(pan_error_control),
+            pan_measure,
+            pan_min_count,
+            pan_max_count,
+        );
+        let tilt_guard_deadband = scale_directional_deadband(
+            deadband_hints.tilt_for_error(tilt_error_control),
+            tilt_measure,
+            tilt_min_count,
+            tilt_max_count,
+        );
         let guarded_pan_error = apply_reversal_guard(
             pan_error_control,
             last_pan_u,
             tolerance_count as f64,
-            deadband_hints.pan_for_error(pan_error_control),
+            pan_guard_deadband,
         );
         let guarded_tilt_error = apply_reversal_guard(
             tilt_error_control,
             last_tilt_u,
             tolerance_count as f64,
-            deadband_hints.tilt_for_error(tilt_error_control),
+            tilt_guard_deadband,
         );
         let pan_command_error = if fine_phase_candidate {
             apply_fine_phase_feedforward(
@@ -381,8 +455,17 @@ fn run_closed_loop(
         let within_tolerance = pan_error_measured.abs() <= pan_tolerance
             && tilt_error_measured.abs() <= tilt_tolerance;
         let backend_motion_hint = ptz_transport::motion_status_hint(client, channel);
-        let backend_completion_ready =
-            completion_gate_allows_success(backend_motion_hint, backend_completion_min_age_ms);
+        let backend_completion_ready = if let Some(hint) = backend_motion_hint {
+            completion_gate_allows_success(
+                hint.moving,
+                hint.move_age_ms,
+                backend_completion_min_age_ms,
+                position_settling.stable_steps(),
+                BACKEND_POSITION_STABLE_REQUIRED_STEPS,
+            )
+        } else {
+            position_settling.stable_steps() >= BACKEND_POSITION_STABLE_REQUIRED_STEPS
+        };
         if within_tolerance && loop_updates >= min_updates && backend_completion_ready {
             stable_steps += 1;
         } else {
@@ -512,6 +595,7 @@ fn run_closed_loop(
                     );
                     last_pan_u = pan_u;
                     last_tilt_u = tilt_u;
+                    pending_pulse_observation = None;
                     if pan_relative_delta != 0 && tilt_relative_delta != 0 {
                         tie_break_pan = !tie_break_pan;
                     }
@@ -529,8 +613,21 @@ fn run_closed_loop(
                 Some((direction, command_error_abs)) => {
                     step_error_abs = command_error_abs;
                     let speed = speed_cap_for_error(command_error_abs).max(1);
-                    let pulse_ms = control_pulse_ms_for_error(command_error_abs);
+                    let pulse_ms = if pulse_lut_candidate {
+                        pulse_ms_for_direction_with_lut(
+                            direction,
+                            pan_command_error,
+                            tilt_command_error,
+                            &pan_pulse_lut,
+                            &tilt_pulse_lut,
+                            command_error_abs,
+                        )
+                    } else {
+                        control_pulse_ms_for_error(command_error_abs)
+                    };
                     ptz_transport::move_ptz(client, channel, direction, speed, Some(pulse_ms))?;
+                    pending_pulse_observation =
+                        pending_pulse_observation_for_command(direction, pulse_ms);
                     let elapsed_ms = Instant::now()
                         .saturating_duration_since(started)
                         .as_millis();
@@ -557,6 +654,7 @@ fn run_closed_loop(
                 None => {
                     last_pan_u = 0.0;
                     last_tilt_u = 0.0;
+                    pending_pulse_observation = None;
                 }
             }
         }
@@ -830,6 +928,127 @@ fn control_pulse_ms_for_error(error_abs: f64) -> u64 {
     pulse_ms.clamp(MIN_CONTROL_PULSE_MS, MAX_CONTROL_PULSE_MS)
 }
 
+fn pulse_ms_for_direction_with_lut(
+    direction: PtzDirection,
+    pan_command_error: f64,
+    tilt_command_error: f64,
+    pan_lut: &AxisPulseLut,
+    tilt_lut: &AxisPulseLut,
+    command_error_abs: f64,
+) -> u64 {
+    let fallback = control_pulse_ms_for_error(command_error_abs);
+    let Some((axis, axis_direction)) = control_axis_direction(direction) else {
+        return fallback;
+    };
+    let axis_error = match axis {
+        ControlAxis::Pan => pan_command_error,
+        ControlAxis::Tilt => tilt_command_error,
+    };
+    if !axis_error.is_finite() {
+        return fallback;
+    }
+
+    let target_count = (axis_error.abs() * PULSE_LUT_TARGET_GAIN)
+        .clamp(PULSE_LUT_TARGET_MIN_COUNT, PULSE_LUT_TARGET_MAX_COUNT);
+    let lut = match axis {
+        ControlAxis::Pan => pan_lut,
+        ControlAxis::Tilt => tilt_lut,
+    };
+    lut.pulse_ms_for_target(
+        axis_direction,
+        target_count,
+        PULSE_LUT_MIN_MS,
+        PULSE_LUT_MAX_MS,
+    )
+}
+
+fn control_axis_direction(direction: PtzDirection) -> Option<(ControlAxis, AxisDirection)> {
+    match direction {
+        PtzDirection::Left => Some((ControlAxis::Pan, AxisDirection::Negative)),
+        PtzDirection::Right => Some((ControlAxis::Pan, AxisDirection::Positive)),
+        PtzDirection::Up => Some((ControlAxis::Tilt, AxisDirection::Positive)),
+        PtzDirection::Down => Some((ControlAxis::Tilt, AxisDirection::Negative)),
+        PtzDirection::LeftUp
+        | PtzDirection::LeftDown
+        | PtzDirection::RightUp
+        | PtzDirection::RightDown => None,
+    }
+}
+
+fn pending_pulse_observation_for_command(
+    direction: PtzDirection,
+    pulse_ms: u64,
+) -> Option<PendingPulseObservation> {
+    if pulse_ms == 0 {
+        return None;
+    }
+    let (axis, axis_direction) = control_axis_direction(direction)?;
+    Some(PendingPulseObservation {
+        axis,
+        direction: axis_direction,
+        pulse_ms,
+    })
+}
+
+fn apply_pending_pulse_observation(
+    pending: &mut Option<PendingPulseObservation>,
+    pan_observed_delta: Option<f64>,
+    tilt_observed_delta: Option<f64>,
+    pan_lut: &mut AxisPulseLut,
+    tilt_lut: &mut AxisPulseLut,
+) {
+    let Some(observation) = pending.take() else {
+        return;
+    };
+    let observed_delta = match observation.axis {
+        ControlAxis::Pan => pan_observed_delta,
+        ControlAxis::Tilt => tilt_observed_delta,
+    };
+    let Some(observed_delta) = observed_delta else {
+        return;
+    };
+    if !observation.direction.matches_observed_delta(observed_delta) {
+        return;
+    }
+
+    match observation.axis {
+        ControlAxis::Pan => {
+            pan_lut.update(observation.direction, observation.pulse_ms, observed_delta)
+        }
+        ControlAxis::Tilt => {
+            tilt_lut.update(observation.direction, observation.pulse_ms, observed_delta)
+        }
+    }
+}
+
+fn position_stable_threshold_count(
+    tolerance_count: f64,
+    pan_deadband_hint_count: f64,
+    tilt_deadband_hint_count: f64,
+) -> f64 {
+    let tolerance_based = (tolerance_count * BACKEND_POSITION_STABLE_TOLERANCE_RATIO).clamp(
+        BACKEND_POSITION_STABLE_MIN_COUNT,
+        BACKEND_POSITION_STABLE_MAX_COUNT,
+    );
+    let deadband_based = (pan_deadband_hint_count.max(tilt_deadband_hint_count) * 0.12).clamp(
+        BACKEND_POSITION_STABLE_MIN_COUNT,
+        BACKEND_POSITION_STABLE_MAX_COUNT,
+    );
+    tolerance_based.max(deadband_based)
+}
+
+impl AxisDirection {
+    fn matches_observed_delta(self, observed_delta: f64) -> bool {
+        if !observed_delta.is_finite() {
+            return false;
+        }
+        match self {
+            AxisDirection::Positive => observed_delta > 0.0,
+            AxisDirection::Negative => observed_delta < 0.0,
+        }
+    }
+}
+
 fn control_step_ms_for_error(error_abs: f64) -> u64 {
     let base = if error_abs <= MICRO_CONTROL_ERROR_COUNT {
         320
@@ -843,20 +1062,6 @@ fn control_step_ms_for_error(error_abs: f64) -> u64 {
         250
     };
     base.max(SETTLE_STEP_MS)
-}
-
-fn completion_gate_allows_success(
-    hint: Option<ptz_transport::TransportMotionHint>,
-    min_age_ms: u64,
-) -> bool {
-    let Some(hint) = hint else {
-        return true;
-    };
-
-    if hint.moving == Some(true) {
-        return false;
-    }
-    hint.move_age_ms.is_none_or(|age_ms| age_ms >= min_age_ms)
 }
 
 fn format_transport_hint(hint: Option<ptz_transport::TransportMotionHint>) -> String {
@@ -1314,13 +1519,16 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use super::{
-        adaptive_axis_tolerance, apply_fine_phase_feedforward, apply_reversal_guard,
-        axis_count_bounds, command_from_errors, completion_gate_allows_success,
-        control_pulse_ms_for_error, ekf_config, load_stored_ekf_state, relative_delta_from_error,
-        save_stored_ekf_state, select_control_error, update_reversal_counter,
+        adaptive_axis_tolerance, apply_fine_phase_feedforward, apply_pending_pulse_observation,
+        apply_reversal_guard, axis_count_bounds, command_from_errors, control_axis_direction,
+        control_pulse_ms_for_error, ekf_config, load_stored_ekf_state,
+        pending_pulse_observation_for_command, position_stable_threshold_count,
+        pulse_ms_for_direction_with_lut, relative_delta_from_error, save_stored_ekf_state,
+        select_control_error, update_reversal_counter,
     };
     use crate::app::usecases::ptz_controller::AxisEkf;
-    use crate::app::usecases::ptz_transport::TransportMotionHint;
+    use crate::app::usecases::ptz_pulse_lut::AxisPulseLut;
+    use crate::app::usecases::ptz_settle_gate::completion_gate_allows_success;
     use crate::core::model::{AxisModelParams, NumericRange, PtzDirection};
 
     #[test]
@@ -1390,28 +1598,76 @@ mod tests {
 
     #[test]
     fn completion_gate_respects_backend_motion_hint() {
-        assert!(completion_gate_allows_success(None, 120));
+        assert!(!completion_gate_allows_success(None, None, 120, 2, 2));
         assert!(!completion_gate_allows_success(
-            Some(TransportMotionHint {
-                moving: Some(true),
-                move_age_ms: Some(250),
-            }),
-            120
+            Some(true),
+            Some(250),
+            120,
+            2,
+            2
         ));
         assert!(!completion_gate_allows_success(
-            Some(TransportMotionHint {
-                moving: Some(false),
-                move_age_ms: Some(70),
-            }),
-            120
+            Some(false),
+            Some(70),
+            120,
+            2,
+            2
         ));
         assert!(completion_gate_allows_success(
-            Some(TransportMotionHint {
-                moving: Some(false),
-                move_age_ms: Some(260),
-            }),
-            120
+            Some(false),
+            Some(260),
+            120,
+            2,
+            2
         ));
+    }
+
+    #[test]
+    fn pulse_lut_path_produces_short_pulse_for_small_error() {
+        let pan_lut = AxisPulseLut::seeded(120.0);
+        let tilt_lut = AxisPulseLut::seeded(120.0);
+        let pulse = pulse_ms_for_direction_with_lut(
+            PtzDirection::Right,
+            90.0,
+            0.0,
+            &pan_lut,
+            &tilt_lut,
+            90.0,
+        );
+        assert!(pulse >= 10);
+        assert!(pulse <= 140);
+    }
+
+    #[test]
+    fn pending_pulse_observation_updates_axis_lut() {
+        let mut pan_lut = AxisPulseLut::seeded(120.0);
+        let mut tilt_lut = AxisPulseLut::seeded(120.0);
+        let mut pending = pending_pulse_observation_for_command(PtzDirection::Right, 40);
+        apply_pending_pulse_observation(
+            &mut pending,
+            Some(120.0),
+            Some(0.0),
+            &mut pan_lut,
+            &mut tilt_lut,
+        );
+        assert!(pending.is_none());
+        assert!(
+            pan_lut.counts_per_ms(crate::app::usecases::ptz_pulse_lut::AxisDirection::Positive)
+                > 1.0
+        );
+    }
+
+    #[test]
+    fn position_stable_threshold_accounts_for_deadband() {
+        let threshold = position_stable_threshold_count(10.0, 180.0, 20.0);
+        assert!(threshold >= 10.0);
+        assert!(threshold <= 24.0);
+    }
+
+    #[test]
+    fn control_axis_direction_rejects_diagonal() {
+        assert!(control_axis_direction(PtzDirection::LeftUp).is_none());
+        assert!(control_axis_direction(PtzDirection::RightDown).is_none());
     }
 
     #[test]
