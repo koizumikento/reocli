@@ -25,6 +25,8 @@ const EKF_STATE_SCHEMA_VERSION: u32 = 1;
 const MIN_ADAPTIVE_UPDATES: usize = 2;
 const REQUIRED_STABLE_STEPS: usize = 2;
 const SETTLE_STEP_MS: u64 = 100;
+const TIMEOUT_RETRY_BUDGET_MIN_MS: u64 = 10_000;
+const TIMEOUT_RETRY_BUDGET_MAX_MS: u64 = 20_000;
 const MIN_CONTROL_PULSE_MS: u64 = 0;
 const MAX_CONTROL_PULSE_MS: u64 = 220;
 const MICRO_CONTROL_ERROR_COUNT: f64 = 90.0;
@@ -37,6 +39,9 @@ const PULSE_LUT_TARGET_MIN_COUNT: f64 = 4.0;
 const PULSE_LUT_TARGET_MAX_COUNT: f64 = 110.0;
 const PULSE_LUT_MIN_MS: u64 = 10;
 const PULSE_LUT_MAX_MS: u64 = 140;
+const NEAR_TARGET_SPEED1_ENTRY_ERROR_COUNT: f64 = 420.0;
+const NEAR_TARGET_SPEED1_MIN_PULSE_MS: u64 = 10;
+const NEAR_TARGET_SPEED1_MAX_PULSE_MS: u64 = 45;
 const FINE_RELATIVE_STEP_GAIN: f64 = 0.55;
 const FINE_RELATIVE_STEP_MIN_COUNT: f64 = 4.0;
 const FINE_RELATIVE_STEP_MAX_COUNT: f64 = 96.0;
@@ -55,6 +60,11 @@ const REVERSAL_GUARD_NEAR_TARGET_MIN_COUNT: f64 = 26.0;
 const REVERSAL_GUARD_NEAR_TARGET_MIN_SCALE: f64 = 0.24;
 const DUAL_AXIS_DOMINANCE_RATIO: f64 = 1.2;
 const TIE_BREAK_CLOSE_ERROR_COUNT: f64 = 320.0;
+const NO_RELATIVE_TILT_PRIORITY_RATIO: f64 = 0.65;
+const NO_RELATIVE_TILT_PRIORITY_MAX_ERROR_COUNT: f64 = 1_200.0;
+const TILT_EDGE_CONTROL_MARGIN_COUNT: f64 = 120.0;
+const TILT_EDGE_CONTROL_MAX_PULSE_MS: u64 = 20;
+const TILT_EDGE_CONTROL_SPEED_CAP: u8 = 1;
 const OSCILLATION_REVERSAL_THRESHOLD: usize = 4;
 const OSCILLATION_DETECT_RANGE_MULTIPLIER: f64 = 4.0;
 const OSCILLATION_MIN_DETECT_COUNT: f64 = 120.0;
@@ -174,23 +184,60 @@ pub fn execute(
 ) -> AppResult<PtzRawPosition> {
     validate_inputs(tolerance_count, timeout_ms)?;
 
-    let operation_result = {
-        let (state_key, state_path) = ekf_state_identity(client, channel);
-        let deadline = Instant::now() + Duration::from_millis(timeout_ms);
-        run_closed_loop(
-            client,
-            channel,
-            target_pan_count,
-            target_tilt_count,
-            tolerance_count,
-            timeout_ms,
-            deadline,
-            &state_key,
-            &state_path,
-        )
-    };
+    let (state_key, state_path) = ekf_state_identity(client, channel);
+    let deadline = Instant::now() + Duration::from_millis(timeout_ms);
+    let mut operation_result = run_closed_loop(
+        client,
+        channel,
+        target_pan_count,
+        target_tilt_count,
+        tolerance_count,
+        timeout_ms,
+        deadline,
+        &state_key,
+        &state_path,
+    );
+
+    if let Err(initial_error) = operation_result {
+        if should_retry_after_timeout(&initial_error) {
+            let retry_timeout_ms = timeout_retry_budget_ms(timeout_ms);
+            let retry_deadline = Instant::now() + Duration::from_millis(retry_timeout_ms);
+            operation_result = match run_closed_loop(
+                client,
+                channel,
+                target_pan_count,
+                target_tilt_count,
+                tolerance_count,
+                retry_timeout_ms,
+                retry_deadline,
+                &state_key,
+                &state_path,
+            ) {
+                Ok(result) => Ok(result),
+                Err(retry_error) => Err(AppError::new(
+                    retry_error.kind,
+                    format!(
+                        "initial_timeout='{}'; retry_timeout='{}'",
+                        initial_error.message, retry_error.message
+                    ),
+                )),
+            };
+        } else {
+            operation_result = Err(initial_error);
+        }
+    }
 
     finalize_with_best_effort_stop(client, channel, operation_result)
+}
+
+fn should_retry_after_timeout(error: &AppError) -> bool {
+    error.kind == ErrorKind::UnexpectedResponse
+        && error.message.contains("set_absolute_raw timeout")
+}
+
+fn timeout_retry_budget_ms(timeout_ms: u64) -> u64 {
+    let scaled = timeout_ms.saturating_mul(3) / 5;
+    scaled.clamp(TIMEOUT_RETRY_BUDGET_MIN_MS, TIMEOUT_RETRY_BUDGET_MAX_MS)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -395,6 +442,9 @@ fn run_closed_loop(
         let pulse_lut_candidate = !supports_relative_move
             && pan_error_measured.abs().max(tilt_error_measured.abs())
                 <= PULSE_LUT_ENTRY_ERROR_COUNT;
+        let near_target_speed1_mode = !supports_relative_move
+            && pan_error_measured.abs().max(tilt_error_measured.abs())
+                <= NEAR_TARGET_SPEED1_ENTRY_ERROR_COUNT;
 
         let pan_guard_deadband = scale_directional_deadband(
             deadband_hints.pan_for_error(pan_error_control),
@@ -604,16 +654,28 @@ fn run_closed_loop(
         }
 
         if !relative_command_applied {
-            match command_from_errors(
+            match tilt_priority_command_for_no_relative(
+                supports_relative_move,
                 pan_command_error,
                 tilt_command_error,
                 tolerance_count as f64,
-                tie_break_pan,
-            ) {
+            )
+            .or_else(|| {
+                command_from_errors(
+                    pan_command_error,
+                    tilt_command_error,
+                    tolerance_count as f64,
+                    tie_break_pan,
+                )
+            }) {
                 Some((direction, command_error_abs)) => {
                     step_error_abs = command_error_abs;
-                    let speed = speed_cap_for_error(command_error_abs).max(1);
-                    let pulse_ms = if pulse_lut_candidate {
+                    let speed = if near_target_speed1_mode {
+                        1
+                    } else {
+                        speed_cap_for_error(command_error_abs).max(1)
+                    };
+                    let base_pulse_ms = if pulse_lut_candidate {
                         pulse_ms_for_direction_with_lut(
                             direction,
                             pan_command_error,
@@ -625,6 +687,19 @@ fn run_closed_loop(
                     } else {
                         control_pulse_ms_for_error(command_error_abs)
                     };
+                    let pulse_ms = if near_target_speed1_mode {
+                        near_target_speed1_pulse_ms(base_pulse_ms)
+                    } else {
+                        base_pulse_ms
+                    };
+                    let (speed, pulse_ms) = clamp_tilt_edge_control(
+                        direction,
+                        speed,
+                        pulse_ms,
+                        tilt_measure,
+                        tilt_min_count,
+                        tilt_max_count,
+                    );
                     ptz_transport::move_ptz(client, channel, direction, speed, Some(pulse_ms))?;
                     pending_pulse_observation =
                         pending_pulse_observation_for_command(direction, pulse_ms);
@@ -893,6 +968,34 @@ fn command_from_errors(
     }
 }
 
+fn tilt_priority_command_for_no_relative(
+    supports_relative_move: bool,
+    pan_error: f64,
+    tilt_error: f64,
+    tolerance_count: f64,
+) -> Option<(PtzDirection, f64)> {
+    if supports_relative_move {
+        return None;
+    }
+    let pan_abs = pan_error.abs();
+    let tilt_abs = tilt_error.abs();
+    if pan_abs <= tolerance_count || tilt_abs <= tolerance_count {
+        return None;
+    }
+    if pan_abs.max(tilt_abs) > NO_RELATIVE_TILT_PRIORITY_MAX_ERROR_COUNT {
+        return None;
+    }
+    if tilt_abs < (pan_abs * NO_RELATIVE_TILT_PRIORITY_RATIO) {
+        return None;
+    }
+
+    if tilt_error.is_sign_positive() {
+        Some((PtzDirection::Up, tilt_abs))
+    } else {
+        Some((PtzDirection::Down, tilt_abs))
+    }
+}
+
 fn speed_cap_for_error(error_abs: f64) -> u8 {
     if error_abs <= FINE_CONTROL_ERROR_COUNT {
         1
@@ -1035,6 +1138,35 @@ fn position_stable_threshold_count(
         BACKEND_POSITION_STABLE_MAX_COUNT,
     );
     tolerance_based.max(deadband_based)
+}
+
+fn near_target_speed1_pulse_ms(base_pulse_ms: u64) -> u64 {
+    base_pulse_ms.clamp(
+        NEAR_TARGET_SPEED1_MIN_PULSE_MS,
+        NEAR_TARGET_SPEED1_MAX_PULSE_MS,
+    )
+}
+
+fn clamp_tilt_edge_control(
+    direction: PtzDirection,
+    speed: u8,
+    pulse_ms: u64,
+    tilt_measure: f64,
+    tilt_min_count: f64,
+    tilt_max_count: f64,
+) -> (u8, u64) {
+    let near_upper_edge = tilt_measure >= (tilt_max_count - TILT_EDGE_CONTROL_MARGIN_COUNT);
+    let near_lower_edge = tilt_measure <= (tilt_min_count + TILT_EDGE_CONTROL_MARGIN_COUNT);
+    let edge_risk = matches!(direction, PtzDirection::Up) && near_upper_edge
+        || matches!(direction, PtzDirection::Down) && near_lower_edge;
+    if !edge_risk {
+        return (speed, pulse_ms);
+    }
+
+    (
+        speed.min(TILT_EDGE_CONTROL_SPEED_CAP),
+        pulse_ms.min(TILT_EDGE_CONTROL_MAX_PULSE_MS),
+    )
 }
 
 impl AxisDirection {
@@ -1520,15 +1652,18 @@ mod tests {
 
     use super::{
         adaptive_axis_tolerance, apply_fine_phase_feedforward, apply_pending_pulse_observation,
-        apply_reversal_guard, axis_count_bounds, command_from_errors, control_axis_direction,
-        control_pulse_ms_for_error, ekf_config, load_stored_ekf_state,
-        pending_pulse_observation_for_command, position_stable_threshold_count,
-        pulse_ms_for_direction_with_lut, relative_delta_from_error, save_stored_ekf_state,
-        select_control_error, update_reversal_counter,
+        apply_reversal_guard, axis_count_bounds, clamp_tilt_edge_control, command_from_errors,
+        control_axis_direction, control_pulse_ms_for_error, ekf_config, load_stored_ekf_state,
+        near_target_speed1_pulse_ms, pending_pulse_observation_for_command,
+        position_stable_threshold_count, pulse_ms_for_direction_with_lut,
+        relative_delta_from_error, save_stored_ekf_state, select_control_error,
+        should_retry_after_timeout, tilt_priority_command_for_no_relative, timeout_retry_budget_ms,
+        update_reversal_counter,
     };
     use crate::app::usecases::ptz_controller::AxisEkf;
     use crate::app::usecases::ptz_pulse_lut::AxisPulseLut;
     use crate::app::usecases::ptz_settle_gate::completion_gate_allows_success;
+    use crate::core::error::{AppError, ErrorKind};
     use crate::core::model::{AxisModelParams, NumericRange, PtzDirection};
 
     #[test]
@@ -1566,6 +1701,72 @@ mod tests {
             command_from_errors(0.0, -110.0, 10.0, true).expect("command should be produced");
         assert_eq!(single_axis.0, PtzDirection::Down);
         assert!(dominant.1 >= 1.0);
+    }
+
+    #[test]
+    fn tilt_priority_command_applies_only_in_supported_band() {
+        assert_eq!(
+            tilt_priority_command_for_no_relative(false, 100.0, 90.0, 10.0).map(|cmd| cmd.0),
+            Some(PtzDirection::Up)
+        );
+        assert_eq!(
+            tilt_priority_command_for_no_relative(false, 100.0, -90.0, 10.0).map(|cmd| cmd.0),
+            Some(PtzDirection::Down)
+        );
+        assert_eq!(
+            tilt_priority_command_for_no_relative(true, 100.0, 90.0, 10.0),
+            None
+        );
+        assert_eq!(
+            tilt_priority_command_for_no_relative(false, 20.0, 8.0, 10.0),
+            None
+        );
+        assert_eq!(
+            tilt_priority_command_for_no_relative(false, 2_000.0, 1_500.0, 10.0),
+            None
+        );
+    }
+
+    #[test]
+    fn timeout_retry_budget_is_bounded_and_scaled() {
+        assert_eq!(timeout_retry_budget_ms(9_000), 10_000);
+        assert_eq!(timeout_retry_budget_ms(25_000), 15_000);
+        assert_eq!(timeout_retry_budget_ms(60_000), 20_000);
+    }
+
+    #[test]
+    fn should_retry_after_timeout_matches_timeout_errors_only() {
+        let timeout_error = AppError::new(
+            ErrorKind::UnexpectedResponse,
+            "set_absolute_raw timeout after 25000ms",
+        );
+        assert!(should_retry_after_timeout(&timeout_error));
+
+        let other_unexpected = AppError::new(ErrorKind::UnexpectedResponse, "other failure");
+        assert!(!should_retry_after_timeout(&other_unexpected));
+
+        let network = AppError::new(ErrorKind::Network, "set_absolute_raw timeout after 25000ms");
+        assert!(!should_retry_after_timeout(&network));
+    }
+
+    #[test]
+    fn clamp_tilt_edge_control_limits_edge_risk_only() {
+        assert_eq!(
+            clamp_tilt_edge_control(PtzDirection::Up, 4, 90, 1_230.0, 0.0, 1_240.0),
+            (1, 20)
+        );
+        assert_eq!(
+            clamp_tilt_edge_control(PtzDirection::Down, 3, 80, 5.0, 0.0, 1_240.0),
+            (1, 20)
+        );
+        assert_eq!(
+            clamp_tilt_edge_control(PtzDirection::Down, 3, 80, 600.0, 0.0, 1_240.0),
+            (3, 80)
+        );
+        assert_eq!(
+            clamp_tilt_edge_control(PtzDirection::Right, 4, 90, 1_230.0, 0.0, 1_240.0),
+            (4, 90)
+        );
     }
 
     #[test]
@@ -1668,6 +1869,13 @@ mod tests {
     fn control_axis_direction_rejects_diagonal() {
         assert!(control_axis_direction(PtzDirection::LeftUp).is_none());
         assert!(control_axis_direction(PtzDirection::RightDown).is_none());
+    }
+
+    #[test]
+    fn near_target_speed1_pulse_ms_clamps_to_guard_band() {
+        assert_eq!(near_target_speed1_pulse_ms(0), 10);
+        assert_eq!(near_target_speed1_pulse_ms(24), 24);
+        assert_eq!(near_target_speed1_pulse_ms(90), 45);
     }
 
     #[test]
