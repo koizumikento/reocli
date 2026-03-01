@@ -60,8 +60,6 @@ const REVERSAL_GUARD_NEAR_TARGET_MIN_COUNT: f64 = 26.0;
 const REVERSAL_GUARD_NEAR_TARGET_MIN_SCALE: f64 = 0.24;
 const DUAL_AXIS_DOMINANCE_RATIO: f64 = 1.2;
 const TIE_BREAK_CLOSE_ERROR_COUNT: f64 = 320.0;
-const NO_RELATIVE_TILT_PRIORITY_RATIO: f64 = 0.65;
-const NO_RELATIVE_TILT_PRIORITY_MAX_ERROR_COUNT: f64 = 1_200.0;
 const TILT_EDGE_CONTROL_MARGIN_COUNT: f64 = 120.0;
 const TILT_EDGE_CONTROL_MAX_PULSE_MS: u64 = 20;
 const TILT_EDGE_CONTROL_SPEED_CAP: u8 = 1;
@@ -288,6 +286,8 @@ fn run_closed_loop(
 
     let pan_span = (pan_max_count - pan_min_count).abs().max(1.0);
     let tilt_span = (tilt_max_count - tilt_min_count).abs().max(1.0);
+    let pan_success_tolerance = axis_one_percent_threshold(pan_span);
+    let tilt_success_tolerance = axis_one_percent_threshold(tilt_span);
     let pan_model = saved_calibration
         .as_ref()
         .map(|stored| sanitize_model_params(stored.calibration.pan_model, pan_span))
@@ -376,6 +376,8 @@ fn run_closed_loop(
 
         let pan_error_measured = target_pan_count as f64 - pan_measure;
         let tilt_error_measured = target_tilt_count as f64 - tilt_measure;
+        let measured_error_norm =
+            normalized_vector_error(pan_error_measured, tilt_error_measured, pan_span, tilt_span);
         let pan_error_estimated = target_pan_count as f64 - estimated_pan;
         let tilt_error_estimated = target_tilt_count as f64 - estimated_tilt;
         update_reversal_counter(
@@ -492,6 +494,8 @@ fn run_closed_loop(
         } else {
             guarded_tilt_error
         };
+        let command_error_norm =
+            normalized_vector_error(pan_command_error, tilt_command_error, pan_span, tilt_span);
 
         consider_best(
             &mut best_observed,
@@ -502,8 +506,8 @@ fn run_closed_loop(
         );
         loop_updates += 1;
 
-        let within_tolerance = pan_error_measured.abs() <= pan_tolerance
-            && tilt_error_measured.abs() <= tilt_tolerance;
+        let within_tolerance = pan_error_measured.abs() <= pan_success_tolerance
+            && tilt_error_measured.abs() <= tilt_success_tolerance;
         let backend_motion_hint = ptz_transport::motion_status_hint(client, channel);
         let backend_completion_ready = if let Some(hint) = backend_motion_hint {
             completion_gate_allows_success(
@@ -571,7 +575,7 @@ fn run_closed_loop(
             return Err(AppError::new(
                 ErrorKind::UnexpectedResponse,
                 format!(
-                    "set_absolute_raw timeout after {}ms on channel {channel}: target=({},{}) current=({},{}) measured_error=({:.1},{:.1}) estimated_error=({:.1},{:.1}) control_error=({:.1},{:.1}) command_error=({:.1},{:.1}) tolerance={} effective_tolerance=({:.1},{:.1}) reversals=({},{}) updates={} stable_steps={} last_dt_sec={:.3} backend_hint={} best=({},{}) best_error=({},{}) trace=[{}]{}",
+                    "set_absolute_raw timeout after {}ms on channel {channel}: target=({},{}) current=({},{}) measured_error=({:.1},{:.1}) measured_error_norm={:.5} estimated_error=({:.1},{:.1}) control_error=({:.1},{:.1}) command_error=({:.1},{:.1}) command_error_norm={:.5} tolerance={} control_tolerance=({:.1},{:.1}) success_tolerance=({:.1},{:.1}) reversals=({},{}) updates={} stable_steps={} last_dt_sec={:.3} backend_hint={} best=({},{}) best_error=({},{}) trace=[{}]{}",
                     timeout_ms,
                     target_pan_count,
                     target_tilt_count,
@@ -579,15 +583,19 @@ fn run_closed_loop(
                     current.tilt_count,
                     pan_error_measured,
                     tilt_error_measured,
+                    measured_error_norm,
                     pan_error_estimated,
                     tilt_error_estimated,
                     pan_error_control,
                     tilt_error_control,
                     pan_command_error,
                     tilt_command_error,
+                    command_error_norm,
                     tolerance_count,
                     pan_tolerance,
                     tilt_tolerance,
+                    pan_success_tolerance,
+                    tilt_success_tolerance,
                     pan_reversals,
                     tilt_reversals,
                     loop_updates,
@@ -654,20 +662,14 @@ fn run_closed_loop(
         }
 
         if !relative_command_applied {
-            match tilt_priority_command_for_no_relative(
-                supports_relative_move,
+            match command_from_errors(
                 pan_command_error,
                 tilt_command_error,
                 tolerance_count as f64,
-            )
-            .or_else(|| {
-                command_from_errors(
-                    pan_command_error,
-                    tilt_command_error,
-                    tolerance_count as f64,
-                    tie_break_pan,
-                )
-            }) {
+                tie_break_pan,
+                pan_span,
+                tilt_span,
+            ) {
                 Some((direction, command_error_abs)) => {
                     step_error_abs = command_error_abs;
                     let speed = if near_target_speed1_mode {
@@ -917,11 +919,33 @@ fn select_control_error(estimated_error: f64, measured_error: f64, tolerance_cou
     }
 }
 
+fn axis_one_percent_threshold(span: f64) -> f64 {
+    if !span.is_finite() || span <= f64::EPSILON {
+        return 1.0;
+    }
+    (span * 0.01).floor().max(1.0)
+}
+
+fn normalized_axis_error(abs_error: f64, span: f64) -> f64 {
+    if !abs_error.is_finite() || !span.is_finite() || span <= f64::EPSILON {
+        return abs_error.abs();
+    }
+    abs_error.abs() / span
+}
+
+fn normalized_vector_error(pan_error: f64, tilt_error: f64, pan_span: f64, tilt_span: f64) -> f64 {
+    let pan_component = normalized_axis_error(pan_error, pan_span);
+    let tilt_component = normalized_axis_error(tilt_error, tilt_span);
+    (pan_component.mul_add(pan_component, tilt_component * tilt_component)).sqrt()
+}
+
 fn command_from_errors(
     pan_error: f64,
     tilt_error: f64,
     tolerance_count: f64,
     tie_break_pan: bool,
+    pan_span: f64,
+    tilt_span: f64,
 ) -> Option<(PtzDirection, f64)> {
     let pan_active = pan_error.abs() > tolerance_count;
     let tilt_active = tilt_error.abs() > tolerance_count;
@@ -931,16 +955,17 @@ fn command_from_errors(
     if pan_active && tilt_active {
         let pan_abs = pan_error.abs();
         let tilt_abs = tilt_error.abs();
-        let prefer_pan =
-            if pan_abs > TIE_BREAK_CLOSE_ERROR_COUNT || tilt_abs > TIE_BREAK_CLOSE_ERROR_COUNT {
-                pan_abs >= tilt_abs
-            } else if pan_abs > tilt_abs * DUAL_AXIS_DOMINANCE_RATIO {
-                true
-            } else if tilt_abs > pan_abs * DUAL_AXIS_DOMINANCE_RATIO {
-                false
-            } else {
-                tie_break_pan
-            };
+        let pan_norm = normalized_axis_error(pan_abs, pan_span);
+        let tilt_norm = normalized_axis_error(tilt_abs, tilt_span);
+        let prefer_pan = if pan_norm > tilt_norm * DUAL_AXIS_DOMINANCE_RATIO {
+            true
+        } else if tilt_norm > pan_norm * DUAL_AXIS_DOMINANCE_RATIO {
+            false
+        } else if pan_abs > TIE_BREAK_CLOSE_ERROR_COUNT || tilt_abs > TIE_BREAK_CLOSE_ERROR_COUNT {
+            pan_norm >= tilt_norm
+        } else {
+            tie_break_pan
+        };
         if prefer_pan {
             if pan_error > 0.0 {
                 return Some((PtzDirection::Right, pan_abs));
@@ -965,34 +990,6 @@ fn command_from_errors(
         Some((PtzDirection::Down, tilt_error.abs()))
     } else {
         None
-    }
-}
-
-fn tilt_priority_command_for_no_relative(
-    supports_relative_move: bool,
-    pan_error: f64,
-    tilt_error: f64,
-    tolerance_count: f64,
-) -> Option<(PtzDirection, f64)> {
-    if supports_relative_move {
-        return None;
-    }
-    let pan_abs = pan_error.abs();
-    let tilt_abs = tilt_error.abs();
-    if pan_abs <= tolerance_count || tilt_abs <= tolerance_count {
-        return None;
-    }
-    if pan_abs.max(tilt_abs) > NO_RELATIVE_TILT_PRIORITY_MAX_ERROR_COUNT {
-        return None;
-    }
-    if tilt_abs < (pan_abs * NO_RELATIVE_TILT_PRIORITY_RATIO) {
-        return None;
-    }
-
-    if tilt_error.is_sign_positive() {
-        Some((PtzDirection::Up, tilt_abs))
-    } else {
-        Some((PtzDirection::Down, tilt_abs))
     }
 }
 
@@ -1652,13 +1649,13 @@ mod tests {
 
     use super::{
         adaptive_axis_tolerance, apply_fine_phase_feedforward, apply_pending_pulse_observation,
-        apply_reversal_guard, axis_count_bounds, clamp_tilt_edge_control, command_from_errors,
-        control_axis_direction, control_pulse_ms_for_error, ekf_config, load_stored_ekf_state,
-        near_target_speed1_pulse_ms, pending_pulse_observation_for_command,
+        apply_reversal_guard, axis_count_bounds, axis_one_percent_threshold,
+        clamp_tilt_edge_control, command_from_errors, control_axis_direction,
+        control_pulse_ms_for_error, ekf_config, load_stored_ekf_state, near_target_speed1_pulse_ms,
+        normalized_vector_error, pending_pulse_observation_for_command,
         position_stable_threshold_count, pulse_ms_for_direction_with_lut,
         relative_delta_from_error, save_stored_ekf_state, select_control_error,
-        should_retry_after_timeout, tilt_priority_command_for_no_relative, timeout_retry_budget_ms,
-        update_reversal_counter,
+        should_retry_after_timeout, timeout_retry_budget_ms, update_reversal_counter,
     };
     use crate::app::usecases::ptz_controller::AxisEkf;
     use crate::app::usecases::ptz_pulse_lut::AxisPulseLut;
@@ -1685,46 +1682,43 @@ mod tests {
 
     #[test]
     fn command_from_errors_prioritizes_dominant_axis_and_uses_tie_break() {
-        let dominant =
-            command_from_errors(220.0, -100.0, 10.0, true).expect("command should be produced");
+        let dominant = command_from_errors(220.0, -100.0, 10.0, true, 1000.0, 1000.0)
+            .expect("command should be produced");
         assert_eq!(dominant.0, PtzDirection::Right);
 
-        let tie_break_pan =
-            command_from_errors(120.0, -110.0, 10.0, true).expect("command should be produced");
+        let tie_break_pan = command_from_errors(120.0, -110.0, 10.0, true, 1000.0, 1000.0)
+            .expect("command should be produced");
         assert_eq!(tie_break_pan.0, PtzDirection::Right);
 
-        let tie_break_tilt =
-            command_from_errors(120.0, -110.0, 10.0, false).expect("command should be produced");
+        let tie_break_tilt = command_from_errors(120.0, -110.0, 10.0, false, 1000.0, 1000.0)
+            .expect("command should be produced");
         assert_eq!(tie_break_tilt.0, PtzDirection::Down);
 
-        let single_axis =
-            command_from_errors(0.0, -110.0, 10.0, true).expect("command should be produced");
+        let single_axis = command_from_errors(0.0, -110.0, 10.0, true, 1000.0, 1000.0)
+            .expect("command should be produced");
         assert_eq!(single_axis.0, PtzDirection::Down);
         assert!(dominant.1 >= 1.0);
     }
 
     #[test]
-    fn tilt_priority_command_applies_only_in_supported_band() {
+    fn command_from_errors_uses_normalized_axis_priority() {
         assert_eq!(
-            tilt_priority_command_for_no_relative(false, 100.0, 90.0, 10.0).map(|cmd| cmd.0),
+            command_from_errors(200.0, 100.0, 10.0, true, 7360.0, 1240.0).map(|cmd| cmd.0),
             Some(PtzDirection::Up)
         );
         assert_eq!(
-            tilt_priority_command_for_no_relative(false, 100.0, -90.0, 10.0).map(|cmd| cmd.0),
-            Some(PtzDirection::Down)
-        );
-        assert_eq!(
-            tilt_priority_command_for_no_relative(true, 100.0, 90.0, 10.0),
+            command_from_errors(8.0, 8.0, 10.0, true, 7360.0, 1240.0),
             None
         );
-        assert_eq!(
-            tilt_priority_command_for_no_relative(false, 20.0, 8.0, 10.0),
-            None
-        );
-        assert_eq!(
-            tilt_priority_command_for_no_relative(false, 2_000.0, 1_500.0, 10.0),
-            None
-        );
+    }
+
+    #[test]
+    fn one_percent_and_vector_helpers_are_finite() {
+        assert_eq!(axis_one_percent_threshold(7360.0), 73.0);
+        assert_eq!(axis_one_percent_threshold(1240.0), 12.0);
+        let vector = normalized_vector_error(73.0, 12.0, 7360.0, 1240.0);
+        assert!(vector.is_finite());
+        assert!(vector > 0.0);
     }
 
     #[test]
