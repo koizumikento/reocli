@@ -25,8 +25,8 @@ const EKF_STATE_SCHEMA_VERSION: u32 = 1;
 const MIN_ADAPTIVE_UPDATES: usize = 2;
 const REQUIRED_STABLE_STEPS: usize = 2;
 const SETTLE_STEP_MS: u64 = 100;
-const TIMEOUT_RETRY_BUDGET_MIN_MS: u64 = 10_000;
-const TIMEOUT_RETRY_BUDGET_MAX_MS: u64 = 20_000;
+const TIMEOUT_RETRY_BUDGET_MIN_MS: u64 = 14_000;
+const TIMEOUT_RETRY_BUDGET_MAX_MS: u64 = 24_000;
 const MIN_CONTROL_PULSE_MS: u64 = 0;
 const MAX_CONTROL_PULSE_MS: u64 = 220;
 const MICRO_CONTROL_ERROR_COUNT: f64 = 90.0;
@@ -63,6 +63,20 @@ const TIE_BREAK_CLOSE_ERROR_COUNT: f64 = 320.0;
 const TILT_EDGE_CONTROL_MARGIN_COUNT: f64 = 120.0;
 const TILT_EDGE_CONTROL_MAX_PULSE_MS: u64 = 20;
 const TILT_EDGE_CONTROL_SPEED_CAP: u8 = 1;
+const FAILURE_DIAG_PAN_EDGE_MARGIN_RATIO: f64 = 0.03;
+const FAILURE_DIAG_PAN_EDGE_MARGIN_MIN_COUNT: f64 = 40.0;
+const FAILURE_DIAG_PAN_EDGE_MARGIN_MAX_COUNT: f64 = 320.0;
+const FAILURE_DIAG_STALE_DELTA_EPS_COUNT: f64 = 1.0;
+const FAILURE_DIAG_STALE_STREAK_MIN: usize = 2;
+const FAILURE_DIAG_AXIS_SWAP_DOMINANCE_RATIO: f64 = 1.6;
+const FAILURE_DIAG_MODEL_MISMATCH_MIN_COUNT: f64 = 20.0;
+const FAILURE_DIAG_MODEL_MISMATCH_RATIO: f64 = 0.8;
+const ONLINE_BETA_EWMA_ALPHA: f64 = 0.22;
+const ONLINE_BETA_MIN_CONTROL_U: f64 = 0.08;
+const ONLINE_BETA_OUTLIER_LOW_RATIO: f64 = 0.35;
+const ONLINE_BETA_OUTLIER_HIGH_RATIO: f64 = 2.8;
+const ONLINE_BETA_SAMPLE_MIN_COUNT: f64 = 4.0;
+const ONLINE_BETA_SAMPLE_SPAN_RATIO_MAX: f64 = 0.32;
 const OSCILLATION_REVERSAL_THRESHOLD: usize = 4;
 const OSCILLATION_DETECT_RANGE_MULTIPLIER: f64 = 4.0;
 const OSCILLATION_MIN_DETECT_COUNT: f64 = 120.0;
@@ -98,6 +112,8 @@ const EKF_MIN_Q_BIAS: f64 = 0.05;
 const EKF_MAX_Q_BIAS: f64 = 24.0;
 const EKF_MIN_R_MEASUREMENT: f64 = 0.2;
 const EKF_MAX_R_MEASUREMENT: f64 = 30.0;
+const SUCCESS_LATCH_MIN_SETTLING_STEPS: usize = 1;
+const SUCCESS_LATCH_CURRENT_NORM_MAX: f64 = 0.04;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 struct StoredAxisEkfState {
@@ -172,6 +188,20 @@ struct PendingPulseObservation {
     pulse_ms: u64,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct FailureModeCounters {
+    edge_saturation_hits: usize,
+    model_mismatch_hits: usize,
+    axis_swap_lag_hits: usize,
+    stale_status_hits: usize,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct AxisOnlineGainTracker {
+    positive_beta: f64,
+    negative_beta: f64,
+}
+
 pub fn execute(
     client: &Client,
     channel: u8,
@@ -212,13 +242,24 @@ pub fn execute(
                 &state_path,
             ) {
                 Ok(result) => Ok(result),
-                Err(retry_error) => Err(AppError::new(
-                    retry_error.kind,
-                    format!(
-                        "initial_timeout='{}'; retry_timeout='{}'",
-                        initial_error.message, retry_error.message
-                    ),
-                )),
+                Err(retry_error) => {
+                    let initial_modes =
+                        parse_failure_mode_counters(&initial_error.message).unwrap_or_default();
+                    let retry_modes =
+                        parse_failure_mode_counters(&retry_error.message).unwrap_or_default();
+                    let max_modes = max_failure_mode_counters(initial_modes, retry_modes);
+                    Err(AppError::new(
+                        retry_error.kind,
+                        format!(
+                            "initial_timeout='{}'; retry_timeout='{}'; initial_failure_modes={}; retry_failure_modes={}; failure_modes_max={}",
+                            initial_error.message,
+                            retry_error.message,
+                            format_failure_mode_counters(initial_modes),
+                            format_failure_mode_counters(retry_modes),
+                            format_failure_mode_counters(max_modes),
+                        ),
+                    ))
+                }
             };
         } else {
             operation_result = Err(initial_error);
@@ -234,8 +275,68 @@ fn should_retry_after_timeout(error: &AppError) -> bool {
 }
 
 fn timeout_retry_budget_ms(timeout_ms: u64) -> u64 {
-    let scaled = timeout_ms.saturating_mul(3) / 5;
+    let scaled = timeout_ms.saturating_mul(3) / 4;
     scaled.clamp(TIMEOUT_RETRY_BUDGET_MIN_MS, TIMEOUT_RETRY_BUDGET_MAX_MS)
+}
+
+fn parse_failure_mode_counters(message: &str) -> Option<FailureModeCounters> {
+    let start = message.rfind("failure_modes=(")? + "failure_modes=(".len();
+    let end = start + message[start..].find(')')?;
+    let tuple = &message[start..end];
+
+    let mut counters = FailureModeCounters::default();
+    let mut parsed_count = 0usize;
+    for entry in tuple.split(',') {
+        let (key, value) = entry.split_once(':')?;
+        let value = value.trim().parse::<usize>().ok()?;
+        match key.trim() {
+            "edge" => {
+                counters.edge_saturation_hits = value;
+                parsed_count += 1;
+            }
+            "model" => {
+                counters.model_mismatch_hits = value;
+                parsed_count += 1;
+            }
+            "axis_swap" => {
+                counters.axis_swap_lag_hits = value;
+                parsed_count += 1;
+            }
+            "stale" => {
+                counters.stale_status_hits = value;
+                parsed_count += 1;
+            }
+            _ => return None,
+        }
+    }
+
+    if parsed_count == 4 {
+        Some(counters)
+    } else {
+        None
+    }
+}
+
+fn max_failure_mode_counters(
+    left: FailureModeCounters,
+    right: FailureModeCounters,
+) -> FailureModeCounters {
+    FailureModeCounters {
+        edge_saturation_hits: left.edge_saturation_hits.max(right.edge_saturation_hits),
+        model_mismatch_hits: left.model_mismatch_hits.max(right.model_mismatch_hits),
+        axis_swap_lag_hits: left.axis_swap_lag_hits.max(right.axis_swap_lag_hits),
+        stale_status_hits: left.stale_status_hits.max(right.stale_status_hits),
+    }
+}
+
+fn format_failure_mode_counters(counters: FailureModeCounters) -> String {
+    format!(
+        "(edge:{},model:{},axis_swap:{},stale:{})",
+        counters.edge_saturation_hits,
+        counters.model_mismatch_hits,
+        counters.axis_swap_lag_hits,
+        counters.stale_status_hits,
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -301,6 +402,8 @@ fn run_closed_loop(
 
     let mut pan_filter = AxisEkf::new(pan_ekf_config, pan_model, initial.pan_count as f64);
     let mut tilt_filter = AxisEkf::new(tilt_ekf_config, tilt_model, initial.tilt_count as f64);
+    let mut pan_gain_tracker = AxisOnlineGainTracker::seeded(pan_model.beta);
+    let mut tilt_gain_tracker = AxisOnlineGainTracker::seeded(tilt_model.beta);
     let mut pan_pulse_lut = AxisPulseLut::seeded(pan_model.beta);
     let mut tilt_pulse_lut = AxisPulseLut::seeded(tilt_model.beta);
     let mut pending_pulse_observation = None;
@@ -310,9 +413,12 @@ fn run_closed_loop(
     let mut loop_updates = 0usize;
     let mut stable_steps = 0usize;
     let mut best_observed: Option<BestObservedState> = None;
+    let mut best_age_steps = 0usize;
     let mut command_trace: Vec<String> = Vec::new();
     let mut last_update_at = Instant::now();
     let mut tie_break_pan = true;
+    let mut failure_modes = FailureModeCounters::default();
+    let mut stale_status_streak = 0usize;
     let mut pan_reversals = 0usize;
     let mut tilt_reversals = 0usize;
     let mut prev_pan_error_measured: Option<f64> = None;
@@ -421,6 +527,24 @@ fn run_closed_loop(
         let tilt_observed_delta = previous_tilt_measure.map(|previous| tilt_measure - previous);
         previous_pan_measure = Some(pan_measure);
         previous_tilt_measure = Some(tilt_measure);
+        let pan_predicted_delta = pan_gain_tracker.predicted_delta(last_pan_u);
+        let tilt_predicted_delta = tilt_gain_tracker.predicted_delta(last_tilt_u);
+        if model_mismatch_detected(pan_predicted_delta, pan_observed_delta)
+            || model_mismatch_detected(tilt_predicted_delta, tilt_observed_delta)
+        {
+            failure_modes.model_mismatch_hits = failure_modes.model_mismatch_hits.saturating_add(1);
+        }
+        pan_gain_tracker.observe(last_pan_u, pan_observed_delta, pan_span);
+        tilt_gain_tracker.observe(last_tilt_u, tilt_observed_delta, tilt_span);
+        if stale_status_detected(
+            last_pan_u,
+            last_tilt_u,
+            pan_observed_delta,
+            tilt_observed_delta,
+            &mut stale_status_streak,
+        ) {
+            failure_modes.stale_status_hits = failure_modes.stale_status_hits.saturating_add(1);
+        }
         apply_pending_pulse_observation(
             &mut pending_pulse_observation,
             pan_observed_delta,
@@ -475,7 +599,7 @@ fn run_closed_loop(
         let pan_command_error = if fine_phase_candidate {
             apply_fine_phase_feedforward(
                 guarded_pan_error,
-                pan_model.beta,
+                pan_gain_tracker.beta_for_u(last_pan_u),
                 last_pan_u,
                 pan_observed_delta,
                 tolerance_count as f64,
@@ -486,7 +610,7 @@ fn run_closed_loop(
         let tilt_command_error = if fine_phase_candidate {
             apply_fine_phase_feedforward(
                 guarded_tilt_error,
-                tilt_model.beta,
+                tilt_gain_tracker.beta_for_u(last_tilt_u),
                 last_tilt_u,
                 tilt_observed_delta,
                 tolerance_count as f64,
@@ -497,13 +621,17 @@ fn run_closed_loop(
         let command_error_norm =
             normalized_vector_error(pan_command_error, tilt_command_error, pan_span, tilt_span);
 
-        consider_best(
+        if consider_best(
             &mut best_observed,
             current.pan_count,
             current.tilt_count,
             target_pan_count,
             target_tilt_count,
-        );
+        ) {
+            best_age_steps = 0;
+        } else {
+            best_age_steps = best_age_steps.saturating_add(1);
+        }
         loop_updates += 1;
 
         let within_tolerance = pan_error_measured.abs() <= pan_success_tolerance
@@ -540,7 +668,32 @@ fn run_closed_loop(
         }
 
         if Instant::now() >= deadline {
-            if within_tolerance && backend_completion_ready {
+            let best = best_observed.unwrap_or(BestObservedState {
+                pan_count: current.pan_count,
+                tilt_count: current.tilt_count,
+                pan_abs_error: pan_error_measured.abs().round() as i64,
+                tilt_abs_error: tilt_error_measured.abs().round() as i64,
+            });
+            let best_within_success_tol =
+                best_within_success_tolerance(best, pan_success_tolerance, tilt_success_tolerance);
+            let latch_eligible = best_within_success_tol
+                && success_latch_ready(
+                    position_settling.stable_steps(),
+                    measured_error_norm,
+                    backend_motion_hint,
+                );
+            if (within_tolerance && backend_completion_ready) || latch_eligible {
+                let success_position = if within_tolerance && backend_completion_ready {
+                    current.clone()
+                } else {
+                    PtzRawPosition {
+                        channel: current.channel,
+                        pan_count: best.pan_count,
+                        tilt_count: best.tilt_count,
+                        zoom_count: current.zoom_count,
+                        focus_count: current.focus_count,
+                    }
+                };
                 save_stored_ekf_state(
                     state_path,
                     state_key,
@@ -550,14 +703,8 @@ fn run_closed_loop(
                     0.0,
                     0.0,
                 )?;
-                return Ok(current);
+                return Ok(success_position);
             }
-            let best = best_observed.unwrap_or(BestObservedState {
-                pan_count: current.pan_count,
-                tilt_count: current.tilt_count,
-                pan_abs_error: pan_error_measured.abs().round() as i64,
-                tilt_abs_error: tilt_error_measured.abs().round() as i64,
-            });
             let persist_error = save_stored_ekf_state(
                 state_path,
                 state_key,
@@ -572,10 +719,17 @@ fn run_closed_loop(
                 .as_ref()
                 .map(|error| format!("; persist_error={}", error.message))
                 .unwrap_or_default();
+            let timeout_blocker = timeout_blocker_label(
+                within_tolerance,
+                backend_completion_ready,
+                best_within_success_tol,
+                latch_eligible,
+            );
+            let dominant_failure_mode = dominant_failure_mode_label(failure_modes);
             return Err(AppError::new(
                 ErrorKind::UnexpectedResponse,
                 format!(
-                    "set_absolute_raw timeout after {}ms on channel {channel}: target=({},{}) current=({},{}) measured_error=({:.1},{:.1}) measured_error_norm={:.5} estimated_error=({:.1},{:.1}) control_error=({:.1},{:.1}) command_error=({:.1},{:.1}) command_error_norm={:.5} tolerance={} control_tolerance=({:.1},{:.1}) success_tolerance=({:.1},{:.1}) reversals=({},{}) updates={} stable_steps={} last_dt_sec={:.3} backend_hint={} best=({},{}) best_error=({},{}) trace=[{}]{}",
+                    "set_absolute_raw timeout after {}ms on channel {channel}: target=({},{}) current=({},{}) measured_error=({:.1},{:.1}) measured_error_norm={:.5} estimated_error=({:.1},{:.1}) control_error=({:.1},{:.1}) command_error=({:.1},{:.1}) command_error_norm={:.5} tolerance={} control_tolerance=({:.1},{:.1}) success_tolerance=({:.1},{:.1}) reversals=({},{}) updates={} stable_steps={} failure_modes=(edge:{},model:{},axis_swap:{},stale:{}) timeout_blocker={} dominant_failure_mode={} best_within_success_tol={} latch_eligible={} best_age_steps={} online_beta=(pan+:{:.1},pan-:{:.1},tilt+:{:.1},tilt-:{:.1}) last_dt_sec={:.3} backend_hint={} best=({},{}) best_error=({},{}) trace=[{}]{}",
                     timeout_ms,
                     target_pan_count,
                     target_tilt_count,
@@ -600,6 +754,19 @@ fn run_closed_loop(
                     tilt_reversals,
                     loop_updates,
                     stable_steps,
+                    failure_modes.edge_saturation_hits,
+                    failure_modes.model_mismatch_hits,
+                    failure_modes.axis_swap_lag_hits,
+                    failure_modes.stale_status_hits,
+                    timeout_blocker,
+                    dominant_failure_mode,
+                    best_within_success_tol,
+                    latch_eligible,
+                    best_age_steps,
+                    pan_gain_tracker.positive_beta(),
+                    pan_gain_tracker.negative_beta(),
+                    tilt_gain_tracker.positive_beta(),
+                    tilt_gain_tracker.negative_beta(),
                     effective_dt_sec,
                     format_transport_hint(backend_motion_hint),
                     best.pan_count,
@@ -672,6 +839,33 @@ fn run_closed_loop(
             ) {
                 Some((direction, command_error_abs)) => {
                     step_error_abs = command_error_abs;
+                    if axis_swap_lag_detected(
+                        pan_command_error,
+                        tilt_command_error,
+                        direction,
+                        pan_span,
+                        tilt_span,
+                    ) {
+                        failure_modes.axis_swap_lag_hits =
+                            failure_modes.axis_swap_lag_hits.saturating_add(1);
+                    }
+                    if edge_saturation_detected(
+                        direction,
+                        pan_measure,
+                        pan_min_count,
+                        pan_max_count,
+                        pan_span,
+                        pan_error_measured,
+                        pan_success_tolerance,
+                        tilt_measure,
+                        tilt_min_count,
+                        tilt_max_count,
+                        tilt_error_measured,
+                        tilt_success_tolerance,
+                    ) {
+                        failure_modes.edge_saturation_hits =
+                            failure_modes.edge_saturation_hits.saturating_add(1);
+                    }
                     let speed = if near_target_speed1_mode {
                         1
                     } else {
@@ -773,6 +967,158 @@ fn sanitize_model_params(model: AxisModelParams, span: f64) -> AxisModelParams {
     };
 
     AxisModelParams { alpha, beta }
+}
+
+impl AxisOnlineGainTracker {
+    fn seeded(model_beta: f64) -> Self {
+        let seeded = if model_beta.is_finite() {
+            model_beta.clamp(MODEL_BETA_MIN, MODEL_BETA_MAX)
+        } else {
+            MODEL_BETA_MIN
+        };
+        Self {
+            positive_beta: seeded,
+            negative_beta: seeded,
+        }
+    }
+
+    fn beta_for_u(self, control_u: f64) -> f64 {
+        if control_u.is_sign_negative() {
+            self.negative_beta
+        } else {
+            self.positive_beta
+        }
+    }
+
+    fn predicted_delta(self, control_u: f64) -> f64 {
+        if !control_u.is_finite() {
+            return 0.0;
+        }
+        let u = control_u.clamp(-1.0, 1.0);
+        self.beta_for_u(u) * u
+    }
+
+    fn observe(&mut self, control_u: f64, observed_delta: Option<f64>, axis_span: f64) {
+        if !control_u.is_finite() {
+            return;
+        }
+        let Some(observed_delta) = observed_delta.filter(|value| value.is_finite()) else {
+            return;
+        };
+        let u = control_u.clamp(-1.0, 1.0);
+        let u_abs = u.abs();
+        if u_abs < ONLINE_BETA_MIN_CONTROL_U {
+            return;
+        }
+        if observed_delta.abs() < ONLINE_BETA_SAMPLE_MIN_COUNT {
+            return;
+        }
+        if observed_delta.signum() != u.signum() {
+            return;
+        }
+
+        let mut sample_beta = (observed_delta.abs() / u_abs).clamp(MODEL_BETA_MIN, MODEL_BETA_MAX);
+        let sample_upper =
+            (axis_span * ONLINE_BETA_SAMPLE_SPAN_RATIO_MAX).clamp(MODEL_BETA_MIN, MODEL_BETA_MAX);
+        if sample_beta > sample_upper {
+            return;
+        }
+        sample_beta = sample_beta.min(sample_upper);
+
+        let target_beta = if u.is_sign_negative() {
+            &mut self.negative_beta
+        } else {
+            &mut self.positive_beta
+        };
+        let previous = *target_beta;
+        let outlier_low = previous * ONLINE_BETA_OUTLIER_LOW_RATIO;
+        let outlier_high = previous * ONLINE_BETA_OUTLIER_HIGH_RATIO;
+        if sample_beta < outlier_low || sample_beta > outlier_high {
+            return;
+        }
+
+        let alpha = ONLINE_BETA_EWMA_ALPHA.clamp(0.05, 0.95);
+        *target_beta =
+            ((1.0 - alpha) * previous + alpha * sample_beta).clamp(MODEL_BETA_MIN, MODEL_BETA_MAX);
+    }
+
+    fn positive_beta(self) -> f64 {
+        self.positive_beta
+    }
+
+    fn negative_beta(self) -> f64 {
+        self.negative_beta
+    }
+}
+
+fn best_within_success_tolerance(
+    best: BestObservedState,
+    pan_success_tolerance: f64,
+    tilt_success_tolerance: f64,
+) -> bool {
+    (best.pan_abs_error as f64) <= pan_success_tolerance
+        && (best.tilt_abs_error as f64) <= tilt_success_tolerance
+}
+
+fn success_latch_ready(
+    settling_steps: usize,
+    measured_error_norm: f64,
+    backend_hint: Option<ptz_transport::TransportMotionHint>,
+) -> bool {
+    let backend_is_moving = backend_hint.and_then(|hint| hint.moving).unwrap_or(false);
+    if backend_is_moving {
+        return false;
+    }
+    if settling_steps >= SUCCESS_LATCH_MIN_SETTLING_STEPS {
+        return true;
+    }
+    measured_error_norm.is_finite() && measured_error_norm <= SUCCESS_LATCH_CURRENT_NORM_MAX
+}
+
+fn timeout_blocker_label(
+    within_tolerance: bool,
+    backend_completion_ready: bool,
+    best_within_success_tol: bool,
+    latch_eligible: bool,
+) -> &'static str {
+    if within_tolerance && !backend_completion_ready {
+        return "completion_gate";
+    }
+    if best_within_success_tol && !latch_eligible {
+        return "latch_gate";
+    }
+    if !within_tolerance {
+        return "residual_error";
+    }
+    "unknown"
+}
+
+fn dominant_failure_mode_label(counters: FailureModeCounters) -> &'static str {
+    let edge = counters.edge_saturation_hits;
+    let model = counters.model_mismatch_hits;
+    let axis_swap = counters.axis_swap_lag_hits;
+    let stale = counters.stale_status_hits;
+    let max = edge.max(model).max(axis_swap).max(stale);
+    if max == 0 {
+        return "none";
+    }
+
+    let leader_count = usize::from(edge == max)
+        + usize::from(model == max)
+        + usize::from(axis_swap == max)
+        + usize::from(stale == max);
+    if leader_count > 1 {
+        return "tie";
+    }
+    if edge == max {
+        "edge"
+    } else if model == max {
+        "model"
+    } else if axis_swap == max {
+        "axis_swap"
+    } else {
+        "stale"
+    }
 }
 
 fn load_saved_calibration_for_channel(client: &Client, channel: u8) -> Option<StoredCalibration> {
@@ -937,6 +1283,135 @@ fn normalized_vector_error(pan_error: f64, tilt_error: f64, pan_span: f64, tilt_
     let pan_component = normalized_axis_error(pan_error, pan_span);
     let tilt_component = normalized_axis_error(tilt_error, tilt_span);
     (pan_component.mul_add(pan_component, tilt_component * tilt_component)).sqrt()
+}
+
+fn model_mismatch_detected(predicted_delta: f64, observed_delta: Option<f64>) -> bool {
+    if !predicted_delta.is_finite() {
+        return false;
+    }
+    let Some(observed_delta) = observed_delta.filter(|value| value.is_finite()) else {
+        return false;
+    };
+    let predicted_abs = predicted_delta.abs();
+    if predicted_abs < FAILURE_DIAG_MODEL_MISMATCH_MIN_COUNT {
+        return false;
+    }
+    let residual_abs = (predicted_delta - observed_delta).abs();
+    let allowed = (predicted_abs * FAILURE_DIAG_MODEL_MISMATCH_RATIO)
+        .max(FAILURE_DIAG_MODEL_MISMATCH_MIN_COUNT);
+    residual_abs > allowed
+}
+
+fn stale_status_detected(
+    last_pan_u: f64,
+    last_tilt_u: f64,
+    pan_observed_delta: Option<f64>,
+    tilt_observed_delta: Option<f64>,
+    streak: &mut usize,
+) -> bool {
+    let commanded_motion = last_pan_u.abs() > 0.05 || last_tilt_u.abs() > 0.05;
+    if !commanded_motion {
+        *streak = 0;
+        return false;
+    }
+
+    let pan_stationary = pan_observed_delta
+        .filter(|value| value.is_finite())
+        .is_some_and(|value| value.abs() <= FAILURE_DIAG_STALE_DELTA_EPS_COUNT);
+    let tilt_stationary = tilt_observed_delta
+        .filter(|value| value.is_finite())
+        .is_some_and(|value| value.abs() <= FAILURE_DIAG_STALE_DELTA_EPS_COUNT);
+    if pan_stationary && tilt_stationary {
+        *streak = streak.saturating_add(1);
+        return *streak >= FAILURE_DIAG_STALE_STREAK_MIN;
+    }
+
+    *streak = 0;
+    false
+}
+
+fn dominant_axis_by_normalized_error(
+    pan_error: f64,
+    tilt_error: f64,
+    pan_span: f64,
+    tilt_span: f64,
+    dominance_ratio: f64,
+) -> Option<ControlAxis> {
+    let pan_norm = normalized_axis_error(pan_error, pan_span);
+    let tilt_norm = normalized_axis_error(tilt_error, tilt_span);
+    if pan_norm <= f64::EPSILON && tilt_norm <= f64::EPSILON {
+        return None;
+    }
+    if pan_norm > tilt_norm * dominance_ratio {
+        Some(ControlAxis::Pan)
+    } else if tilt_norm > pan_norm * dominance_ratio {
+        Some(ControlAxis::Tilt)
+    } else {
+        None
+    }
+}
+
+fn axis_swap_lag_detected(
+    pan_command_error: f64,
+    tilt_command_error: f64,
+    direction: PtzDirection,
+    pan_span: f64,
+    tilt_span: f64,
+) -> bool {
+    let Some(dominant_axis) = dominant_axis_by_normalized_error(
+        pan_command_error,
+        tilt_command_error,
+        pan_span,
+        tilt_span,
+        FAILURE_DIAG_AXIS_SWAP_DOMINANCE_RATIO,
+    ) else {
+        return false;
+    };
+    let Some((command_axis, _)) = control_axis_direction(direction) else {
+        return false;
+    };
+    dominant_axis != command_axis
+}
+
+#[allow(clippy::too_many_arguments)]
+fn edge_saturation_detected(
+    direction: PtzDirection,
+    pan_measure: f64,
+    pan_min_count: f64,
+    pan_max_count: f64,
+    pan_span: f64,
+    pan_error_measured: f64,
+    pan_success_tolerance: f64,
+    tilt_measure: f64,
+    tilt_min_count: f64,
+    tilt_max_count: f64,
+    tilt_error_measured: f64,
+    tilt_success_tolerance: f64,
+) -> bool {
+    let pan_margin = (pan_span * FAILURE_DIAG_PAN_EDGE_MARGIN_RATIO).clamp(
+        FAILURE_DIAG_PAN_EDGE_MARGIN_MIN_COUNT,
+        FAILURE_DIAG_PAN_EDGE_MARGIN_MAX_COUNT,
+    );
+    let near_pan_low = pan_measure <= (pan_min_count + pan_margin);
+    let near_pan_high = pan_measure >= (pan_max_count - pan_margin);
+    let pan_push_low = pan_error_measured < -pan_success_tolerance;
+    let pan_push_high = pan_error_measured > pan_success_tolerance;
+
+    let near_tilt_low = tilt_measure <= (tilt_min_count + TILT_EDGE_CONTROL_MARGIN_COUNT);
+    let near_tilt_high = tilt_measure >= (tilt_max_count - TILT_EDGE_CONTROL_MARGIN_COUNT);
+    let tilt_push_low = tilt_error_measured < -tilt_success_tolerance;
+    let tilt_push_high = tilt_error_measured > tilt_success_tolerance;
+
+    match direction {
+        PtzDirection::Left => near_pan_low && pan_push_low,
+        PtzDirection::Right => near_pan_high && pan_push_high,
+        PtzDirection::Up => near_tilt_high && tilt_push_high,
+        PtzDirection::Down => near_tilt_low && tilt_push_low,
+        PtzDirection::LeftUp
+        | PtzDirection::LeftDown
+        | PtzDirection::RightUp
+        | PtzDirection::RightDown => false,
+    }
 }
 
 fn command_from_errors(
@@ -1394,7 +1869,7 @@ fn consider_best(
     tilt_count: i64,
     target_pan_count: i64,
     target_tilt_count: i64,
-) {
+) -> bool {
     let candidate_pan_abs_error = (target_pan_count - pan_count).abs();
     let candidate_tilt_abs_error = (target_tilt_count - tilt_count).abs();
     let candidate_max_error = candidate_pan_abs_error.max(candidate_tilt_abs_error);
@@ -1418,6 +1893,9 @@ fn consider_best(
             pan_abs_error: candidate_pan_abs_error,
             tilt_abs_error: candidate_tilt_abs_error,
         });
+        true
+    } else {
+        false
     }
 }
 
@@ -1648,14 +2126,19 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use super::{
-        adaptive_axis_tolerance, apply_fine_phase_feedforward, apply_pending_pulse_observation,
-        apply_reversal_guard, axis_count_bounds, axis_one_percent_threshold,
-        clamp_tilt_edge_control, command_from_errors, control_axis_direction,
-        control_pulse_ms_for_error, ekf_config, load_stored_ekf_state, near_target_speed1_pulse_ms,
-        normalized_vector_error, pending_pulse_observation_for_command,
-        position_stable_threshold_count, pulse_ms_for_direction_with_lut,
-        relative_delta_from_error, save_stored_ekf_state, select_control_error,
-        should_retry_after_timeout, timeout_retry_budget_ms, update_reversal_counter,
+        AxisOnlineGainTracker, FailureModeCounters, adaptive_axis_tolerance,
+        apply_fine_phase_feedforward, apply_pending_pulse_observation, apply_reversal_guard,
+        axis_count_bounds, axis_one_percent_threshold, axis_swap_lag_detected,
+        best_within_success_tolerance, clamp_tilt_edge_control, command_from_errors,
+        control_axis_direction, control_pulse_ms_for_error, dominant_failure_mode_label,
+        edge_saturation_detected, ekf_config, format_failure_mode_counters, load_stored_ekf_state,
+        max_failure_mode_counters, model_mismatch_detected, near_target_speed1_pulse_ms,
+        normalized_vector_error, parse_failure_mode_counters,
+        pending_pulse_observation_for_command, position_stable_threshold_count,
+        pulse_ms_for_direction_with_lut, relative_delta_from_error, save_stored_ekf_state,
+        select_control_error, should_retry_after_timeout, stale_status_detected,
+        success_latch_ready, timeout_blocker_label, timeout_retry_budget_ms,
+        update_reversal_counter,
     };
     use crate::app::usecases::ptz_controller::AxisEkf;
     use crate::app::usecases::ptz_pulse_lut::AxisPulseLut;
@@ -1722,10 +2205,161 @@ mod tests {
     }
 
     #[test]
+    fn failure_mode_helpers_detect_expected_patterns() {
+        assert!(model_mismatch_detected(120.0, Some(10.0)));
+        assert!(!model_mismatch_detected(10.0, Some(1.0)));
+
+        let mut stale = 0usize;
+        assert!(!stale_status_detected(
+            0.6,
+            0.0,
+            Some(0.1),
+            Some(0.1),
+            &mut stale
+        ));
+        assert!(stale_status_detected(
+            0.6,
+            0.0,
+            Some(0.1),
+            Some(0.1),
+            &mut stale
+        ));
+
+        assert!(axis_swap_lag_detected(
+            500.0,
+            40.0,
+            PtzDirection::Up,
+            7360.0,
+            1240.0
+        ));
+        assert!(!axis_swap_lag_detected(
+            40.0,
+            500.0,
+            PtzDirection::Up,
+            7360.0,
+            1240.0
+        ));
+
+        assert!(edge_saturation_detected(
+            PtzDirection::Up,
+            7000.0,
+            0.0,
+            7360.0,
+            7360.0,
+            0.0,
+            73.0,
+            1235.0,
+            0.0,
+            1240.0,
+            40.0,
+            12.0,
+        ));
+        assert!(!edge_saturation_detected(
+            PtzDirection::Right,
+            2000.0,
+            0.0,
+            7360.0,
+            7360.0,
+            40.0,
+            73.0,
+            600.0,
+            0.0,
+            1240.0,
+            0.0,
+            12.0,
+        ));
+    }
+
+    #[test]
+    fn failure_mode_counter_parsing_and_max_are_stable() {
+        let parsed = parse_failure_mode_counters(
+            "set_absolute_raw timeout ... failure_modes=(edge:7,model:3,axis_swap:0,stale:1)",
+        )
+        .expect("failure mode tuple should parse");
+        assert_eq!(
+            parsed,
+            FailureModeCounters {
+                edge_saturation_hits: 7,
+                model_mismatch_hits: 3,
+                axis_swap_lag_hits: 0,
+                stale_status_hits: 1,
+            }
+        );
+        assert_eq!(
+            format_failure_mode_counters(parsed),
+            "(edge:7,model:3,axis_swap:0,stale:1)"
+        );
+
+        let retry = FailureModeCounters {
+            edge_saturation_hits: 5,
+            model_mismatch_hits: 9,
+            axis_swap_lag_hits: 2,
+            stale_status_hits: 0,
+        };
+        let merged = max_failure_mode_counters(parsed, retry);
+        assert_eq!(
+            merged,
+            FailureModeCounters {
+                edge_saturation_hits: 7,
+                model_mismatch_hits: 9,
+                axis_swap_lag_hits: 2,
+                stale_status_hits: 1,
+            }
+        );
+        assert_eq!(dominant_failure_mode_label(merged), "model");
+    }
+
+    #[test]
+    fn online_gain_tracker_updates_directionally_and_rejects_outliers() {
+        let mut tracker = AxisOnlineGainTracker::seeded(120.0);
+        tracker.observe(0.5, Some(90.0), 7_360.0);
+        assert!(tracker.positive_beta() > 120.0);
+        assert!((tracker.negative_beta() - 120.0).abs() < 1e-6);
+
+        tracker.observe(-0.6, Some(-30.0), 7_360.0);
+        assert!(tracker.negative_beta() < 120.0);
+
+        let before = tracker.positive_beta();
+        tracker.observe(0.4, Some(2_000.0), 7_360.0);
+        assert!((tracker.positive_beta() - before).abs() < 1e-6);
+    }
+
+    #[test]
+    fn success_latch_helpers_gate_by_age_and_motion() {
+        let idle = Some(crate::app::usecases::ptz_transport::TransportMotionHint {
+            moving: Some(false),
+            move_age_ms: Some(300),
+        });
+        let moving = Some(crate::app::usecases::ptz_transport::TransportMotionHint {
+            moving: Some(true),
+            move_age_ms: Some(10),
+        });
+        assert!(success_latch_ready(1, 0.02, idle));
+        assert!(!success_latch_ready(1, 0.005, moving));
+        assert!(success_latch_ready(0, 0.01, idle));
+        assert!(!success_latch_ready(0, 0.08, idle));
+
+        assert!(best_within_success_tolerance(
+            super::BestObservedState {
+                pan_count: 100,
+                tilt_count: 20,
+                pan_abs_error: 15,
+                tilt_abs_error: 8,
+            },
+            20.0,
+            10.0
+        ));
+        assert_eq!(
+            timeout_blocker_label(false, false, true, false),
+            "latch_gate"
+        );
+    }
+
+    #[test]
     fn timeout_retry_budget_is_bounded_and_scaled() {
-        assert_eq!(timeout_retry_budget_ms(9_000), 10_000);
-        assert_eq!(timeout_retry_budget_ms(25_000), 15_000);
-        assert_eq!(timeout_retry_budget_ms(60_000), 20_000);
+        assert_eq!(timeout_retry_budget_ms(9_000), 14_000);
+        assert_eq!(timeout_retry_budget_ms(25_000), 18_750);
+        assert_eq!(timeout_retry_budget_ms(60_000), 24_000);
     }
 
     #[test]
