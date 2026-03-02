@@ -114,6 +114,10 @@ const EKF_MIN_R_MEASUREMENT: f64 = 0.2;
 const EKF_MAX_R_MEASUREMENT: f64 = 30.0;
 const SUCCESS_LATCH_MIN_SETTLING_STEPS: usize = 1;
 const SUCCESS_LATCH_CURRENT_NORM_MAX: f64 = 0.04;
+const OSCILLATION_STABLE_STEP_REDUCTION_REVERSAL_SUM: usize = 6;
+const SECONDARY_AXIS_INTERLEAVE_MIN_NORM: f64 = 0.02;
+const SECONDARY_AXIS_INTERLEAVE_INTERVAL_MIN: usize = 1;
+const SECONDARY_AXIS_INTERLEAVE_INTERVAL_MAX: usize = 5;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 struct StoredAxisEkfState {
@@ -202,6 +206,12 @@ struct AxisOnlineGainTracker {
     negative_beta: f64,
 }
 
+#[derive(Debug, Clone, Copy, Default)]
+struct DualAxisInterleaveState {
+    dominant_axis: Option<ControlAxis>,
+    dominant_streak: usize,
+}
+
 pub fn execute(
     client: &Client,
     channel: u8,
@@ -275,7 +285,7 @@ fn should_retry_after_timeout(error: &AppError) -> bool {
 }
 
 fn timeout_retry_budget_ms(timeout_ms: u64) -> u64 {
-    let scaled = timeout_ms.saturating_mul(3) / 4;
+    let scaled = timeout_ms.saturating_mul(2);
     scaled.clamp(TIMEOUT_RETRY_BUDGET_MIN_MS, TIMEOUT_RETRY_BUDGET_MAX_MS)
 }
 
@@ -446,6 +456,7 @@ fn run_closed_loop(
     };
     let mut previous_pan_measure = Some(initial.pan_count as f64);
     let mut previous_tilt_measure = Some(initial.tilt_count as f64);
+    let mut dual_axis_interleave = DualAxisInterleaveState::default();
 
     if let Some(stored) = load_stored_ekf_state(state_path, state_key, channel)? {
         if let Some(restored_pan) =
@@ -636,6 +647,8 @@ fn run_closed_loop(
 
         let within_tolerance = pan_error_measured.abs() <= pan_success_tolerance
             && tilt_error_measured.abs() <= tilt_success_tolerance;
+        let required_stable_steps =
+            required_stable_steps_for_oscillation(pan_reversals, tilt_reversals);
         let backend_motion_hint = ptz_transport::motion_status_hint(client, channel);
         let backend_completion_ready = if let Some(hint) = backend_motion_hint {
             completion_gate_allows_success(
@@ -654,7 +667,7 @@ fn run_closed_loop(
             stable_steps = 0;
         }
 
-        if within_tolerance && stable_steps >= REQUIRED_STABLE_STEPS {
+        if within_tolerance && stable_steps >= required_stable_steps {
             save_stored_ekf_state(
                 state_path,
                 state_key,
@@ -829,14 +842,25 @@ fn run_closed_loop(
         }
 
         if !relative_command_applied {
-            match command_from_errors(
+            let forced_secondary = forced_secondary_axis_command(
+                &mut dual_axis_interleave,
                 pan_command_error,
                 tilt_command_error,
                 tolerance_count as f64,
-                tie_break_pan,
                 pan_span,
                 tilt_span,
-            ) {
+            );
+            let selected_command = forced_secondary.or_else(|| {
+                command_from_errors(
+                    pan_command_error,
+                    tilt_command_error,
+                    tolerance_count as f64,
+                    tie_break_pan,
+                    pan_span,
+                    tilt_span,
+                )
+            });
+            match selected_command {
                 Some((direction, command_error_abs)) => {
                     step_error_abs = command_error_abs;
                     if axis_swap_lag_detected(
@@ -1468,6 +1492,117 @@ fn command_from_errors(
     }
 }
 
+fn forced_secondary_axis_command(
+    state: &mut DualAxisInterleaveState,
+    pan_error: f64,
+    tilt_error: f64,
+    tolerance_count: f64,
+    pan_span: f64,
+    tilt_span: f64,
+) -> Option<(PtzDirection, f64)> {
+    let pan_active = pan_error.abs() > tolerance_count;
+    let tilt_active = tilt_error.abs() > tolerance_count;
+    if !pan_active || !tilt_active {
+        state.dominant_axis = None;
+        state.dominant_streak = 0;
+        return None;
+    }
+
+    let pan_norm = normalized_axis_error(pan_error, pan_span);
+    let tilt_norm = normalized_axis_error(tilt_error, tilt_span);
+    if !pan_norm.is_finite() || !tilt_norm.is_finite() {
+        state.dominant_axis = None;
+        state.dominant_streak = 0;
+        return None;
+    }
+
+    let (dominant_axis, dominant_norm, secondary_axis, secondary_norm, secondary_error) =
+        if pan_norm >= tilt_norm {
+            (
+                ControlAxis::Pan,
+                pan_norm,
+                ControlAxis::Tilt,
+                tilt_norm,
+                tilt_error,
+            )
+        } else {
+            (
+                ControlAxis::Tilt,
+                tilt_norm,
+                ControlAxis::Pan,
+                pan_norm,
+                pan_error,
+            )
+        };
+
+    if secondary_norm < SECONDARY_AXIS_INTERLEAVE_MIN_NORM {
+        state.dominant_axis = Some(dominant_axis);
+        state.dominant_streak = 0;
+        return None;
+    }
+
+    if state.dominant_axis != Some(dominant_axis) {
+        state.dominant_axis = Some(dominant_axis);
+        state.dominant_streak = 0;
+    }
+    let interval = secondary_axis_interleave_interval(dominant_norm, secondary_norm);
+    if state.dominant_streak < interval {
+        state.dominant_streak = state.dominant_streak.saturating_add(1);
+        return None;
+    }
+
+    state.dominant_streak = 0;
+    command_for_axis_error(secondary_axis, secondary_error)
+}
+
+fn secondary_axis_interleave_interval(dominant_norm: f64, secondary_norm: f64) -> usize {
+    if !dominant_norm.is_finite() || !secondary_norm.is_finite() || secondary_norm <= f64::EPSILON {
+        return SECONDARY_AXIS_INTERLEAVE_INTERVAL_MAX;
+    }
+    let ratio = (dominant_norm / secondary_norm).clamp(1.0, 32.0);
+    let interval = if ratio <= 1.25 {
+        1
+    } else if ratio <= 1.8 {
+        2
+    } else if ratio <= 2.6 {
+        3
+    } else if ratio <= 4.0 {
+        4
+    } else {
+        5
+    };
+    interval.clamp(
+        SECONDARY_AXIS_INTERLEAVE_INTERVAL_MIN,
+        SECONDARY_AXIS_INTERLEAVE_INTERVAL_MAX,
+    )
+}
+
+fn command_for_axis_error(axis: ControlAxis, axis_error: f64) -> Option<(PtzDirection, f64)> {
+    if !axis_error.is_finite() {
+        return None;
+    }
+    let abs_error = axis_error.abs();
+    if abs_error <= f64::EPSILON {
+        return None;
+    }
+    match axis {
+        ControlAxis::Pan => {
+            if axis_error.is_sign_positive() {
+                Some((PtzDirection::Right, abs_error))
+            } else {
+                Some((PtzDirection::Left, abs_error))
+            }
+        }
+        ControlAxis::Tilt => {
+            if axis_error.is_sign_positive() {
+                Some((PtzDirection::Up, abs_error))
+            } else {
+                Some((PtzDirection::Down, abs_error))
+            }
+        }
+    }
+}
+
 fn speed_cap_for_error(error_abs: f64) -> u8 {
     if error_abs <= FINE_CONTROL_ERROR_COUNT {
         1
@@ -1843,6 +1978,15 @@ fn adaptive_axis_tolerance(
     }
 }
 
+fn required_stable_steps_for_oscillation(pan_reversals: usize, tilt_reversals: usize) -> usize {
+    let reversal_sum = pan_reversals.saturating_add(tilt_reversals);
+    if reversal_sum >= OSCILLATION_STABLE_STEP_REDUCTION_REVERSAL_SUM {
+        1
+    } else {
+        REQUIRED_STABLE_STEPS
+    }
+}
+
 fn control_components_from_command(
     direction: PtzDirection,
     speed: u8,
@@ -2126,18 +2270,20 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use super::{
-        AxisOnlineGainTracker, FailureModeCounters, adaptive_axis_tolerance,
-        apply_fine_phase_feedforward, apply_pending_pulse_observation, apply_reversal_guard,
-        axis_count_bounds, axis_one_percent_threshold, axis_swap_lag_detected,
-        best_within_success_tolerance, clamp_tilt_edge_control, command_from_errors,
-        control_axis_direction, control_pulse_ms_for_error, dominant_failure_mode_label,
-        edge_saturation_detected, ekf_config, format_failure_mode_counters, load_stored_ekf_state,
+        AxisOnlineGainTracker, DualAxisInterleaveState, FailureModeCounters,
+        adaptive_axis_tolerance, apply_fine_phase_feedforward, apply_pending_pulse_observation,
+        apply_reversal_guard, axis_count_bounds, axis_one_percent_threshold,
+        axis_swap_lag_detected, best_within_success_tolerance, clamp_tilt_edge_control,
+        command_from_errors, control_axis_direction, control_pulse_ms_for_error,
+        dominant_failure_mode_label, edge_saturation_detected, ekf_config,
+        forced_secondary_axis_command, format_failure_mode_counters, load_stored_ekf_state,
         max_failure_mode_counters, model_mismatch_detected, near_target_speed1_pulse_ms,
         normalized_vector_error, parse_failure_mode_counters,
         pending_pulse_observation_for_command, position_stable_threshold_count,
-        pulse_ms_for_direction_with_lut, relative_delta_from_error, save_stored_ekf_state,
-        select_control_error, should_retry_after_timeout, stale_status_detected,
-        success_latch_ready, timeout_blocker_label, timeout_retry_budget_ms,
+        pulse_ms_for_direction_with_lut, relative_delta_from_error,
+        required_stable_steps_for_oscillation, save_stored_ekf_state,
+        secondary_axis_interleave_interval, select_control_error, should_retry_after_timeout,
+        stale_status_detected, success_latch_ready, timeout_blocker_label, timeout_retry_budget_ms,
         update_reversal_counter,
     };
     use crate::app::usecases::ptz_controller::AxisEkf;
@@ -2193,6 +2339,38 @@ mod tests {
             command_from_errors(8.0, 8.0, 10.0, true, 7360.0, 1240.0),
             None
         );
+    }
+
+    #[test]
+    fn secondary_axis_interleave_interval_scales_with_ratio() {
+        assert_eq!(secondary_axis_interleave_interval(0.30, 0.25), 1);
+        assert_eq!(secondary_axis_interleave_interval(0.30, 0.18), 2);
+        assert_eq!(secondary_axis_interleave_interval(0.30, 0.12), 3);
+        assert_eq!(secondary_axis_interleave_interval(0.30, 0.08), 4);
+        assert_eq!(secondary_axis_interleave_interval(0.30, 0.04), 5);
+    }
+
+    #[test]
+    fn forced_secondary_axis_command_alternates_for_balanced_dual_axis_error() {
+        let mut state = DualAxisInterleaveState::default();
+        let mut directions = Vec::new();
+        for _ in 0..4 {
+            let forced =
+                forced_secondary_axis_command(&mut state, -3_422.0, 476.0, 12.0, 7_360.0, 1_240.0)
+                    .map(|(direction, _)| direction);
+            directions.push(forced);
+        }
+
+        assert_eq!(directions[0], None);
+        assert_eq!(directions[1], Some(PtzDirection::Up));
+        assert_eq!(directions[2], None);
+        assert_eq!(directions[3], Some(PtzDirection::Up));
+
+        let reset = forced_secondary_axis_command(&mut state, -80.0, 0.0, 12.0, 7_360.0, 1_240.0);
+        assert_eq!(reset, None);
+        let first_after_reset =
+            forced_secondary_axis_command(&mut state, -400.0, 200.0, 12.0, 7_360.0, 1_240.0);
+        assert_eq!(first_after_reset, None);
     }
 
     #[test]
@@ -2357,8 +2535,8 @@ mod tests {
 
     #[test]
     fn timeout_retry_budget_is_bounded_and_scaled() {
-        assert_eq!(timeout_retry_budget_ms(9_000), 14_000);
-        assert_eq!(timeout_retry_budget_ms(25_000), 18_750);
+        assert_eq!(timeout_retry_budget_ms(9_000), 18_000);
+        assert_eq!(timeout_retry_budget_ms(25_000), 24_000);
         assert_eq!(timeout_retry_budget_ms(60_000), 24_000);
     }
 
@@ -2375,6 +2553,13 @@ mod tests {
 
         let network = AppError::new(ErrorKind::Network, "set_absolute_raw timeout after 25000ms");
         assert!(!should_retry_after_timeout(&network));
+    }
+
+    #[test]
+    fn required_stable_steps_reduces_when_oscillation_is_high() {
+        assert_eq!(required_stable_steps_for_oscillation(0, 0), 2);
+        assert_eq!(required_stable_steps_for_oscillation(2, 3), 2);
+        assert_eq!(required_stable_steps_for_oscillation(4, 2), 1);
     }
 
     #[test]
