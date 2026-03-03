@@ -1,0 +1,339 @@
+use std::fs;
+use std::path::Path;
+use std::time::{SystemTime, UNIX_EPOCH};
+
+use mockito::{Matcher, Server};
+
+use super::{
+    AxisKind, AxisMotion, CALIBRATION_SCHEMA_VERSION, CALIBRATION_SOURCE_MEASURED,
+    DirectionalDeadband, StoredCalibration, attempt_home_restore_on_failure,
+    build_axis_count_range, can_reuse_saved_calibration, deadband_upper_bound_for_span,
+    estimate_deadband_from_samples, estimate_model_from_sweep, evenly_spaced_samples, execute,
+    map_status_to_counts, robust_deadband_from_samples, save_stored_calibration,
+};
+use crate::core::error::{AppError, AppResult, ErrorKind};
+use crate::core::model::{
+    AxisModelParams, CalibrationParams, DeviceInfo, NumericRange, PtzDirection, PtzStatus,
+};
+use crate::interfaces::runtime;
+use crate::reolink::client::{Auth, Client};
+
+#[test]
+fn execute_requires_channel_match_for_saved_reuse() {
+    let unique = unique_suffix();
+    let device_info = DeviceInfo {
+        model: format!("model-{unique}"),
+        firmware: format!("fw-{unique}"),
+        serial_number: format!("serial-{unique}"),
+    };
+    let calibration_path = runtime::calibration_file_path_for_camera(&device_info);
+    cleanup_file(&calibration_path);
+    let saved = StoredCalibration {
+        schema_version: CALIBRATION_SCHEMA_VERSION,
+        source: CALIBRATION_SOURCE_MEASURED.to_string(),
+        camera_key: runtime::calibration_camera_key(&device_info),
+        channel: 1,
+        calibration: sample_calibration_params(&device_info),
+    };
+    save_stored_calibration(&calibration_path, &saved)
+        .expect("saved calibration should be created");
+
+    let mut server = Server::new();
+    let _dev_info_mock = server
+        .mock("POST", "/cgi-bin/api.cgi")
+        .match_query(Matcher::UrlEncoded(
+            "cmd".to_string(),
+            "GetDevInfo".to_string(),
+        ))
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(format!(
+            r#"[{{"cmd":"GetDevInfo","code":0,"value":{{"DevInfo":{{"model":"{}","firmware":"{}","serial":"{}"}}}}}}]"#,
+            device_info.model, device_info.firmware, device_info.serial_number
+        ))
+        .expect(1)
+        .create();
+    let _cur_pos_mock = server
+        .mock("POST", "/cgi-bin/api.cgi")
+        .match_query(Matcher::UrlEncoded(
+            "cmd".to_string(),
+            "GetPtzCurPos".to_string(),
+        ))
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(
+            r#"[{"cmd":"GetPtzCurPos","code":0,
+                "value":{"PtzCurPos":{"channel":0,"Ppos":120,"Tpos":40}},
+                "range":{"PtzCurPos":{"Ppos":{"min":-3550,"max":3550},"Tpos":{"min":0,"max":900}}}
+            }]"#,
+        )
+        .expect_at_least(6)
+        .expect_at_most(24)
+        .create();
+    let _zoom_focus_mock = server
+        .mock("POST", "/cgi-bin/api.cgi")
+        .match_query(Matcher::UrlEncoded(
+            "cmd".to_string(),
+            "GetZoomFocus".to_string(),
+        ))
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(r#"[{"cmd":"GetZoomFocus","code":1}]"#)
+        .expect(1)
+        .create();
+    let _preset_mock = server
+        .mock("POST", "/cgi-bin/api.cgi")
+        .match_query(Matcher::UrlEncoded(
+            "cmd".to_string(),
+            "GetPtzPreset".to_string(),
+        ))
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(r#"[{"cmd":"GetPtzPreset","code":1}]"#)
+        .expect(1)
+        .create();
+    let _check_state_mock = server
+        .mock("POST", "/cgi-bin/api.cgi")
+        .match_query(Matcher::UrlEncoded(
+            "cmd".to_string(),
+            "GetPtzCheckState".to_string(),
+        ))
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(r#"[{"cmd":"GetPtzCheckState","code":0,"value":{"PtzCheckState":2}}]"#)
+        .expect(1)
+        .create();
+    let _ptz_ctrl_mock = server
+        .mock("POST", "/cgi-bin/api.cgi")
+        .match_query(Matcher::UrlEncoded(
+            "cmd".to_string(),
+            "PtzCtrl".to_string(),
+        ))
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(r#"[{"cmd":"PtzCtrl","code":0}]"#)
+        .expect_at_least(9)
+        .expect_at_most(24)
+        .create();
+
+    let client = Client::new(server.url(), Auth::Anonymous);
+    let report = execute(&client, 0).expect("calibration should fallback and succeed");
+    assert!(!report.reused_existing);
+    assert_eq!(report.channel, 0);
+    assert_eq!(report.params.channel, 0);
+    assert_eq!(
+        report.params.camera_key,
+        runtime::calibration_camera_key(&device_info)
+    );
+
+    cleanup_file(Path::new(&report.calibration_path));
+}
+
+#[test]
+fn can_reuse_saved_calibration_requires_matching_channel() {
+    let device_info = DeviceInfo {
+        model: "model".to_string(),
+        firmware: "firmware".to_string(),
+        serial_number: "serial".to_string(),
+    };
+    let saved = StoredCalibration {
+        schema_version: CALIBRATION_SCHEMA_VERSION,
+        source: CALIBRATION_SOURCE_MEASURED.to_string(),
+        camera_key: runtime::calibration_camera_key(&device_info),
+        channel: 3,
+        calibration: sample_calibration_params(&device_info),
+    };
+    let calibrated = PtzStatus {
+        calibration_state: Some(2),
+        ..PtzStatus::default()
+    };
+    let not_calibrated = PtzStatus {
+        calibration_state: Some(1),
+        ..PtzStatus::default()
+    };
+
+    assert!(can_reuse_saved_calibration(&calibrated, 3, &saved));
+    assert!(!can_reuse_saved_calibration(&calibrated, 1, &saved));
+    assert!(!can_reuse_saved_calibration(&not_calibrated, 3, &saved));
+}
+
+#[test]
+fn attempt_home_restore_on_failure_restores_known_axes() {
+    let measured: AppResult<CalibrationParams> = Err(AppError::new(
+        ErrorKind::UnexpectedResponse,
+        "forced failure",
+    ));
+    let pan_motion = AxisMotion {
+        increase: PtzDirection::Right,
+        decrease: PtzDirection::Left,
+    };
+    let tilt_motion = AxisMotion {
+        increase: PtzDirection::Up,
+        decrease: PtzDirection::Down,
+    };
+
+    let mut calls = Vec::new();
+    attempt_home_restore_on_failure(
+        &measured,
+        120,
+        -45,
+        Some(pan_motion),
+        Some(tilt_motion),
+        |axis, home_position, motion| {
+            calls.push((axis, home_position, motion.increase, motion.decrease));
+        },
+    );
+
+    assert_eq!(calls.len(), 2);
+    assert!(matches!(
+        calls[0],
+        (AxisKind::Pan, 120, PtzDirection::Right, PtzDirection::Left)
+    ));
+    assert!(matches!(
+        calls[1],
+        (AxisKind::Tilt, -45, PtzDirection::Up, PtzDirection::Down)
+    ));
+}
+
+#[test]
+fn attempt_home_restore_on_failure_skips_when_measured_succeeds() {
+    let measured = Ok(CalibrationParams::default());
+    let mut called = false;
+    attempt_home_restore_on_failure(
+        &measured,
+        120,
+        -45,
+        Some(AxisMotion {
+            increase: PtzDirection::Right,
+            decrease: PtzDirection::Left,
+        }),
+        Some(AxisMotion {
+            increase: PtzDirection::Up,
+            decrease: PtzDirection::Down,
+        }),
+        |_axis, _home_position, _motion| {
+            called = true;
+        },
+    );
+    assert!(!called);
+}
+
+#[test]
+fn build_axis_count_range_uses_range_when_present() {
+    let range = NumericRange {
+        min: -3550,
+        max: 3550,
+    };
+    let mapped = build_axis_count_range(Some(&range), Some(120), 3600);
+    assert_eq!(mapped.min_count, -3550);
+    assert_eq!(mapped.max_count, 3550);
+}
+
+#[test]
+fn build_axis_count_range_falls_back_to_default_span() {
+    let mapped = build_axis_count_range(None, Some(500), 2000);
+    assert_eq!(mapped.min_count, -500);
+    assert_eq!(mapped.max_count, 1500);
+}
+
+#[test]
+fn map_status_to_counts_returns_raw_positions() {
+    let status = PtzStatus {
+        channel: 2,
+        pan_position: Some(1500),
+        tilt_position: Some(-180),
+        ..PtzStatus::default()
+    };
+    let (pan_count, tilt_count) = map_status_to_counts(&status).expect("status should map");
+    assert_eq!(pan_count, 1500);
+    assert_eq!(tilt_count, -180);
+}
+
+#[test]
+fn estimate_model_from_sweep_uses_fallback_for_insufficient_samples() {
+    let model = estimate_model_from_sweep(7_200.0, &[8.0]);
+    assert!((0.75..=0.98).contains(&model.alpha));
+    assert!((20.0..=600.0).contains(&model.beta));
+}
+
+#[test]
+fn estimate_model_from_sweep_produces_finite_model() {
+    let model = estimate_model_from_sweep(7_200.0, &[80.0, 97.0, 108.0, 114.0, 118.0]);
+    assert!(model.alpha.is_finite());
+    assert!(model.beta.is_finite());
+    assert!((0.75..=0.98).contains(&model.alpha));
+    assert!((20.0..=600.0).contains(&model.beta));
+}
+
+#[test]
+fn evenly_spaced_samples_caps_to_target_count() {
+    let source = (0..100).map(|value| value as f64).collect::<Vec<_>>();
+    let sampled = evenly_spaced_samples(&source, 50);
+    assert_eq!(sampled.len(), 50);
+    assert_eq!(sampled.first().copied(), Some(0.0));
+    assert_eq!(sampled.last().copied(), Some(99.0));
+}
+
+#[test]
+fn robust_deadband_from_samples_resists_large_outliers() {
+    let estimate =
+        robust_deadband_from_samples(&[7, 8, 7, 6, 140, 7, 8]).expect("estimate should exist");
+    assert_eq!(estimate, 7);
+}
+
+#[test]
+fn estimate_deadband_from_samples_clips_to_span_upper_bound() {
+    let span = 1_000.0;
+    let clipped = estimate_deadband_from_samples(&[240, 250, 260, 270, 280], span);
+    assert_eq!(clipped, deadband_upper_bound_for_span(span));
+}
+
+#[test]
+fn directional_deadband_compatibility_uses_max_direction() {
+    let directional = DirectionalDeadband {
+        increase_count: 9,
+        decrease_count: 14,
+    };
+    assert_eq!(directional.compatibility_count(), 14);
+}
+
+fn sample_calibration_params(device_info: &DeviceInfo) -> CalibrationParams {
+    CalibrationParams {
+        serial_number: device_info.serial_number.clone(),
+        model: device_info.model.clone(),
+        firmware: device_info.firmware.clone(),
+        pan_min_count: -3550,
+        pan_max_count: 3550,
+        pan_deadband_count: 6,
+        pan_deadband_increase_count: Some(6),
+        pan_deadband_decrease_count: Some(6),
+        tilt_min_count: 0,
+        tilt_max_count: 900,
+        tilt_deadband_count: 6,
+        tilt_deadband_increase_count: Some(6),
+        tilt_deadband_decrease_count: Some(6),
+        pan_model: AxisModelParams {
+            alpha: 0.9,
+            beta: 120.0,
+        },
+        tilt_model: AxisModelParams {
+            alpha: 0.9,
+            beta: 60.0,
+        },
+        created_at: "1".to_string(),
+    }
+}
+
+fn unique_suffix() -> String {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    format!("{now}-{}", std::process::id())
+}
+
+fn cleanup_file(path: &Path) {
+    if path.exists() {
+        let _ = fs::remove_file(path);
+    }
+}

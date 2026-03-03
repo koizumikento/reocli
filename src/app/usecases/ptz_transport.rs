@@ -271,3 +271,6 @@ fn onvif_config() -> AppResult<onvif::OnvifConfig> {
         profile_token,
     ))
 }
+
+#[cfg(test)]
+mod tests;

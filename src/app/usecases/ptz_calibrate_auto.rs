@@ -75,6 +75,7 @@ pub fn execute(client: &Client, channel: u8) -> AppResult<PtzCalibrationReport> 
 
     if status.calibrated() == Some(true)
         && let Some((saved_params, _)) = load_saved_params_for_device(&device_info)?
+        && can_reuse_saved_calibration(&status, channel, &saved_params)
     {
         let (pan_count, tilt_count) = map_status_to_counts(&status)?;
         return Ok(PtzCalibrationReport {
@@ -144,6 +145,14 @@ pub fn execute(client: &Client, channel: u8) -> AppResult<PtzCalibrationReport> 
         calibration: stored.calibration,
         report,
     })
+}
+
+fn can_reuse_saved_calibration(
+    status: &PtzStatus,
+    requested_channel: u8,
+    saved_params: &StoredCalibration,
+) -> bool {
+    status.calibrated() == Some(true) && saved_params.channel == requested_channel
 }
 
 pub(crate) fn load_saved_params_for_device(
@@ -243,20 +252,36 @@ fn try_build_measured_calibration(
     device_info: &DeviceInfo,
     status: &PtzStatus,
 ) -> AppResult<CalibrationParams> {
-    let measured = (|| {
-        let home_pan = axis_position(status, AxisKind::Pan)?;
-        let home_tilt = axis_position(status, AxisKind::Tilt)?;
+    let home_pan = axis_position(status, AxisKind::Pan)?;
+    let home_tilt = axis_position(status, AxisKind::Tilt)?;
+    let mut pan_motion = None;
+    let mut tilt_motion = None;
 
-        let pan_motion = detect_axis_motion(client, channel, AxisKind::Pan)?;
-        let tilt_motion = detect_axis_motion(client, channel, AxisKind::Tilt)?;
+    let measured = (|| {
+        let detected_pan_motion = detect_axis_motion(client, channel, AxisKind::Pan)?;
+        pan_motion = Some(detected_pan_motion);
+        let detected_tilt_motion = detect_axis_motion(client, channel, AxisKind::Tilt)?;
+        tilt_motion = Some(detected_tilt_motion);
 
         let (pan_min, pan_max, pan_sweep_deltas) =
-            sweep_axis_bounds(client, channel, AxisKind::Pan, pan_motion)?;
+            sweep_axis_bounds(client, channel, AxisKind::Pan, detected_pan_motion)?;
         let (tilt_min, tilt_max, tilt_sweep_deltas) =
-            sweep_axis_bounds(client, channel, AxisKind::Tilt, tilt_motion)?;
+            sweep_axis_bounds(client, channel, AxisKind::Tilt, detected_tilt_motion)?;
 
-        restore_axis_to_home(client, channel, AxisKind::Pan, home_pan, pan_motion)?;
-        restore_axis_to_home(client, channel, AxisKind::Tilt, home_tilt, tilt_motion)?;
+        restore_axis_to_home(
+            client,
+            channel,
+            AxisKind::Pan,
+            home_pan,
+            detected_pan_motion,
+        )?;
+        restore_axis_to_home(
+            client,
+            channel,
+            AxisKind::Tilt,
+            home_tilt,
+            detected_tilt_motion,
+        )?;
         let pan_span = (pan_max - pan_min).unsigned_abs() as f64;
         let tilt_span = (tilt_max - tilt_min).unsigned_abs() as f64;
         let pan_model = estimate_model_from_sweep(pan_span, &pan_sweep_deltas);
@@ -265,7 +290,7 @@ fn try_build_measured_calibration(
             client,
             channel,
             AxisKind::Pan,
-            pan_motion,
+            detected_pan_motion,
             pan_span,
         )
         .unwrap_or_else(|_| DirectionalDeadband::uniform(DEFAULT_DEADBAND_COUNT));
@@ -273,7 +298,7 @@ fn try_build_measured_calibration(
             client,
             channel,
             AxisKind::Tilt,
-            tilt_motion,
+            detected_tilt_motion,
             tilt_span,
         )
         .unwrap_or_else(|_| DirectionalDeadband::uniform(DEFAULT_DEADBAND_COUNT));
@@ -300,8 +325,42 @@ fn try_build_measured_calibration(
         })
     })();
 
+    attempt_home_restore_on_failure(
+        &measured,
+        home_pan,
+        home_tilt,
+        pan_motion,
+        tilt_motion,
+        |axis, home_position, motion| {
+            let _ = restore_axis_to_home(client, channel, axis, home_position, motion);
+        },
+    );
+
     let _ = ptz_transport::stop_ptz(client, channel);
     measured
+}
+
+fn attempt_home_restore_on_failure<F>(
+    measured_result: &AppResult<CalibrationParams>,
+    home_pan: i64,
+    home_tilt: i64,
+    pan_motion: Option<AxisMotion>,
+    tilt_motion: Option<AxisMotion>,
+    mut restore_axis: F,
+) where
+    F: FnMut(AxisKind, i64, AxisMotion),
+{
+    if measured_result.is_ok() {
+        return;
+    }
+
+    if let Some(pan_motion) = pan_motion {
+        restore_axis(AxisKind::Pan, home_pan, pan_motion);
+    }
+
+    if let Some(tilt_motion) = tilt_motion {
+        restore_axis(AxisKind::Tilt, home_tilt, tilt_motion);
+    }
 }
 
 fn detect_axis_motion(client: &Client, channel: u8, axis: AxisKind) -> AppResult<AxisMotion> {
@@ -833,90 +892,4 @@ fn now_epoch_millis() -> u64 {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::{
-        DirectionalDeadband, build_axis_count_range, deadband_upper_bound_for_span,
-        estimate_deadband_from_samples, estimate_model_from_sweep, evenly_spaced_samples,
-        map_status_to_counts, robust_deadband_from_samples,
-    };
-    use crate::core::model::{NumericRange, PtzStatus};
-
-    #[test]
-    fn build_axis_count_range_uses_range_when_present() {
-        let range = NumericRange {
-            min: -3550,
-            max: 3550,
-        };
-        let mapped = build_axis_count_range(Some(&range), Some(120), 3600);
-        assert_eq!(mapped.min_count, -3550);
-        assert_eq!(mapped.max_count, 3550);
-    }
-
-    #[test]
-    fn build_axis_count_range_falls_back_to_default_span() {
-        let mapped = build_axis_count_range(None, Some(500), 2000);
-        assert_eq!(mapped.min_count, -500);
-        assert_eq!(mapped.max_count, 1500);
-    }
-
-    #[test]
-    fn map_status_to_counts_returns_raw_positions() {
-        let status = PtzStatus {
-            channel: 2,
-            pan_position: Some(1500),
-            tilt_position: Some(-180),
-            ..PtzStatus::default()
-        };
-        let (pan_count, tilt_count) = map_status_to_counts(&status).expect("status should map");
-        assert_eq!(pan_count, 1500);
-        assert_eq!(tilt_count, -180);
-    }
-
-    #[test]
-    fn estimate_model_from_sweep_uses_fallback_for_insufficient_samples() {
-        let model = estimate_model_from_sweep(7_200.0, &[8.0]);
-        assert!((0.75..=0.98).contains(&model.alpha));
-        assert!((20.0..=600.0).contains(&model.beta));
-    }
-
-    #[test]
-    fn estimate_model_from_sweep_produces_finite_model() {
-        let model = estimate_model_from_sweep(7_200.0, &[80.0, 97.0, 108.0, 114.0, 118.0]);
-        assert!(model.alpha.is_finite());
-        assert!(model.beta.is_finite());
-        assert!((0.75..=0.98).contains(&model.alpha));
-        assert!((20.0..=600.0).contains(&model.beta));
-    }
-
-    #[test]
-    fn evenly_spaced_samples_caps_to_target_count() {
-        let source = (0..100).map(|value| value as f64).collect::<Vec<_>>();
-        let sampled = evenly_spaced_samples(&source, 50);
-        assert_eq!(sampled.len(), 50);
-        assert_eq!(sampled.first().copied(), Some(0.0));
-        assert_eq!(sampled.last().copied(), Some(99.0));
-    }
-
-    #[test]
-    fn robust_deadband_from_samples_resists_large_outliers() {
-        let estimate =
-            robust_deadband_from_samples(&[7, 8, 7, 6, 140, 7, 8]).expect("estimate should exist");
-        assert_eq!(estimate, 7);
-    }
-
-    #[test]
-    fn estimate_deadband_from_samples_clips_to_span_upper_bound() {
-        let span = 1_000.0;
-        let clipped = estimate_deadband_from_samples(&[240, 250, 260, 270, 280], span);
-        assert_eq!(clipped, deadband_upper_bound_for_span(span));
-    }
-
-    #[test]
-    fn directional_deadband_compatibility_uses_max_direction() {
-        let directional = DirectionalDeadband {
-            increase_count: 9,
-            decrease_count: 14,
-        };
-        assert_eq!(directional.compatibility_count(), 14);
-    }
-}
+mod tests;
