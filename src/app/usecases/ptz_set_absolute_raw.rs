@@ -25,8 +25,8 @@ const EKF_STATE_SCHEMA_VERSION: u32 = 1;
 const MIN_ADAPTIVE_UPDATES: usize = 2;
 const REQUIRED_STABLE_STEPS: usize = 2;
 const SETTLE_STEP_MS: u64 = 100;
-const TIMEOUT_RETRY_BUDGET_MIN_MS: u64 = 14_000;
-const TIMEOUT_RETRY_BUDGET_MAX_MS: u64 = 24_000;
+const TIMEOUT_RETRY_BUDGET_MIN_MS: u64 = 18_000;
+const TIMEOUT_RETRY_BUDGET_MAX_MS: u64 = 36_000;
 const MIN_CONTROL_PULSE_MS: u64 = 0;
 const MAX_CONTROL_PULSE_MS: u64 = 220;
 const MICRO_CONTROL_ERROR_COUNT: f64 = 90.0;
@@ -40,8 +40,8 @@ const PULSE_LUT_TARGET_MAX_COUNT: f64 = 110.0;
 const PULSE_LUT_MIN_MS: u64 = 10;
 const PULSE_LUT_MAX_MS: u64 = 140;
 const NEAR_TARGET_SPEED1_ENTRY_ERROR_COUNT: f64 = 420.0;
-const NEAR_TARGET_SPEED1_MIN_PULSE_MS: u64 = 10;
 const NEAR_TARGET_SPEED1_MAX_PULSE_MS: u64 = 45;
+const NEAR_TARGET_TILT_MICRO_ERROR_COUNT: f64 = 48.0;
 const FINE_RELATIVE_STEP_GAIN: f64 = 0.55;
 const FINE_RELATIVE_STEP_MIN_COUNT: f64 = 4.0;
 const FINE_RELATIVE_STEP_MAX_COUNT: f64 = 96.0;
@@ -85,10 +85,10 @@ const OSCILLATION_TOLERANCE_RELAX_MAX_COUNT: f64 = 48.0;
 const CALIBRATION_DEADBAND_HINT_MAX_COUNT: f64 = 200.0;
 const CALIBRATION_GUARD_DEADBAND_RATIO: f64 = 0.45;
 
-const DEFAULT_PAN_MIN_COUNT: f64 = -3000.0;
-const DEFAULT_PAN_MAX_COUNT: f64 = 3000.0;
-const DEFAULT_TILT_MIN_COUNT: f64 = -1800.0;
-const DEFAULT_TILT_MAX_COUNT: f64 = 1800.0;
+const DEFAULT_PAN_MIN_COUNT: f64 = 0.0;
+const DEFAULT_PAN_MAX_COUNT: f64 = 7360.0;
+const DEFAULT_TILT_MIN_COUNT: f64 = 0.0;
+const DEFAULT_TILT_MAX_COUNT: f64 = 1240.0;
 const EKF_POSITION_MARGIN_COUNT: f64 = 120.0;
 const EKF_VELOCITY_RATIO: f64 = 0.35;
 const EKF_MIN_VELOCITY_COUNT_PER_SEC: f64 = 120.0;
@@ -285,7 +285,7 @@ fn should_retry_after_timeout(error: &AppError) -> bool {
 }
 
 fn timeout_retry_budget_ms(timeout_ms: u64) -> u64 {
-    let scaled = timeout_ms.saturating_mul(2);
+    let scaled = timeout_ms.saturating_mul(3);
     scaled.clamp(TIMEOUT_RETRY_BUDGET_MIN_MS, TIMEOUT_RETRY_BUDGET_MAX_MS)
 }
 
@@ -366,6 +366,32 @@ fn run_closed_loop(
     let initial_status = ptz::get_ptz_cur_pos(client, channel)?;
     let initial = map_status_to_raw_position(&initial_status)?;
 
+    let (pan_nominal_min_count, pan_nominal_max_count) = axis_nominal_bounds(
+        status_with_ranges
+            .as_ref()
+            .and_then(|status| status.pan_range.as_ref()),
+        saved_calibration.as_ref().map(|stored| {
+            (
+                stored.calibration.pan_min_count,
+                stored.calibration.pan_max_count,
+            )
+        }),
+        DEFAULT_PAN_MIN_COUNT,
+        DEFAULT_PAN_MAX_COUNT,
+    );
+    let (tilt_nominal_min_count, tilt_nominal_max_count) = axis_nominal_bounds(
+        status_with_ranges
+            .as_ref()
+            .and_then(|status| status.tilt_range.as_ref()),
+        saved_calibration.as_ref().map(|stored| {
+            (
+                stored.calibration.tilt_min_count,
+                stored.calibration.tilt_max_count,
+            )
+        }),
+        DEFAULT_TILT_MIN_COUNT,
+        DEFAULT_TILT_MAX_COUNT,
+    );
     let (pan_min_count, pan_max_count) = axis_count_bounds(
         status_with_ranges
             .as_ref()
@@ -397,8 +423,14 @@ fn run_closed_loop(
 
     let pan_span = (pan_max_count - pan_min_count).abs().max(1.0);
     let tilt_span = (tilt_max_count - tilt_min_count).abs().max(1.0);
-    let pan_success_tolerance = axis_one_percent_threshold(pan_span);
-    let tilt_success_tolerance = axis_one_percent_threshold(tilt_span);
+    let pan_nominal_span = (pan_nominal_max_count - pan_nominal_min_count)
+        .abs()
+        .max(1.0);
+    let tilt_nominal_span = (tilt_nominal_max_count - tilt_nominal_min_count)
+        .abs()
+        .max(1.0);
+    let pan_success_tolerance = axis_one_percent_threshold(pan_nominal_span);
+    let tilt_success_tolerance = axis_one_percent_threshold(tilt_nominal_span);
     let pan_model = saved_calibration
         .as_ref()
         .map(|stored| sanitize_model_params(stored.calibration.pan_model, pan_span))
@@ -908,7 +940,7 @@ fn run_closed_loop(
                         control_pulse_ms_for_error(command_error_abs)
                     };
                     let pulse_ms = if near_target_speed1_mode {
-                        near_target_speed1_pulse_ms(base_pulse_ms)
+                        near_target_speed1_pulse_ms(base_pulse_ms, command_error_abs, direction)
                     } else {
                         base_pulse_ms
                     };
@@ -1237,6 +1269,33 @@ fn axis_count_bounds(
     fallback_min: f64,
     fallback_max: f64,
 ) -> (f64, f64) {
+    let (mut min_count, mut max_count) =
+        resolved_axis_bounds(range, calibration_bounds, fallback_min, fallback_max);
+
+    let current = current_count as f64;
+    min_count = min_count.min(current) - EKF_POSITION_MARGIN_COUNT;
+    max_count = max_count.max(current) + EKF_POSITION_MARGIN_COUNT;
+    if max_count <= min_count {
+        return resolved_axis_bounds(range, calibration_bounds, fallback_min, fallback_max);
+    }
+    (min_count, max_count)
+}
+
+fn axis_nominal_bounds(
+    range: Option<&NumericRange>,
+    calibration_bounds: Option<(i64, i64)>,
+    fallback_min: f64,
+    fallback_max: f64,
+) -> (f64, f64) {
+    resolved_axis_bounds(range, calibration_bounds, fallback_min, fallback_max)
+}
+
+fn resolved_axis_bounds(
+    range: Option<&NumericRange>,
+    calibration_bounds: Option<(i64, i64)>,
+    fallback_min: f64,
+    fallback_max: f64,
+) -> (f64, f64) {
     let mut min_count = fallback_min.min(fallback_max);
     let mut max_count = fallback_max.max(fallback_min);
 
@@ -1256,16 +1315,14 @@ fn axis_count_bounds(
         }
     }
 
-    let current = current_count as f64;
-    min_count = min_count.min(current) - EKF_POSITION_MARGIN_COUNT;
-    max_count = max_count.max(current) + EKF_POSITION_MARGIN_COUNT;
     if max_count <= min_count {
-        return (
+        (
             fallback_min.min(fallback_max),
             fallback_max.max(fallback_min),
-        );
+        )
+    } else {
+        (min_count, max_count)
     }
-    (min_count, max_count)
 }
 
 fn select_control_error(estimated_error: f64, measured_error: f64, tolerance_count: i64) -> f64 {
@@ -1747,11 +1804,16 @@ fn position_stable_threshold_count(
     tolerance_based.max(deadband_based)
 }
 
-fn near_target_speed1_pulse_ms(base_pulse_ms: u64) -> u64 {
-    base_pulse_ms.clamp(
-        NEAR_TARGET_SPEED1_MIN_PULSE_MS,
-        NEAR_TARGET_SPEED1_MAX_PULSE_MS,
-    )
+fn near_target_speed1_pulse_ms(
+    base_pulse_ms: u64,
+    command_error_abs: f64,
+    direction: PtzDirection,
+) -> u64 {
+    let is_tilt_axis = matches!(direction, PtzDirection::Up | PtzDirection::Down);
+    if is_tilt_axis && command_error_abs <= NEAR_TARGET_TILT_MICRO_ERROR_COUNT {
+        return 0;
+    }
+    base_pulse_ms.clamp(0, NEAR_TARGET_SPEED1_MAX_PULSE_MS)
 }
 
 fn clamp_tilt_edge_control(
@@ -2272,7 +2334,7 @@ mod tests {
     use super::{
         AxisOnlineGainTracker, DualAxisInterleaveState, FailureModeCounters,
         adaptive_axis_tolerance, apply_fine_phase_feedforward, apply_pending_pulse_observation,
-        apply_reversal_guard, axis_count_bounds, axis_one_percent_threshold,
+        apply_reversal_guard, axis_count_bounds, axis_nominal_bounds, axis_one_percent_threshold,
         axis_swap_lag_detected, best_within_success_tolerance, clamp_tilt_edge_control,
         command_from_errors, control_axis_direction, control_pulse_ms_for_error,
         dominant_failure_mode_label, edge_saturation_detected, ekf_config,
@@ -2307,6 +2369,18 @@ mod tests {
         let (min_count, max_count) = axis_count_bounds(Some(&range), None, 3000, -3000.0, 3000.0);
         assert!((min_count - -1120.0).abs() < 1e-6);
         assert!((max_count - 3120.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn axis_nominal_bounds_prefers_calibration_without_margin() {
+        let (min_count, max_count) = axis_nominal_bounds(None, Some((0, 1240)), -1800.0, 1800.0);
+        assert_eq!(min_count, 0.0);
+        assert_eq!(max_count, 1240.0);
+
+        let range = NumericRange { min: 10, max: 100 };
+        let (range_min, range_max) = axis_nominal_bounds(Some(&range), None, -1800.0, 1800.0);
+        assert_eq!(range_min, 10.0);
+        assert_eq!(range_max, 100.0);
     }
 
     #[test]
@@ -2535,9 +2609,9 @@ mod tests {
 
     #[test]
     fn timeout_retry_budget_is_bounded_and_scaled() {
-        assert_eq!(timeout_retry_budget_ms(9_000), 18_000);
-        assert_eq!(timeout_retry_budget_ms(25_000), 24_000);
-        assert_eq!(timeout_retry_budget_ms(60_000), 24_000);
+        assert_eq!(timeout_retry_budget_ms(9_000), 27_000);
+        assert_eq!(timeout_retry_budget_ms(25_000), 36_000);
+        assert_eq!(timeout_retry_budget_ms(60_000), 36_000);
     }
 
     #[test]
@@ -2685,10 +2759,14 @@ mod tests {
     }
 
     #[test]
-    fn near_target_speed1_pulse_ms_clamps_to_guard_band() {
-        assert_eq!(near_target_speed1_pulse_ms(0), 10);
-        assert_eq!(near_target_speed1_pulse_ms(24), 24);
-        assert_eq!(near_target_speed1_pulse_ms(90), 45);
+    fn near_target_speed1_pulse_ms_allows_tilt_micro_and_clamps_upper_bound() {
+        assert_eq!(near_target_speed1_pulse_ms(24, 32.0, PtzDirection::Up), 0);
+        assert_eq!(near_target_speed1_pulse_ms(24, 60.0, PtzDirection::Up), 24);
+        assert_eq!(near_target_speed1_pulse_ms(0, 24.0, PtzDirection::Right), 0);
+        assert_eq!(
+            near_target_speed1_pulse_ms(90, 120.0, PtzDirection::Right),
+            45
+        );
     }
 
     #[test]
