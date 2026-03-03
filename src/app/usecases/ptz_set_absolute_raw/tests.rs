@@ -8,10 +8,10 @@ use super::{
     axis_count_bounds, axis_one_percent_threshold, axis_swap_lag_detected,
     best_within_success_tolerance, clamp_tilt_edge_control, command_from_errors,
     control_axis_direction, control_pulse_ms_for_error, dominant_failure_mode_label,
-    edge_saturation_detected, ekf_config, forced_secondary_axis_command,
-    format_failure_mode_counters, load_stored_ekf_state, max_failure_mode_counters,
-    model_mismatch_detected, near_target_speed1_pulse_ms, normalized_vector_error,
-    parse_failure_mode_counters, pending_pulse_observation_for_command,
+    edge_saturation_detected, ekf_config, enforce_residual_command_activity,
+    forced_secondary_axis_command, format_failure_mode_counters, load_stored_ekf_state,
+    max_failure_mode_counters, model_mismatch_detected, near_target_speed1_pulse_ms,
+    normalized_vector_error, parse_failure_mode_counters, pending_pulse_observation_for_command,
     position_stable_threshold_count, pulse_ms_for_direction_with_lut, relative_delta_from_error,
     required_stable_steps_for_oscillation, save_stored_ekf_state,
     secondary_axis_interleave_interval, select_control_error, should_retry_after_timeout,
@@ -324,6 +324,24 @@ fn apply_reversal_guard_blocks_small_reverse_commands() {
 
     let blocked_by_deadband = apply_reversal_guard(-70.0, 0.5, 10.0, 180.0);
     assert_eq!(blocked_by_deadband, 0.0);
+}
+
+#[test]
+fn enforce_residual_command_activity_reactivates_when_guard_suppresses_before_success() {
+    let restored = enforce_residual_command_activity(4.8, 21.0, 12.0, 12.0);
+    assert!(restored > 12.0);
+}
+
+#[test]
+fn enforce_residual_command_activity_preserves_guarded_value_within_success_band() {
+    assert_eq!(
+        enforce_residual_command_activity(4.8, 11.0, 12.0, 12.0),
+        4.8
+    );
+    assert_eq!(
+        enforce_residual_command_activity(-3.2, -10.0, 12.0, 12.0),
+        -3.2
+    );
 }
 
 #[test]

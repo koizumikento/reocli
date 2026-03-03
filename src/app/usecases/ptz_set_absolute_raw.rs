@@ -685,6 +685,18 @@ fn run_closed_loop(
         } else {
             guarded_tilt_error
         };
+        let pan_command_error = enforce_residual_command_activity(
+            pan_command_error,
+            pan_error_measured,
+            tolerance_count as f64,
+            pan_success_tolerance,
+        );
+        let tilt_command_error = enforce_residual_command_activity(
+            tilt_command_error,
+            tilt_error_measured,
+            tolerance_count as f64,
+            tilt_success_tolerance,
+        );
         let command_error_norm =
             normalized_vector_error(pan_command_error, tilt_command_error, pan_span, tilt_span);
 
@@ -2012,6 +2024,33 @@ fn apply_reversal_guard(
         0.0
     } else {
         error
+    }
+}
+
+fn enforce_residual_command_activity(
+    command_error: f64,
+    measured_error: f64,
+    control_tolerance: f64,
+    success_tolerance: f64,
+) -> f64 {
+    if !command_error.is_finite() || !measured_error.is_finite() {
+        return command_error;
+    }
+    if measured_error.abs() <= success_tolerance {
+        return command_error;
+    }
+    if command_error.abs() > control_tolerance {
+        return command_error;
+    }
+    if command_error.abs() > f64::EPSILON && command_error.signum() != measured_error.signum() {
+        return command_error;
+    }
+
+    let activation_floor = control_tolerance.max(success_tolerance) + 1.0;
+    if measured_error.is_sign_positive() {
+        measured_error.abs().max(activation_floor)
+    } else {
+        -measured_error.abs().max(activation_floor)
     }
 }
 
