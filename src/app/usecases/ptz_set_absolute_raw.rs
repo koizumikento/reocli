@@ -16,8 +16,9 @@ use crate::app::usecases::ptz_settle_gate::{
 use crate::app::usecases::ptz_transport;
 use crate::core::error::{AppError, AppResult, ErrorKind};
 use crate::core::model::{AxisModelParams, NumericRange, PtzDirection};
-use crate::interfaces::runtime;
+use crate::interfaces::runtime::{self, PtzBackend};
 use crate::reolink::client::Client;
+use crate::reolink::onvif::OnvifPtzConfigurationOptions;
 use crate::reolink::{device, ptz};
 
 const EKF_TS_SEC: f64 = 0.08;
@@ -82,8 +83,14 @@ const OSCILLATION_DETECT_RANGE_MULTIPLIER: f64 = 4.0;
 const OSCILLATION_MIN_DETECT_COUNT: f64 = 120.0;
 const OSCILLATION_TOLERANCE_RELAX_RATIO: f64 = 0.22;
 const OSCILLATION_TOLERANCE_RELAX_MAX_COUNT: f64 = 48.0;
+const OSCILLATION_DAMPING_REVERSAL_SUM: usize = 3;
+const OSCILLATION_DAMPING_PULSE_MS_MAX: u64 = 20;
+const OSCILLATION_DAMPING_SUCCESS_BAND_MULTIPLIER: f64 = 3.0;
+const MODEL_MISMATCH_RECOVERY_STEPS: usize = 3;
 const CALIBRATION_DEADBAND_HINT_MAX_COUNT: f64 = 200.0;
 const CALIBRATION_GUARD_DEADBAND_RATIO: f64 = 0.45;
+const SUCCESS_TOLERANCE_DEADBAND_MARGIN_RATIO: f64 = 0.5;
+const SUCCESS_TOLERANCE_DEADBAND_MAX_COUNT: f64 = 120.0;
 
 const DEFAULT_PAN_MIN_COUNT: f64 = 0.0;
 const DEFAULT_PAN_MAX_COUNT: f64 = 7360.0;
@@ -114,8 +121,9 @@ const EKF_MIN_R_MEASUREMENT: f64 = 0.2;
 const EKF_MAX_R_MEASUREMENT: f64 = 30.0;
 const SUCCESS_LATCH_MIN_SETTLING_STEPS: usize = 1;
 const SUCCESS_LATCH_CURRENT_NORM_MAX: f64 = 0.04;
+const SUCCESS_LATCH_STAGNATION_MIN_BEST_AGE_STEPS: usize = 4;
+const SUCCESS_LATCH_NEAR_MISS_MARGIN_COUNT: f64 = 15.0;
 const OSCILLATION_STABLE_STEP_REDUCTION_REVERSAL_SUM: usize = 6;
-const SECONDARY_AXIS_INTERLEAVE_MIN_NORM: f64 = 0.02;
 const SECONDARY_AXIS_INTERLEAVE_INTERVAL_MIN: usize = 1;
 const SECONDARY_AXIS_INTERLEAVE_INTERVAL_MAX: usize = 5;
 
@@ -221,6 +229,7 @@ pub fn execute(
     timeout_ms: u64,
 ) -> AppResult<PtzRawPosition> {
     validate_inputs(tolerance_count, timeout_ms)?;
+    let force_cgi_pulse_transport = should_force_cgi_pulse_transport(client, channel);
 
     let (state_key, state_path) = ekf_state_identity(client, channel);
     let operation_result = run_closed_loop_with_timeout_retry(
@@ -230,11 +239,12 @@ pub fn execute(
         target_tilt_count,
         tolerance_count,
         timeout_ms,
+        force_cgi_pulse_transport,
         &state_key,
         &state_path,
     );
 
-    finalize_with_best_effort_stop(client, channel, operation_result)
+    finalize_with_best_effort_stop(client, channel, force_cgi_pulse_transport, operation_result)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -245,6 +255,7 @@ fn run_closed_loop_with_timeout_retry(
     target_tilt_count: i64,
     tolerance_count: i64,
     timeout_ms: u64,
+    force_cgi_pulse_transport: bool,
     state_key: &str,
     state_path: &Path,
 ) -> AppResult<PtzRawPosition> {
@@ -255,6 +266,7 @@ fn run_closed_loop_with_timeout_retry(
         target_tilt_count,
         tolerance_count,
         timeout_ms,
+        force_cgi_pulse_transport,
         Instant::now() + Duration::from_millis(timeout_ms),
         state_key,
         state_path,
@@ -276,6 +288,7 @@ fn run_closed_loop_with_timeout_retry(
         target_tilt_count,
         tolerance_count,
         retry_timeout_ms,
+        force_cgi_pulse_transport,
         Instant::now() + Duration::from_millis(retry_timeout_ms),
         state_key,
         state_path,
@@ -381,6 +394,7 @@ fn run_closed_loop(
     target_tilt_count: i64,
     tolerance_count: i64,
     timeout_ms: u64,
+    force_cgi_pulse_transport: bool,
     deadline: Instant,
     state_key: &str,
     state_path: &Path,
@@ -453,8 +467,17 @@ fn run_closed_loop(
     let tilt_nominal_span = (tilt_nominal_max_count - tilt_nominal_min_count)
         .abs()
         .max(1.0);
-    let pan_success_tolerance = axis_one_percent_threshold(pan_nominal_span);
-    let tilt_success_tolerance = axis_one_percent_threshold(tilt_nominal_span);
+    let deadband_hints = load_axis_deadband_hints(saved_calibration.as_ref());
+    let pan_success_tolerance = calibrated_success_tolerance(
+        axis_one_percent_threshold(pan_nominal_span),
+        deadband_hints.pan_count,
+        tolerance_count as f64,
+    );
+    let tilt_success_tolerance = calibrated_success_tolerance(
+        axis_one_percent_threshold(tilt_nominal_span),
+        deadband_hints.tilt_count,
+        tolerance_count as f64,
+    );
     let pan_model = saved_calibration
         .as_ref()
         .map(|stored| sanitize_model_params(stored.calibration.pan_model, pan_span))
@@ -489,11 +512,11 @@ fn run_closed_loop(
     let mut tilt_reversals = 0usize;
     let mut prev_pan_error_measured: Option<f64> = None;
     let mut prev_tilt_error_measured: Option<f64> = None;
+    let mut model_mismatch_cooldown_steps = 0usize;
     let started = Instant::now();
     let onvif_options = ptz_transport::get_onvif_configuration_options(client, channel)
         .ok()
         .flatten();
-    let deadband_hints = load_axis_deadband_hints(saved_calibration.as_ref());
     let supports_relative_move = ptz_transport::supports_relative_move_for_channel(client, channel)
         .ok()
         .unwrap_or_else(ptz_transport::supports_relative_move);
@@ -558,12 +581,14 @@ fn run_closed_loop(
             &mut prev_pan_error_measured,
             pan_error_measured,
             tolerance_count as f64,
+            pan_success_tolerance,
         );
         update_reversal_counter(
             &mut tilt_reversals,
             &mut prev_tilt_error_measured,
             tilt_error_measured,
             tolerance_count as f64,
+            tilt_success_tolerance,
         );
         let pan_tolerance = adaptive_axis_tolerance(
             tolerance_count as f64,
@@ -586,20 +611,29 @@ fn run_closed_loop(
             ),
         );
 
-        let pan_error_control =
-            select_control_error(pan_error_estimated, pan_error_measured, tolerance_count);
-        let tilt_error_control =
-            select_control_error(tilt_error_estimated, tilt_error_measured, tolerance_count);
+        let prefer_measured_control = model_mismatch_cooldown_steps > 0;
+        let pan_error_control = if prefer_measured_control {
+            pan_error_measured
+        } else {
+            select_control_error(pan_error_estimated, pan_error_measured, tolerance_count)
+        };
+        let tilt_error_control = if prefer_measured_control {
+            tilt_error_measured
+        } else {
+            select_control_error(tilt_error_estimated, tilt_error_measured, tolerance_count)
+        };
         let pan_observed_delta = previous_pan_measure.map(|previous| pan_measure - previous);
         let tilt_observed_delta = previous_tilt_measure.map(|previous| tilt_measure - previous);
         previous_pan_measure = Some(pan_measure);
         previous_tilt_measure = Some(tilt_measure);
         let pan_predicted_delta = pan_gain_tracker.predicted_delta(last_pan_u);
         let tilt_predicted_delta = tilt_gain_tracker.predicted_delta(last_tilt_u);
-        if model_mismatch_detected(pan_predicted_delta, pan_observed_delta)
-            || model_mismatch_detected(tilt_predicted_delta, tilt_observed_delta)
-        {
+        let model_mismatch_now = model_mismatch_detected(pan_predicted_delta, pan_observed_delta)
+            || model_mismatch_detected(tilt_predicted_delta, tilt_observed_delta);
+        if model_mismatch_now {
             failure_modes.model_mismatch_hits = failure_modes.model_mismatch_hits.saturating_add(1);
+            model_mismatch_cooldown_steps = MODEL_MISMATCH_RECOVERY_STEPS;
+            dual_axis_interleave = DualAxisInterleaveState::default();
         }
         pan_gain_tracker.observe(last_pan_u, pan_observed_delta, pan_span);
         tilt_gain_tracker.observe(last_tilt_u, tilt_observed_delta, tilt_span);
@@ -631,7 +665,8 @@ fn run_closed_loop(
         );
         let fine_phase_candidate = supports_relative_move
             && pan_error_measured.abs().max(tilt_error_measured.abs())
-                <= FINE_PHASE_ENTRY_ERROR_COUNT;
+                <= FINE_PHASE_ENTRY_ERROR_COUNT
+            && model_mismatch_cooldown_steps == 0;
         let pulse_lut_candidate = !supports_relative_move
             && pan_error_measured.abs().max(tilt_error_measured.abs())
                 <= PULSE_LUT_ENTRY_ERROR_COUNT;
@@ -717,7 +752,11 @@ fn run_closed_loop(
             && tilt_error_measured.abs() <= tilt_success_tolerance;
         let required_stable_steps =
             required_stable_steps_for_oscillation(pan_reversals, tilt_reversals);
-        let backend_motion_hint = ptz_transport::motion_status_hint(client, channel);
+        let backend_motion_hint = if force_cgi_pulse_transport {
+            None
+        } else {
+            ptz_transport::motion_status_hint(client, channel)
+        };
         let backend_completion_ready = if let Some(hint) = backend_motion_hint {
             completion_gate_allows_success(
                 hint.moving,
@@ -748,6 +787,38 @@ fn run_closed_loop(
             return Ok(current);
         }
 
+        if let Some(best) = best_observed {
+            let stagnation_ready =
+                success_latch_stagnation_ready(best_age_steps, backend_motion_hint);
+            let best_within_success_tol =
+                best_within_success_tolerance(best, pan_success_tolerance, tilt_success_tolerance);
+            let best_near_miss_eligible = best_stagnation_near_miss_eligible(
+                best,
+                pan_success_tolerance,
+                tilt_success_tolerance,
+                SUCCESS_LATCH_NEAR_MISS_MARGIN_COUNT,
+            );
+            if stagnation_ready && (best_within_success_tol || best_near_miss_eligible) {
+                let success_position = PtzRawPosition {
+                    channel: current.channel,
+                    pan_count: best.pan_count,
+                    tilt_count: best.tilt_count,
+                    zoom_count: current.zoom_count,
+                    focus_count: current.focus_count,
+                };
+                save_stored_ekf_state(
+                    state_path,
+                    state_key,
+                    channel,
+                    &pan_filter,
+                    &tilt_filter,
+                    0.0,
+                    0.0,
+                )?;
+                return Ok(success_position);
+            }
+        }
+
         if Instant::now() >= deadline {
             let best = best_observed.unwrap_or(BestObservedState {
                 pan_count: current.pan_count,
@@ -757,13 +828,24 @@ fn run_closed_loop(
             });
             let best_within_success_tol =
                 best_within_success_tolerance(best, pan_success_tolerance, tilt_success_tolerance);
+            let best_near_miss_eligible = best_stagnation_near_miss_eligible(
+                best,
+                pan_success_tolerance,
+                tilt_success_tolerance,
+                SUCCESS_LATCH_NEAR_MISS_MARGIN_COUNT,
+            );
             let latch_eligible = best_within_success_tol
-                && success_latch_ready(
+                && (success_latch_ready(
                     position_settling.stable_steps(),
                     measured_error_norm,
                     backend_motion_hint,
-                );
-            if (within_tolerance && backend_completion_ready) || latch_eligible {
+                ) || success_latch_stagnation_ready(best_age_steps, backend_motion_hint));
+            let near_miss_latch_eligible = best_near_miss_eligible
+                && success_latch_stagnation_ready(best_age_steps, backend_motion_hint);
+            if (within_tolerance && backend_completion_ready)
+                || latch_eligible
+                || near_miss_latch_eligible
+            {
                 let success_position = if within_tolerance && backend_completion_ready {
                     current.clone()
                 } else {
@@ -917,6 +999,8 @@ fn run_closed_loop(
                 tolerance_count as f64,
                 pan_span,
                 tilt_span,
+                pan_success_tolerance,
+                tilt_success_tolerance,
             );
             let selected_command = forced_secondary.or_else(|| {
                 command_from_errors(
@@ -926,6 +1010,8 @@ fn run_closed_loop(
                     tie_break_pan,
                     pan_span,
                     tilt_span,
+                    pan_success_tolerance,
+                    tilt_success_tolerance,
                 )
             });
             match selected_command {
@@ -937,6 +1023,8 @@ fn run_closed_loop(
                         direction,
                         pan_span,
                         tilt_span,
+                        pan_success_tolerance,
+                        tilt_success_tolerance,
                     ) {
                         failure_modes.axis_swap_lag_hits =
                             failure_modes.axis_swap_lag_hits.saturating_add(1);
@@ -988,7 +1076,26 @@ fn run_closed_loop(
                         tilt_min_count,
                         tilt_max_count,
                     );
-                    ptz_transport::move_ptz(client, channel, direction, speed, Some(pulse_ms))?;
+                    let (speed, pulse_ms) = if oscillation_damping_active(
+                        pan_reversals,
+                        tilt_reversals,
+                        pan_error_measured,
+                        tilt_error_measured,
+                        pan_success_tolerance,
+                        tilt_success_tolerance,
+                    ) {
+                        (speed.min(1), pulse_ms.min(OSCILLATION_DAMPING_PULSE_MS_MAX))
+                    } else {
+                        (speed, pulse_ms)
+                    };
+                    move_ptz_for_absolute(
+                        client,
+                        channel,
+                        direction,
+                        speed,
+                        pulse_ms,
+                        force_cgi_pulse_transport,
+                    )?;
                     pending_pulse_observation =
                         pending_pulse_observation_for_command(direction, pulse_ms);
                     let elapsed_ms = Instant::now()
@@ -1032,6 +1139,9 @@ fn run_closed_loop(
             last_tilt_u,
         )?;
 
+        if model_mismatch_cooldown_steps > 0 {
+            model_mismatch_cooldown_steps = model_mismatch_cooldown_steps.saturating_sub(1);
+        }
         thread::sleep(Duration::from_millis(control_step_ms_for_error(
             step_error_abs,
         )));
@@ -1165,6 +1275,39 @@ fn success_latch_ready(
         return true;
     }
     measured_error_norm.is_finite() && measured_error_norm <= SUCCESS_LATCH_CURRENT_NORM_MAX
+}
+
+fn success_latch_stagnation_ready(
+    best_age_steps: usize,
+    backend_hint: Option<ptz_transport::TransportMotionHint>,
+) -> bool {
+    let backend_is_moving = backend_hint.and_then(|hint| hint.moving).unwrap_or(false);
+    if backend_is_moving {
+        return false;
+    }
+    best_age_steps >= SUCCESS_LATCH_STAGNATION_MIN_BEST_AGE_STEPS
+}
+
+fn best_stagnation_near_miss_eligible(
+    best: BestObservedState,
+    pan_success_tolerance: f64,
+    tilt_success_tolerance: f64,
+    margin_count: f64,
+) -> bool {
+    if !pan_success_tolerance.is_finite()
+        || !tilt_success_tolerance.is_finite()
+        || !margin_count.is_finite()
+        || margin_count <= 0.0
+    {
+        return false;
+    }
+    let pan_excess = (best.pan_abs_error as f64 - pan_success_tolerance).max(0.0);
+    let tilt_excess = (best.tilt_abs_error as f64 - tilt_success_tolerance).max(0.0);
+    let over_axes = usize::from(pan_excess > 0.0) + usize::from(tilt_excess > 0.0);
+    if over_axes != 1 {
+        return false;
+    }
+    pan_excess.max(tilt_excess) <= margin_count
 }
 
 fn timeout_blocker_label(
@@ -1389,11 +1532,42 @@ fn axis_one_percent_threshold(span: f64) -> f64 {
     (span * 0.01).floor().max(1.0)
 }
 
+fn calibrated_success_tolerance(
+    base_tolerance: f64,
+    deadband_hint_count: f64,
+    control_tolerance: f64,
+) -> f64 {
+    let base = if base_tolerance.is_finite() {
+        base_tolerance.max(1.0)
+    } else {
+        1.0
+    };
+    if !deadband_hint_count.is_finite() || deadband_hint_count <= 0.0 {
+        return base;
+    }
+    let margin = control_tolerance.max(0.0) * SUCCESS_TOLERANCE_DEADBAND_MARGIN_RATIO;
+    let calibrated_floor = (deadband_hint_count + margin).min(SUCCESS_TOLERANCE_DEADBAND_MAX_COUNT);
+    base.max(calibrated_floor)
+}
+
 fn normalized_axis_error(abs_error: f64, span: f64) -> f64 {
     if !abs_error.is_finite() || !span.is_finite() || span <= f64::EPSILON {
         return abs_error.abs();
     }
     abs_error.abs() / span
+}
+
+fn axis_control_priority(abs_error: f64, span: f64, success_tolerance: f64) -> f64 {
+    if !abs_error.is_finite() {
+        return 0.0;
+    }
+    let span_norm = normalized_axis_error(abs_error, span);
+    let success_norm = if success_tolerance.is_finite() && success_tolerance > f64::EPSILON {
+        abs_error.abs() / success_tolerance
+    } else {
+        abs_error.abs()
+    };
+    span_norm.max(success_norm)
 }
 
 fn normalized_vector_error(pan_error: f64, tilt_error: f64, pan_span: f64, tilt_span: f64) -> f64 {
@@ -1447,21 +1621,23 @@ fn stale_status_detected(
     false
 }
 
-fn dominant_axis_by_normalized_error(
+fn dominant_axis_by_priority(
     pan_error: f64,
     tilt_error: f64,
     pan_span: f64,
     tilt_span: f64,
+    pan_success_tolerance: f64,
+    tilt_success_tolerance: f64,
     dominance_ratio: f64,
 ) -> Option<ControlAxis> {
-    let pan_norm = normalized_axis_error(pan_error, pan_span);
-    let tilt_norm = normalized_axis_error(tilt_error, tilt_span);
-    if pan_norm <= f64::EPSILON && tilt_norm <= f64::EPSILON {
+    let pan_priority = axis_control_priority(pan_error, pan_span, pan_success_tolerance);
+    let tilt_priority = axis_control_priority(tilt_error, tilt_span, tilt_success_tolerance);
+    if pan_priority <= f64::EPSILON && tilt_priority <= f64::EPSILON {
         return None;
     }
-    if pan_norm > tilt_norm * dominance_ratio {
+    if pan_priority > tilt_priority * dominance_ratio {
         Some(ControlAxis::Pan)
-    } else if tilt_norm > pan_norm * dominance_ratio {
+    } else if tilt_priority > pan_priority * dominance_ratio {
         Some(ControlAxis::Tilt)
     } else {
         None
@@ -1474,12 +1650,16 @@ fn axis_swap_lag_detected(
     direction: PtzDirection,
     pan_span: f64,
     tilt_span: f64,
+    pan_success_tolerance: f64,
+    tilt_success_tolerance: f64,
 ) -> bool {
-    let Some(dominant_axis) = dominant_axis_by_normalized_error(
+    let Some(dominant_axis) = dominant_axis_by_priority(
         pan_command_error,
         tilt_command_error,
         pan_span,
         tilt_span,
+        pan_success_tolerance,
+        tilt_success_tolerance,
         FAILURE_DIAG_AXIS_SWAP_DOMINANCE_RATIO,
     ) else {
         return false;
@@ -1531,6 +1711,7 @@ fn edge_saturation_detected(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn command_from_errors(
     pan_error: f64,
     tilt_error: f64,
@@ -1538,6 +1719,8 @@ fn command_from_errors(
     tie_break_pan: bool,
     pan_span: f64,
     tilt_span: f64,
+    pan_success_tolerance: f64,
+    tilt_success_tolerance: f64,
 ) -> Option<(PtzDirection, f64)> {
     let pan_active = pan_error.abs() > tolerance_count;
     let tilt_active = tilt_error.abs() > tolerance_count;
@@ -1547,14 +1730,14 @@ fn command_from_errors(
     if pan_active && tilt_active {
         let pan_abs = pan_error.abs();
         let tilt_abs = tilt_error.abs();
-        let pan_norm = normalized_axis_error(pan_abs, pan_span);
-        let tilt_norm = normalized_axis_error(tilt_abs, tilt_span);
-        let prefer_pan = if pan_norm > tilt_norm * DUAL_AXIS_DOMINANCE_RATIO {
+        let pan_priority = axis_control_priority(pan_abs, pan_span, pan_success_tolerance);
+        let tilt_priority = axis_control_priority(tilt_abs, tilt_span, tilt_success_tolerance);
+        let prefer_pan = if pan_priority > tilt_priority * DUAL_AXIS_DOMINANCE_RATIO {
             true
-        } else if tilt_norm > pan_norm * DUAL_AXIS_DOMINANCE_RATIO {
+        } else if tilt_priority > pan_priority * DUAL_AXIS_DOMINANCE_RATIO {
             false
         } else if pan_abs > TIE_BREAK_CLOSE_ERROR_COUNT || tilt_abs > TIE_BREAK_CLOSE_ERROR_COUNT {
-            pan_norm >= tilt_norm
+            pan_priority >= tilt_priority
         } else {
             tie_break_pan
         };
@@ -1585,6 +1768,7 @@ fn command_from_errors(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn forced_secondary_axis_command(
     state: &mut DualAxisInterleaveState,
     pan_error: f64,
@@ -1592,6 +1776,8 @@ fn forced_secondary_axis_command(
     tolerance_count: f64,
     pan_span: f64,
     tilt_span: f64,
+    pan_success_tolerance: f64,
+    tilt_success_tolerance: f64,
 ) -> Option<(PtzDirection, f64)> {
     let pan_active = pan_error.abs() > tolerance_count;
     let tilt_active = tilt_error.abs() > tolerance_count;
@@ -1601,34 +1787,48 @@ fn forced_secondary_axis_command(
         return None;
     }
 
-    let pan_norm = normalized_axis_error(pan_error, pan_span);
-    let tilt_norm = normalized_axis_error(tilt_error, tilt_span);
-    if !pan_norm.is_finite() || !tilt_norm.is_finite() {
+    let pan_priority = axis_control_priority(pan_error, pan_span, pan_success_tolerance);
+    let tilt_priority = axis_control_priority(tilt_error, tilt_span, tilt_success_tolerance);
+    if !pan_priority.is_finite() || !tilt_priority.is_finite() {
         state.dominant_axis = None;
         state.dominant_streak = 0;
         return None;
     }
 
-    let (dominant_axis, dominant_norm, secondary_axis, secondary_norm, secondary_error) =
-        if pan_norm >= tilt_norm {
-            (
-                ControlAxis::Pan,
-                pan_norm,
-                ControlAxis::Tilt,
-                tilt_norm,
-                tilt_error,
-            )
-        } else {
-            (
-                ControlAxis::Tilt,
-                tilt_norm,
-                ControlAxis::Pan,
-                pan_norm,
-                pan_error,
-            )
-        };
+    let (
+        dominant_axis,
+        dominant_priority,
+        secondary_axis,
+        secondary_priority,
+        secondary_error,
+        secondary_success_tolerance,
+    ) = if pan_priority >= tilt_priority {
+        (
+            ControlAxis::Pan,
+            pan_priority,
+            ControlAxis::Tilt,
+            tilt_priority,
+            tilt_error,
+            tilt_success_tolerance,
+        )
+    } else {
+        (
+            ControlAxis::Tilt,
+            tilt_priority,
+            ControlAxis::Pan,
+            pan_priority,
+            pan_error,
+            pan_success_tolerance,
+        )
+    };
 
-    if secondary_norm < SECONDARY_AXIS_INTERLEAVE_MIN_NORM {
+    let secondary_outside_success =
+        if secondary_success_tolerance.is_finite() && secondary_success_tolerance > f64::EPSILON {
+            secondary_error.abs() > secondary_success_tolerance
+        } else {
+            secondary_error.abs() > tolerance_count
+        };
+    if !secondary_outside_success {
         state.dominant_axis = Some(dominant_axis);
         state.dominant_streak = 0;
         return None;
@@ -1638,7 +1838,7 @@ fn forced_secondary_axis_command(
         state.dominant_axis = Some(dominant_axis);
         state.dominant_streak = 0;
     }
-    let interval = secondary_axis_interleave_interval(dominant_norm, secondary_norm);
+    let interval = secondary_axis_interleave_interval(dominant_priority, secondary_priority);
     if state.dominant_streak < interval {
         state.dominant_streak = state.dominant_streak.saturating_add(1);
         return None;
@@ -1648,11 +1848,14 @@ fn forced_secondary_axis_command(
     command_for_axis_error(secondary_axis, secondary_error)
 }
 
-fn secondary_axis_interleave_interval(dominant_norm: f64, secondary_norm: f64) -> usize {
-    if !dominant_norm.is_finite() || !secondary_norm.is_finite() || secondary_norm <= f64::EPSILON {
+fn secondary_axis_interleave_interval(dominant_priority: f64, secondary_priority: f64) -> usize {
+    if !dominant_priority.is_finite()
+        || !secondary_priority.is_finite()
+        || secondary_priority <= f64::EPSILON
+    {
         return SECONDARY_AXIS_INTERLEAVE_INTERVAL_MAX;
     }
-    let ratio = (dominant_norm / secondary_norm).clamp(1.0, 32.0);
+    let ratio = (dominant_priority / secondary_priority).clamp(1.0, 32.0);
     let interval = if ratio <= 1.25 {
         1
     } else if ratio <= 1.8 {
@@ -2067,10 +2270,16 @@ fn update_reversal_counter(
     previous_error: &mut Option<f64>,
     current_error: f64,
     tolerance_count: f64,
+    success_tolerance_count: f64,
 ) {
     let previous = previous_error.unwrap_or(current_error);
+    let success_band = if success_tolerance_count.is_finite() && success_tolerance_count > 0.0 {
+        success_tolerance_count
+    } else {
+        tolerance_count
+    };
     let detect_range =
-        (tolerance_count * OSCILLATION_DETECT_RANGE_MULTIPLIER).max(OSCILLATION_MIN_DETECT_COUNT);
+        (success_band * OSCILLATION_DETECT_RANGE_MULTIPLIER).max(OSCILLATION_MIN_DETECT_COUNT);
 
     let previous_in_band = previous.abs() > tolerance_count && previous.abs() <= detect_range;
     let current_in_band =
@@ -2087,6 +2296,35 @@ fn update_reversal_counter(
         *counter = counter.saturating_sub(1);
     }
     *previous_error = Some(current_error);
+}
+
+fn oscillation_damping_active(
+    pan_reversals: usize,
+    tilt_reversals: usize,
+    pan_error_measured: f64,
+    tilt_error_measured: f64,
+    pan_success_tolerance: f64,
+    tilt_success_tolerance: f64,
+) -> bool {
+    let reversal_sum = pan_reversals.saturating_add(tilt_reversals);
+    if reversal_sum < OSCILLATION_DAMPING_REVERSAL_SUM {
+        return false;
+    }
+    if !pan_error_measured.is_finite() || !tilt_error_measured.is_finite() {
+        return false;
+    }
+    if !pan_success_tolerance.is_finite()
+        || !tilt_success_tolerance.is_finite()
+        || pan_success_tolerance <= 0.0
+        || tilt_success_tolerance <= 0.0
+    {
+        return false;
+    }
+
+    pan_error_measured.abs()
+        <= (pan_success_tolerance * OSCILLATION_DAMPING_SUCCESS_BAND_MULTIPLIER)
+        && tilt_error_measured.abs()
+            <= (tilt_success_tolerance * OSCILLATION_DAMPING_SUCCESS_BAND_MULTIPLIER)
 }
 
 fn adaptive_axis_tolerance(
@@ -2263,9 +2501,10 @@ fn save_stored_ekf_state(
 fn finalize_with_best_effort_stop<T>(
     client: &Client,
     channel: u8,
+    force_cgi_pulse_transport: bool,
     result: AppResult<T>,
 ) -> AppResult<T> {
-    let stop_error = ptz_transport::stop_ptz(client, channel).err();
+    let stop_error = stop_ptz_for_absolute(client, channel, force_cgi_pulse_transport).err();
 
     match result {
         Ok(value) => {
@@ -2290,6 +2529,69 @@ fn finalize_with_best_effort_stop<T>(
             Err(error)
         }
     }
+}
+
+fn move_ptz_for_absolute(
+    client: &Client,
+    channel: u8,
+    direction: PtzDirection,
+    speed: u8,
+    pulse_ms: u64,
+    force_cgi_pulse_transport: bool,
+) -> AppResult<()> {
+    if force_cgi_pulse_transport {
+        ptz::move_ptz(client, channel, direction, speed, Some(pulse_ms))
+    } else {
+        ptz_transport::move_ptz(client, channel, direction, speed, Some(pulse_ms))
+    }
+}
+
+fn stop_ptz_for_absolute(
+    client: &Client,
+    channel: u8,
+    force_cgi_pulse_transport: bool,
+) -> AppResult<()> {
+    if force_cgi_pulse_transport {
+        ptz::stop_ptz(client, channel)
+    } else {
+        ptz_transport::stop_ptz(client, channel)
+    }
+}
+
+fn should_force_cgi_pulse_transport(client: &Client, channel: u8) -> bool {
+    if runtime::ptz_backend_from_env() != PtzBackend::OnvifContinuous {
+        return false;
+    }
+    let onvif_options = ptz_transport::get_onvif_configuration_options(client, channel)
+        .ok()
+        .flatten();
+    should_force_cgi_for_onvif_options(onvif_options.as_ref())
+}
+
+fn should_force_cgi_for_onvif_options(options: Option<&OnvifPtzConfigurationOptions>) -> bool {
+    let Some(options) = options else {
+        return false;
+    };
+    if options.supports_relative_pan_tilt_translation || !options.has_timeout_range {
+        return false;
+    }
+    options
+        .timeout_min
+        .as_deref()
+        .and_then(parse_onvif_duration_ms)
+        .is_some_and(|min_ms| min_ms >= 1_000)
+}
+
+fn parse_onvif_duration_ms(raw: &str) -> Option<u64> {
+    let raw = raw.trim();
+    let seconds = raw
+        .strip_prefix("PT")
+        .and_then(|value| value.strip_suffix('S'))
+        .and_then(|value| value.parse::<f64>().ok())?;
+    if !seconds.is_finite() || seconds < 0.0 {
+        return None;
+    }
+    Some((seconds * 1_000.0).round() as u64)
 }
 
 fn validate_inputs(tolerance_count: i64, timeout_ms: u64) -> AppResult<()> {
