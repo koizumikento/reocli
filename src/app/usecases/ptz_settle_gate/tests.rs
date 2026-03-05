@@ -1,4 +1,4 @@
-use super::{PositionSettlingTracker, completion_gate_allows_success};
+use super::{completion_gate_allows_success, CompletionGateCapabilities, PositionSettlingTracker};
 
 #[test]
 fn tracker_accumulates_when_both_axes_are_within_threshold() {
@@ -38,38 +38,104 @@ fn completion_gate_blocks_while_moving_or_unstable() {
     assert!(!completion_gate_allows_success(
         Some(true),
         Some(300),
+        CompletionGateCapabilities::from_hint(Some(true), Some(300)),
         120,
         3,
         2,
+        4,
     ));
     assert!(!completion_gate_allows_success(
         Some(false),
         Some(300),
+        CompletionGateCapabilities::from_hint(Some(false), Some(300)),
         120,
         1,
         2,
+        4,
     ));
 }
 
 #[test]
-fn completion_gate_allows_stopped_with_sufficient_age() {
-    assert!(completion_gate_allows_success(
+fn completion_gate_full_hint_path_matches_previous_behavior() {
+    assert!(!completion_gate_allows_success(
         Some(false),
-        Some(250),
+        Some(80),
+        CompletionGateCapabilities::from_hint(Some(false), Some(80)),
         120,
         2,
         2,
+        4,
+    ));
+    assert!(completion_gate_allows_success(
+        Some(false),
+        Some(250),
+        CompletionGateCapabilities::from_hint(Some(false), Some(250)),
+        120,
+        2,
+        2,
+        4,
     ));
 }
 
 #[test]
-fn completion_gate_allows_stopped_without_age_when_stable() {
-    assert!(completion_gate_allows_success(Some(false), None, 120, 2, 2));
+fn completion_gate_partial_hint_falls_back_to_stricter_stability() {
+    assert!(!completion_gate_allows_success(
+        Some(false),
+        None,
+        CompletionGateCapabilities::from_hint(Some(false), None),
+        120,
+        2,
+        2,
+        4,
+    ));
+    assert!(completion_gate_allows_success(
+        Some(false),
+        None,
+        CompletionGateCapabilities::from_hint(Some(false), None),
+        120,
+        4,
+        2,
+        4,
+    ));
+
+    assert!(!completion_gate_allows_success(
+        None,
+        Some(180),
+        CompletionGateCapabilities::from_hint(None, Some(180)),
+        120,
+        2,
+        2,
+        4,
+    ));
+    assert!(completion_gate_allows_success(
+        None,
+        Some(180),
+        CompletionGateCapabilities::from_hint(None, Some(180)),
+        120,
+        4,
+        2,
+        4,
+    ));
 }
 
 #[test]
-fn completion_gate_requires_age_when_moving_state_unknown() {
-    assert!(!completion_gate_allows_success(None, None, 120, 3, 2));
-    assert!(!completion_gate_allows_success(None, Some(80), 120, 3, 2));
-    assert!(completion_gate_allows_success(None, Some(180), 120, 3, 2));
+fn completion_gate_partial_hint_respects_age_when_present() {
+    assert!(!completion_gate_allows_success(
+        None,
+        Some(80),
+        CompletionGateCapabilities::from_hint(None, Some(80)),
+        120,
+        5,
+        2,
+        4,
+    ));
+    assert!(completion_gate_allows_success(
+        None,
+        None,
+        CompletionGateCapabilities::from_hint(None, None),
+        120,
+        5,
+        2,
+        4,
+    ));
 }

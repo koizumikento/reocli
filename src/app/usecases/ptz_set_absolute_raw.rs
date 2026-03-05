@@ -5,13 +5,13 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 
-use crate::app::usecases::ptz_calibrate_auto::{StoredCalibration, load_saved_params_for_device};
+use crate::app::usecases::ptz_calibrate_auto::{load_saved_params_for_device, StoredCalibration};
 use crate::app::usecases::ptz_controller::{AxisEkf, AxisEkfConfig, AxisEkfSnapshot};
 use crate::app::usecases::ptz_deadband::scale_directional_deadband;
-use crate::app::usecases::ptz_get_absolute_raw::{PtzRawPosition, map_status_to_raw_position};
+use crate::app::usecases::ptz_get_absolute_raw::{map_status_to_raw_position, PtzRawPosition};
 use crate::app::usecases::ptz_pulse_lut::{AxisDirection, AxisPulseLut};
 use crate::app::usecases::ptz_settle_gate::{
-    PositionSettlingTracker, completion_gate_allows_success,
+    completion_gate_allows_success, CompletionGateCapabilities, PositionSettlingTracker,
 };
 use crate::app::usecases::ptz_transport;
 use crate::core::error::{AppError, AppResult, ErrorKind};
@@ -58,6 +58,7 @@ const FINE_FEEDFORWARD_GAIN: f64 = 0.28;
 const FINE_FEEDFORWARD_MAX_COUNT: f64 = 72.0;
 const BACKEND_COMPLETION_MIN_AGE_MS: u64 = 120;
 const BACKEND_POSITION_STABLE_REQUIRED_STEPS: usize = 2;
+const BACKEND_POSITION_STABLE_REQUIRED_STEPS_FALLBACK: usize = 4;
 const BACKEND_POSITION_STABLE_TOLERANCE_RATIO: f64 = 0.35;
 const BACKEND_POSITION_STABLE_MIN_COUNT: f64 = 2.0;
 const BACKEND_POSITION_STABLE_MAX_COUNT: f64 = 24.0;
@@ -1027,9 +1028,11 @@ fn run_closed_loop(
             completion_gate_allows_success(
                 hint.moving,
                 hint.move_age_ms,
+                CompletionGateCapabilities::from_hint(hint.moving, hint.move_age_ms),
                 backend_completion_min_age_ms,
                 position_settling.stable_steps(),
                 BACKEND_POSITION_STABLE_REQUIRED_STEPS,
+                BACKEND_POSITION_STABLE_REQUIRED_STEPS_FALLBACK,
             )
         } else {
             position_settling.stable_steps() >= BACKEND_POSITION_STABLE_REQUIRED_STEPS
