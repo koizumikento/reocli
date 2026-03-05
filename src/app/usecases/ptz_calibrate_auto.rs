@@ -52,6 +52,10 @@ const CALIBRATION_MODEL_RESIDUAL_BLEND_END_RATIO: f64 = 0.0075;
 const CALIBRATION_MODEL_RESIDUAL_BLEND_START_MULTIPLIER: f64 = 1.0;
 const CALIBRATION_MODEL_RESIDUAL_BLEND_END_MULTIPLIER: f64 = 2.0;
 const CALIBRATION_MODEL_RESIDUAL_BLEND_MIN_COUNT: f64 = 5.0;
+const CALIBRATION_MODEL_WEIGHT_EPSILON: f64 = 1e-6;
+const CALIBRATION_MODEL_TILT_WEIGHT_HUBER_Z: f64 = 1.75;
+const CALIBRATION_MODEL_TILT_WEIGHT_CENTER_Z: f64 = 2.5;
+const CALIBRATION_MODEL_TILT_WEIGHT_MIN: f64 = 0.05;
 const CALIBRATION_QUALITY_P95_MAX_RATIO_PAN: f64 = 0.02;
 const CALIBRATION_QUALITY_P95_MAX_RATIO_TILT: f64 = 0.03;
 const CALIBRATION_QUALITY_P95_FLOOR_PAN: i64 = 12;
@@ -1046,20 +1050,42 @@ fn estimate_model_from_samples(
         return fallback;
     }
 
+    let sample_weights = axis_sample_weights(axis, samples);
     let mut alpha_numer = 0.0f64;
     let mut alpha_denom = 0.0f64;
-    for window in samples.windows(2) {
+    for (index, window) in samples.windows(2).enumerate() {
+        let pair_weight = sample_weights
+            .get(index)
+            .zip(sample_weights.get(index + 1))
+            .map(|(lhs, rhs)| (lhs * rhs).sqrt())
+            .unwrap_or(1.0);
+        if !pair_weight.is_finite() || pair_weight <= 0.0 {
+            continue;
+        }
         let prev = window[0];
         let next = window[1];
-        alpha_numer += prev * next;
-        alpha_denom += prev * prev;
+        alpha_numer += pair_weight * prev * next;
+        alpha_denom += pair_weight * prev * prev;
     }
     if alpha_denom <= f64::EPSILON {
         return fallback;
     }
 
     let alpha = (alpha_numer / alpha_denom).clamp(MODEL_ALPHA_MIN, MODEL_ALPHA_MAX);
-    let mean_delta = samples.iter().sum::<f64>() / samples.len() as f64;
+    let (weighted_sum, weight_sum) = samples.iter().zip(sample_weights.iter()).fold(
+        (0.0f64, 0.0f64),
+        |(sum, total_weight), (sample, weight)| {
+            if !sample.is_finite() || !weight.is_finite() || *weight <= 0.0 {
+                (sum, total_weight)
+            } else {
+                (sum + (*sample * *weight), total_weight + *weight)
+            }
+        },
+    );
+    if weight_sum <= CALIBRATION_MODEL_WEIGHT_EPSILON {
+        return fallback;
+    }
+    let mean_delta = weighted_sum / weight_sum;
     let velocity = mean_delta / calibration_effective_ts_sec(axis);
     let beta = (velocity * (1.0 - alpha) / calibration_control_u(axis))
         .clamp(MODEL_BETA_MIN, MODEL_BETA_MAX);
@@ -1068,6 +1094,56 @@ fn estimate_model_from_samples(
     }
 
     AxisModelParams { alpha, beta }
+}
+
+fn axis_sample_weights(axis: AxisKind, samples: &[f64]) -> Vec<f64> {
+    match axis {
+        AxisKind::Pan => vec![1.0; samples.len()],
+        AxisKind::Tilt => tilt_sample_weights(samples),
+    }
+}
+
+fn tilt_sample_weights(samples: &[f64]) -> Vec<f64> {
+    if samples.is_empty() {
+        return Vec::new();
+    }
+    if samples.len() < 4 {
+        return vec![1.0; samples.len()];
+    }
+
+    let mut sorted = samples.to_vec();
+    sorted.sort_by(|lhs, rhs| lhs.total_cmp(rhs));
+    let median = quantile_of_sorted_f64(&sorted, 0.5);
+    let q25 = quantile_of_sorted_f64(&sorted, 0.25);
+    let q75 = quantile_of_sorted_f64(&sorted, 0.75);
+    let iqr_sigma = (q75 - q25).abs() * 0.7413;
+
+    let mut abs_dev = samples
+        .iter()
+        .map(|sample| (sample - median).abs())
+        .collect::<Vec<_>>();
+    abs_dev.sort_by(|lhs, rhs| lhs.total_cmp(rhs));
+    let mad = quantile_of_sorted_f64(&abs_dev, 0.5);
+    let sigma = (mad * 1.4826).max(iqr_sigma).max(1.0);
+
+    samples
+        .iter()
+        .map(|sample| {
+            let z = (sample - median).abs() / sigma;
+            let huber = if z <= CALIBRATION_MODEL_TILT_WEIGHT_HUBER_Z {
+                1.0
+            } else {
+                CALIBRATION_MODEL_TILT_WEIGHT_HUBER_Z / z
+            };
+            let center = 1.0 / (1.0 + (z / CALIBRATION_MODEL_TILT_WEIGHT_CENTER_Z).powi(2));
+            let weight = huber * center;
+            if weight.is_finite() {
+                weight.clamp(CALIBRATION_MODEL_TILT_WEIGHT_MIN, 1.0)
+            } else {
+                1.0
+            }
+        })
+        .collect()
 }
 
 fn winsorize_samples(samples: &[f64], trim_ratio: f64) -> Vec<f64> {

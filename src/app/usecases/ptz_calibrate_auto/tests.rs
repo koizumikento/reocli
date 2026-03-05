@@ -5,15 +5,17 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use mockito::{Matcher, Server};
 
 use super::{
-    AxisKind, AxisMotion, CALIBRATION_SCHEMA_VERSION, CALIBRATION_SOURCE_MEASURED,
-    DirectionalDeadband, StoredCalibration, attempt_home_restore_on_failure,
+    AxisKind, AxisMotion, CALIBRATION_MODEL_TRIM_RATIO, CALIBRATION_SCHEMA_VERSION,
+    CALIBRATION_SOURCE_MEASURED, DirectionalDeadband, MODEL_ALPHA_MAX, MODEL_ALPHA_MIN,
+    MODEL_BETA_MAX, MODEL_BETA_MIN, StoredCalibration, attempt_home_restore_on_failure,
     axis_model_min_samples, axis_model_sample_cap, axis_quality_threshold_count,
-    build_axis_count_range, calibration_min_move_delta, calibration_pulse_ms,
+    axis_sample_weights, build_axis_count_range, calibration_control_u,
+    calibration_effective_ts_sec, calibration_min_move_delta, calibration_pulse_ms,
     calibration_pulse_speed, calibration_stall_delta, can_reuse_saved_calibration,
-    deadband_upper_bound_for_span, estimate_deadband_from_samples, estimate_model_from_sweep,
-    estimate_model_from_sweep_with_quality, evenly_spaced_samples, execute, map_status_to_counts,
-    robust_deadband_from_samples, save_stored_calibration, validate_measured_calibration_quality,
-    winsorize_samples,
+    deadband_upper_bound_for_span, estimate_deadband_from_samples, estimate_model_from_samples,
+    estimate_model_from_sweep, estimate_model_from_sweep_with_quality, evenly_spaced_samples,
+    execute, fallback_model_for_span, map_status_to_counts, robust_deadband_from_samples,
+    save_stored_calibration, validate_measured_calibration_quality, winsorize_samples,
 };
 use crate::core::error::{AppError, AppResult, ErrorKind};
 use crate::core::model::{
@@ -270,6 +272,60 @@ fn estimate_model_from_sweep_produces_finite_model() {
 }
 
 #[test]
+fn pan_weighted_estimation_matches_unweighted_reference_formula() {
+    let samples = [80.0, 97.0, 108.0, 114.0, 118.0, 122.0];
+    let fallback = fallback_model_for_span(7_200.0);
+    let weighted = estimate_model_from_samples(AxisKind::Pan, &samples, fallback);
+    let reference = unweighted_reference_model(AxisKind::Pan, &samples, fallback);
+
+    assert_approx_eq(weighted.alpha, reference.alpha, 1e-12);
+    assert_approx_eq(weighted.beta, reference.beta, 1e-9);
+}
+
+#[test]
+fn tilt_axis_weights_downweight_far_outlier_samples() {
+    let samples = [40.0, 41.0, 42.0, 43.0, 180.0, 44.0, 45.0];
+    let pan_weights = axis_sample_weights(AxisKind::Pan, &samples);
+    let tilt_weights = axis_sample_weights(AxisKind::Tilt, &samples);
+
+    assert!(
+        pan_weights
+            .iter()
+            .all(|weight| (*weight - 1.0).abs() <= f64::EPSILON)
+    );
+    assert!(tilt_weights[4] < tilt_weights[3]);
+    assert!(tilt_weights[4] <= 0.2);
+}
+
+#[test]
+fn weighted_tilt_estimation_is_more_robust_to_noisy_sequences() {
+    let clean = synthetic_axis_samples(AxisKind::Tilt, 0.9, 120.0, 85.0, 96);
+    let mut noisy = clean.clone();
+    for (index, sample) in noisy.iter_mut().enumerate() {
+        if index % 9 == 0 {
+            *sample *= 2.2;
+        } else if index % 11 == 0 {
+            *sample *= 0.55;
+        }
+    }
+
+    let fallback = fallback_model_for_span(1_800.0);
+    let stabilized_noisy = winsorize_samples(&noisy, CALIBRATION_MODEL_TRIM_RATIO);
+    let weighted_noisy = estimate_model_from_samples(AxisKind::Tilt, &stabilized_noisy, fallback);
+    let unweighted_noisy = unweighted_reference_model(AxisKind::Tilt, &stabilized_noisy, fallback);
+    let clean_reference = estimate_model_from_samples(AxisKind::Tilt, &clean, fallback);
+    let weighted_distance = normalized_model_distance(weighted_noisy, clean_reference);
+    let unweighted_distance = normalized_model_distance(unweighted_noisy, clean_reference);
+
+    assert!(
+        weighted_distance < unweighted_distance,
+        "expected weighted tilt fit to be closer to clean-model fit: weighted={weighted_distance}, unweighted={unweighted_distance}"
+    );
+    assert!((MODEL_ALPHA_MIN..=MODEL_ALPHA_MAX).contains(&weighted_noisy.alpha));
+    assert!((MODEL_BETA_MIN..=MODEL_BETA_MAX).contains(&weighted_noisy.beta));
+}
+
+#[test]
 fn estimate_model_from_sweep_with_quality_applies_fallback_blend_for_noisy_samples() {
     let estimate = estimate_model_from_sweep_with_quality(
         AxisKind::Pan,
@@ -407,6 +463,70 @@ fn directional_deadband_compatibility_uses_max_direction() {
         decrease_count: 14,
     };
     assert_eq!(directional.compatibility_count(), 14);
+}
+
+fn assert_approx_eq(lhs: f64, rhs: f64, tolerance: f64) {
+    let delta = (lhs - rhs).abs();
+    assert!(
+        delta <= tolerance,
+        "values differ: lhs={lhs}, rhs={rhs}, delta={delta}, tolerance={tolerance}"
+    );
+}
+
+fn normalized_model_distance(lhs: AxisModelParams, rhs: AxisModelParams) -> f64 {
+    let alpha_range = (MODEL_ALPHA_MAX - MODEL_ALPHA_MIN).max(f64::EPSILON);
+    let beta_range = (MODEL_BETA_MAX - MODEL_BETA_MIN).max(f64::EPSILON);
+    ((lhs.alpha - rhs.alpha).abs() / alpha_range) + ((lhs.beta - rhs.beta).abs() / beta_range)
+}
+
+fn synthetic_axis_samples(
+    axis: AxisKind,
+    alpha: f64,
+    beta: f64,
+    start: f64,
+    count: usize,
+) -> Vec<f64> {
+    let input_gain = beta * calibration_control_u(axis) * calibration_effective_ts_sec(axis);
+    let mut current = start;
+    let mut samples = Vec::with_capacity(count);
+    for _ in 0..count {
+        samples.push(current);
+        current = alpha * current + input_gain;
+    }
+    samples
+}
+
+fn unweighted_reference_model(
+    axis: AxisKind,
+    samples: &[f64],
+    fallback: AxisModelParams,
+) -> AxisModelParams {
+    if samples.len() < 2 {
+        return fallback;
+    }
+
+    let mut alpha_numer = 0.0f64;
+    let mut alpha_denom = 0.0f64;
+    for window in samples.windows(2) {
+        let prev = window[0];
+        let next = window[1];
+        alpha_numer += prev * next;
+        alpha_denom += prev * prev;
+    }
+    if alpha_denom <= f64::EPSILON {
+        return fallback;
+    }
+
+    let alpha = (alpha_numer / alpha_denom).clamp(MODEL_ALPHA_MIN, MODEL_ALPHA_MAX);
+    let mean_delta = samples.iter().sum::<f64>() / samples.len() as f64;
+    let velocity = mean_delta / calibration_effective_ts_sec(axis);
+    let beta = (velocity * (1.0 - alpha) / calibration_control_u(axis))
+        .clamp(MODEL_BETA_MIN, MODEL_BETA_MAX);
+    if !alpha.is_finite() || !beta.is_finite() {
+        return fallback;
+    }
+
+    AxisModelParams { alpha, beta }
 }
 
 fn sample_calibration_params(device_info: &DeviceInfo) -> CalibrationParams {
