@@ -3,8 +3,9 @@ use std::path::PathBuf;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use super::{
-    AxisOnlineGainTracker, DualAxisInterleaveState, FailureModeCounters, OnlineLearningState,
-    adaptive_axis_tolerance, apply_fine_phase_feedforward, apply_pending_pulse_observation,
+    AdaptiveTimeoutRttEstimator, AxisOnlineGainTracker, DualAxisInterleaveState, EdgePushContext,
+    EdgePushLockoutState, FailureModeCounters, OnlineLearningState, adaptive_axis_tolerance,
+    adaptive_timeout_budget, apply_fine_phase_feedforward, apply_pending_pulse_observation,
     apply_reversal_guard, apply_tilt_backlash_compensation, axis_count_bounds,
     axis_one_percent_threshold, axis_percent_threshold, axis_stale_detected,
     axis_swap_lag_detected, best_stagnation_near_miss_eligible, best_within_success_tolerance,
@@ -19,7 +20,8 @@ use super::{
     parse_failure_mode_counters, parse_onvif_duration_ms, pending_pulse_observation_for_command,
     position_stable_threshold_count, pulse_ms_for_direction_with_lut, relative_delta_from_error,
     remaining_control_step_sleep_duration, required_stable_steps_for_oscillation,
-    save_stored_ekf_state, secondary_axis_interleave_interval, select_control_error,
+    save_stored_ekf_state, secondary_axis_interleave_interval,
+    select_command_with_edge_push_lockout, select_control_error,
     should_force_cgi_for_onvif_options, should_retry_after_timeout, stale_status_detected,
     strict_axis_focus_command, success_latch_ready, success_latch_stagnation_ready,
     timeout_blocker_label, timeout_retry_budget_ms, update_reversal_counter,
@@ -404,6 +406,149 @@ fn timeout_retry_budget_is_bounded_and_scaled() {
     assert_eq!(timeout_retry_budget_ms(9_000), 27_000);
     assert_eq!(timeout_retry_budget_ms(25_000), 36_000);
     assert_eq!(timeout_retry_budget_ms(60_000), 36_000);
+}
+
+#[test]
+fn adaptive_timeout_budget_requires_multiple_samples_and_tracks_rttvar() {
+    let mut estimator = AdaptiveTimeoutRttEstimator::default();
+    estimator.observe(Duration::from_millis(50));
+    let single_sample_budget = adaptive_timeout_budget(4_000, estimator);
+    assert_eq!(single_sample_budget.applied_slack_ms, 0);
+    assert_eq!(single_sample_budget.sample_count, 1);
+
+    estimator.observe(Duration::from_millis(350));
+    let budget = adaptive_timeout_budget(4_000, estimator);
+    assert_eq!(budget.sample_count, 2);
+    assert_eq!(budget.raw_slack_ms, 375);
+    assert_eq!(budget.applied_slack_ms, 375);
+    assert_eq!(budget.effective_timeout_ms, 4_375);
+    assert!((budget.srtt_ms - 87.5).abs() < 1e-6);
+    assert!((budget.rttvar_ms - 93.75).abs() < 1e-6);
+}
+
+#[test]
+fn adaptive_timeout_budget_caps_variance_slack() {
+    let mut estimator = AdaptiveTimeoutRttEstimator::default();
+    estimator.observe(Duration::from_millis(50));
+    estimator.observe(Duration::from_millis(2_000));
+    let budget = adaptive_timeout_budget(2_000, estimator);
+    assert!(budget.raw_slack_ms > budget.slack_cap_ms);
+    assert_eq!(budget.applied_slack_ms, 1_000);
+    assert_eq!(budget.effective_timeout_ms, 3_000);
+}
+
+#[test]
+fn edge_push_lockout_blocks_repeated_risky_push_and_releases() {
+    let edge_context = EdgePushContext {
+        pan_measure: 7_355.0,
+        pan_min_count: 0.0,
+        pan_max_count: 7_360.0,
+        pan_span: 7_360.0,
+        pan_error_measured: 300.0,
+        pan_success_tolerance: 120.0,
+        tilt_measure: 620.0,
+        tilt_min_count: 0.0,
+        tilt_max_count: 1_240.0,
+        tilt_error_measured: 0.0,
+        tilt_success_tolerance: 68.0,
+    };
+    let mut lockout = EdgePushLockoutState::default();
+
+    let first = select_command_with_edge_push_lockout(
+        &mut lockout,
+        Some((PtzDirection::Right, 300.0)),
+        300.0,
+        0.0,
+        10.0,
+        10.0,
+        edge_context,
+    );
+    assert_eq!(first, (Some((PtzDirection::Right, 300.0)), false));
+
+    let second = select_command_with_edge_push_lockout(
+        &mut lockout,
+        Some((PtzDirection::Right, 300.0)),
+        300.0,
+        0.0,
+        10.0,
+        10.0,
+        edge_context,
+    );
+    assert_eq!(second, (None, true));
+
+    let third = select_command_with_edge_push_lockout(
+        &mut lockout,
+        Some((PtzDirection::Right, 300.0)),
+        300.0,
+        0.0,
+        10.0,
+        10.0,
+        edge_context,
+    );
+    assert_eq!(third, (None, true));
+
+    let fourth = select_command_with_edge_push_lockout(
+        &mut lockout,
+        Some((PtzDirection::Right, 300.0)),
+        300.0,
+        0.0,
+        10.0,
+        10.0,
+        edge_context,
+    );
+    assert_eq!(fourth, (None, true));
+
+    let fifth = select_command_with_edge_push_lockout(
+        &mut lockout,
+        Some((PtzDirection::Right, 300.0)),
+        300.0,
+        0.0,
+        10.0,
+        10.0,
+        edge_context,
+    );
+    assert_eq!(fifth, (Some((PtzDirection::Right, 300.0)), false));
+}
+
+#[test]
+fn edge_push_lockout_prefers_other_axis_when_available() {
+    let edge_context = EdgePushContext {
+        pan_measure: 7_355.0,
+        pan_min_count: 0.0,
+        pan_max_count: 7_360.0,
+        pan_span: 7_360.0,
+        pan_error_measured: 300.0,
+        pan_success_tolerance: 120.0,
+        tilt_measure: 620.0,
+        tilt_min_count: 0.0,
+        tilt_max_count: 1_240.0,
+        tilt_error_measured: -180.0,
+        tilt_success_tolerance: 68.0,
+    };
+    let mut lockout = EdgePushLockoutState::default();
+    let _ = select_command_with_edge_push_lockout(
+        &mut lockout,
+        Some((PtzDirection::Right, 300.0)),
+        300.0,
+        -180.0,
+        10.0,
+        10.0,
+        edge_context,
+    );
+
+    let blocked_with_fallback = select_command_with_edge_push_lockout(
+        &mut lockout,
+        Some((PtzDirection::Right, 300.0)),
+        300.0,
+        -180.0,
+        10.0,
+        10.0,
+        edge_context,
+    );
+    assert_eq!(
+        blocked_with_fallback,
+        (Some((PtzDirection::Down, 180.0)), true)
+    );
 }
 
 #[test]

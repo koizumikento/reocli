@@ -7,12 +7,13 @@ use mockito::{Matcher, Server};
 use super::{
     AxisKind, AxisMotion, CALIBRATION_SCHEMA_VERSION, CALIBRATION_SOURCE_MEASURED,
     DirectionalDeadband, StoredCalibration, attempt_home_restore_on_failure,
-    axis_quality_threshold_count, build_axis_count_range, calibration_min_move_delta,
-    calibration_pulse_ms, calibration_pulse_speed, calibration_stall_delta,
-    can_reuse_saved_calibration, deadband_upper_bound_for_span, estimate_deadband_from_samples,
-    estimate_model_from_sweep, estimate_model_from_sweep_with_quality, evenly_spaced_samples,
-    execute, map_status_to_counts, robust_deadband_from_samples, save_stored_calibration,
-    validate_measured_calibration_quality, winsorize_samples,
+    axis_model_min_samples, axis_model_sample_cap, axis_quality_threshold_count,
+    build_axis_count_range, calibration_min_move_delta, calibration_pulse_ms,
+    calibration_pulse_speed, calibration_stall_delta, can_reuse_saved_calibration,
+    deadband_upper_bound_for_span, estimate_deadband_from_samples, estimate_model_from_sweep,
+    estimate_model_from_sweep_with_quality, evenly_spaced_samples, execute, map_status_to_counts,
+    robust_deadband_from_samples, save_stored_calibration, validate_measured_calibration_quality,
+    winsorize_samples,
 };
 use crate::core::error::{AppError, AppResult, ErrorKind};
 use crate::core::model::{
@@ -277,6 +278,36 @@ fn estimate_model_from_sweep_with_quality_applies_fallback_blend_for_noisy_sampl
     );
     assert!(estimate.fallback_blend_ratio > 0.0);
     assert!(estimate.residual_p95_count > 0);
+}
+
+#[test]
+fn axis_model_sample_policy_biases_tilt_higher_than_pan() {
+    let pan_cap = axis_model_sample_cap(AxisKind::Pan);
+    let tilt_cap = axis_model_sample_cap(AxisKind::Tilt);
+    let pan_min = axis_model_min_samples(AxisKind::Pan);
+    let tilt_min = axis_model_min_samples(AxisKind::Tilt);
+
+    assert!(tilt_cap > pan_cap);
+    assert!(tilt_min > pan_min);
+    assert!(pan_min <= pan_cap);
+    assert!(tilt_min <= tilt_cap);
+}
+
+#[test]
+fn estimate_model_from_sweep_with_quality_uses_axis_specific_sample_caps() {
+    let source = (1..=240).map(|value| value as f64).collect::<Vec<_>>();
+    let pan_estimate = estimate_model_from_sweep_with_quality(AxisKind::Pan, 7_200.0, &source);
+    let tilt_estimate = estimate_model_from_sweep_with_quality(AxisKind::Tilt, 1_800.0, &source);
+
+    assert_eq!(
+        pan_estimate.sample_count,
+        axis_model_sample_cap(AxisKind::Pan)
+    );
+    assert_eq!(
+        tilt_estimate.sample_count,
+        axis_model_sample_cap(AxisKind::Tilt)
+    );
+    assert!(tilt_estimate.sample_count > pan_estimate.sample_count);
 }
 
 #[test]

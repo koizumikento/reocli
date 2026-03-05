@@ -1,5 +1,48 @@
-use super::{AxisController, AxisControllerConfig, AxisEkf, AxisEkfConfig, quantize_normalized_u};
+use super::{
+    AxisController, AxisControllerConfig, AxisEkf, AxisEkfConfig, EKF_NIS_HARD_GATE,
+    quantize_normalized_u,
+};
 use crate::core::model::{AxisModelParams, AxisState};
+
+fn full_trust_output_for_next_update(ekf: &AxisEkf, control_u: f64, measurement: f64) -> f64 {
+    let u = control_u.clamp(-1.0, 1.0);
+    let ts = ekf.config.ts_sec.max(1e-3);
+    let predicted_state = AxisState {
+        position: ekf.state.position + ts * ekf.state.velocity,
+        velocity: ekf.model.alpha * ekf.state.velocity + ekf.model.beta * u,
+        bias: ekf.state.bias,
+    };
+    let a = [[1.0, ts, 0.0], [0.0, ekf.model.alpha, 0.0], [0.0, 0.0, 1.0]];
+    let q_scale = ekf
+        .adaptive_q_scale
+        .clamp(super::EKF_MIN_Q_SCALE, super::EKF_MAX_Q_SCALE);
+    let p_pred = super::add_3x3(
+        super::mul_3x3(super::mul_3x3(a, ekf.covariance), super::transpose_3x3(a)),
+        [
+            [ekf.config.q_position.max(1e-6) * q_scale, 0.0, 0.0],
+            [0.0, ekf.config.q_velocity.max(1e-6) * q_scale, 0.0],
+            [0.0, 0.0, ekf.config.q_bias.max(1e-8) * q_scale],
+        ],
+    );
+
+    let innovation = measurement - super::output_from_state(predicted_state);
+    let h = [1.0, 0.0, 1.0];
+    let ph_t = super::mul_3x3_3x1(p_pred, h);
+    let r = ekf
+        .adaptive_r
+        .clamp(super::EKF_MIN_MEASUREMENT_R, super::EKF_MAX_MEASUREMENT_R);
+    let s = (super::dot_3(h, ph_t) + r.max(1e-6)).max(1e-6);
+    let gain = super::scale_3(ph_t, 1.0 / s);
+    let corrected_state = AxisState {
+        position: (predicted_state.position + gain[0] * innovation)
+            .clamp(ekf.config.min_position, ekf.config.max_position),
+        velocity: (predicted_state.velocity + gain[1] * innovation)
+            .clamp(ekf.config.min_velocity, ekf.config.max_velocity),
+        bias: (predicted_state.bias + gain[2] * innovation)
+            .clamp(ekf.config.min_bias, ekf.config.max_bias),
+    };
+    super::output_from_state(corrected_state)
+}
 
 #[test]
 fn state_update_converges_toward_measurement() {
@@ -111,6 +154,7 @@ fn ekf_rejects_large_measurement_outlier() {
     let outlier = 5_000.0;
     let _ = ekf.update(0.0, outlier);
     let output_after = ekf.output();
+    let consistency = ekf.consistency();
 
     assert!(
         (output_after - output_before).abs() < 10.0,
@@ -119,6 +163,11 @@ fn ekf_rejects_large_measurement_outlier() {
     assert!(
         (output_after - outlier).abs() > 1_000.0,
         "state should not be pulled close to the outlier, output={output_after}, outlier={outlier}"
+    );
+    assert!(
+        consistency.last_nis >= EKF_NIS_HARD_GATE,
+        "hard gate should still protect extreme outliers, nis={}",
+        consistency.last_nis
     );
 }
 
@@ -138,6 +187,56 @@ fn ekf_normal_measurement_updates_state() {
     let error_after = (ekf.output() - measurement).abs();
 
     assert!(error_after < error_before);
+}
+
+#[test]
+fn ekf_inlier_update_matches_classic_kalman_step() {
+    let mut ekf = AxisEkf::new(
+        AxisEkfConfig::with_default_noise(0.05, -180.0, 180.0),
+        AxisModelParams {
+            alpha: 0.92,
+            beta: 0.35,
+        },
+        0.0,
+    );
+    let measurement = 2.0;
+    let expected_output = full_trust_output_for_next_update(&ekf, 0.0, measurement);
+
+    let _ = ekf.update(0.0, measurement);
+    let output_after = ekf.output();
+
+    assert!(
+        (output_after - expected_output).abs() < 1e-9,
+        "inlier update should match the non-robust EKF step, expected={expected_output}, actual={output_after}"
+    );
+}
+
+#[test]
+fn ekf_moderate_outlier_is_down_weighted_not_ignored() {
+    let mut ekf = AxisEkf::new(
+        AxisEkfConfig::with_default_noise(0.05, -180.0, 180.0),
+        AxisModelParams {
+            alpha: 0.92,
+            beta: 0.35,
+        },
+        0.0,
+    );
+
+    let output_before = ekf.output();
+    let moderate_outlier = 8.0;
+    let full_trust_output = full_trust_output_for_next_update(&ekf, 0.0, moderate_outlier);
+
+    let _ = ekf.update(0.0, moderate_outlier);
+    let output_after = ekf.output();
+
+    assert!(
+        output_after > output_before + 1.0,
+        "moderate outlier should still influence state (not ignored), before={output_before}, after={output_after}"
+    );
+    assert!(
+        output_after < full_trust_output - 0.5,
+        "moderate outlier should be down-weighted versus full trust, full_trust={full_trust_output}, robust={output_after}"
+    );
 }
 
 #[test]

@@ -28,6 +28,12 @@ const REQUIRED_STABLE_STEPS: usize = 2;
 const SETTLE_STEP_MS: u64 = 60;
 const TIMEOUT_RETRY_BUDGET_MIN_MS: u64 = 18_000;
 const TIMEOUT_RETRY_BUDGET_MAX_MS: u64 = 36_000;
+const ADAPTIVE_TIMEOUT_RTT_ALPHA: f64 = 1.0 / 8.0;
+const ADAPTIVE_TIMEOUT_RTT_BETA: f64 = 1.0 / 4.0;
+const ADAPTIVE_TIMEOUT_RTTVAR_GAIN: f64 = 4.0;
+const ADAPTIVE_TIMEOUT_MIN_SAMPLE_COUNT: usize = 2;
+const ADAPTIVE_TIMEOUT_MAX_SLACK_MS: u64 = 8_000;
+const ADAPTIVE_TIMEOUT_MAX_SAMPLE_MS: f64 = 10_000.0;
 const MIN_CONTROL_PULSE_MS: u64 = 0;
 const MAX_CONTROL_PULSE_MS: u64 = 220;
 const ACTIVE_COMMAND_MIN_PULSE_MS: u64 = 8;
@@ -136,6 +142,8 @@ const STRICT_COMPLETION_GRACE_STEPS: usize = 3;
 const OSCILLATION_STABLE_STEP_REDUCTION_REVERSAL_SUM: usize = 6;
 const SECONDARY_AXIS_INTERLEAVE_INTERVAL_MIN: usize = 1;
 const SECONDARY_AXIS_INTERLEAVE_INTERVAL_MAX: usize = 3;
+const EDGE_PUSH_LOCKOUT_TRIGGER_STREAK: usize = 2;
+const EDGE_PUSH_LOCKOUT_HOLD_STEPS: usize = 2;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 struct StoredAxisEkfState {
@@ -250,6 +258,56 @@ struct AxisOnlineGainTracker {
 struct DualAxisInterleaveState {
     dominant_axis: Option<ControlAxis>,
     dominant_streak: usize,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct AdaptiveTimeoutRttEstimator {
+    srtt_ms: Option<f64>,
+    rttvar_ms: Option<f64>,
+    last_sample_ms: Option<f64>,
+    sample_count: usize,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct AdaptiveTimeoutBudget {
+    base_timeout_ms: u64,
+    raw_slack_ms: u64,
+    slack_cap_ms: u64,
+    applied_slack_ms: u64,
+    effective_timeout_ms: u64,
+    srtt_ms: f64,
+    rttvar_ms: f64,
+    last_sample_ms: f64,
+    sample_count: usize,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct EdgePushDirectionLockout {
+    risky_streak: usize,
+    lockout_steps: usize,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct EdgePushLockoutState {
+    left: EdgePushDirectionLockout,
+    right: EdgePushDirectionLockout,
+    up: EdgePushDirectionLockout,
+    down: EdgePushDirectionLockout,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct EdgePushContext {
+    pan_measure: f64,
+    pan_min_count: f64,
+    pan_max_count: f64,
+    pan_span: f64,
+    pan_error_measured: f64,
+    pan_success_tolerance: f64,
+    tilt_measure: f64,
+    tilt_min_count: f64,
+    tilt_max_count: f64,
+    tilt_error_measured: f64,
+    tilt_success_tolerance: f64,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -368,6 +426,72 @@ fn timeout_retry_budget_ms(timeout_ms: u64) -> u64 {
     scaled.clamp(TIMEOUT_RETRY_BUDGET_MIN_MS, TIMEOUT_RETRY_BUDGET_MAX_MS)
 }
 
+impl AdaptiveTimeoutRttEstimator {
+    fn observe(&mut self, sample: Duration) {
+        let sample_ms = (sample.as_secs_f64() * 1000.0).clamp(1.0, ADAPTIVE_TIMEOUT_MAX_SAMPLE_MS);
+        if !sample_ms.is_finite() {
+            return;
+        }
+        self.last_sample_ms = Some(sample_ms);
+        self.sample_count = self.sample_count.saturating_add(1);
+
+        let (Some(srtt_ms), Some(rttvar_ms)) = (self.srtt_ms, self.rttvar_ms) else {
+            self.srtt_ms = Some(sample_ms);
+            self.rttvar_ms = Some((sample_ms / 2.0).max(0.0));
+            return;
+        };
+
+        let deviation_ms = (srtt_ms - sample_ms).abs();
+        let updated_rttvar_ms = (1.0 - ADAPTIVE_TIMEOUT_RTT_BETA) * rttvar_ms
+            + ADAPTIVE_TIMEOUT_RTT_BETA * deviation_ms;
+        let updated_srtt_ms =
+            (1.0 - ADAPTIVE_TIMEOUT_RTT_ALPHA) * srtt_ms + ADAPTIVE_TIMEOUT_RTT_ALPHA * sample_ms;
+        self.srtt_ms = Some(updated_srtt_ms.max(0.0));
+        self.rttvar_ms = Some(updated_rttvar_ms.max(0.0));
+    }
+}
+
+fn adaptive_timeout_slack_cap_ms(base_timeout_ms: u64) -> u64 {
+    (base_timeout_ms / 2).clamp(1, ADAPTIVE_TIMEOUT_MAX_SLACK_MS)
+}
+
+fn adaptive_timeout_budget(
+    base_timeout_ms: u64,
+    estimator: AdaptiveTimeoutRttEstimator,
+) -> AdaptiveTimeoutBudget {
+    let srtt_ms = estimator.srtt_ms.unwrap_or(0.0).max(0.0);
+    let rttvar_ms = estimator.rttvar_ms.unwrap_or(0.0).max(0.0);
+    let raw_slack_ms = if estimator.sample_count >= ADAPTIVE_TIMEOUT_MIN_SAMPLE_COUNT {
+        let candidate = (ADAPTIVE_TIMEOUT_RTTVAR_GAIN * rttvar_ms).round();
+        if candidate.is_finite() && candidate > 0.0 {
+            candidate as u64
+        } else {
+            0
+        }
+    } else {
+        0
+    };
+    let slack_cap_ms = adaptive_timeout_slack_cap_ms(base_timeout_ms);
+    let applied_slack_ms = raw_slack_ms.min(slack_cap_ms);
+    AdaptiveTimeoutBudget {
+        base_timeout_ms,
+        raw_slack_ms,
+        slack_cap_ms,
+        applied_slack_ms,
+        effective_timeout_ms: base_timeout_ms.saturating_add(applied_slack_ms),
+        srtt_ms,
+        rttvar_ms,
+        last_sample_ms: estimator.last_sample_ms.unwrap_or(0.0).max(0.0),
+        sample_count: estimator.sample_count,
+    }
+}
+
+fn adaptive_timeout_deadline(base_deadline: Instant, budget: AdaptiveTimeoutBudget) -> Instant {
+    base_deadline
+        .checked_add(Duration::from_millis(budget.applied_slack_ms))
+        .unwrap_or(base_deadline)
+}
+
 fn parse_failure_mode_counters(message: &str) -> Option<FailureModeCounters> {
     let start = message.rfind("failure_modes=(")? + "failure_modes=(".len();
     let end = start + message[start..].find(')')?;
@@ -441,9 +565,16 @@ fn run_closed_loop(
     state_key: &str,
     state_path: &Path,
 ) -> AppResult<PtzRawPosition> {
+    let mut timeout_rtt_estimator = AdaptiveTimeoutRttEstimator::default();
+    let status_with_ranges_started_at = Instant::now();
     let status_with_ranges = ptz::get_ptz_status(client, channel).ok();
+    timeout_rtt_estimator
+        .observe(Instant::now().saturating_duration_since(status_with_ranges_started_at));
     let saved_calibration = load_saved_calibration_for_channel(client, channel);
+    let initial_status_started_at = Instant::now();
     let initial_status = ptz::get_ptz_cur_pos(client, channel)?;
+    timeout_rtt_estimator
+        .observe(Instant::now().saturating_duration_since(initial_status_started_at));
     let initial = map_status_to_raw_position(&initial_status)?;
 
     let (pan_nominal_min_count, pan_nominal_max_count) = axis_nominal_bounds(
@@ -551,6 +682,8 @@ fn run_closed_loop(
     let mut last_update_at = Instant::now();
     let mut tie_break_pan = true;
     let mut failure_modes = FailureModeCounters::default();
+    let mut edge_push_lockout = EdgePushLockoutState::default();
+    let mut edge_lockout_blocks = 0usize;
     let mut stale_status_streak = 0usize;
     let mut pan_reversals = 0usize;
     let mut tilt_reversals = 0usize;
@@ -621,7 +754,10 @@ fn run_closed_loop(
 
     loop {
         let loop_started_at = Instant::now();
+        let status_request_started_at = Instant::now();
         let status = ptz::get_ptz_cur_pos(client, channel)?;
+        timeout_rtt_estimator
+            .observe(Instant::now().saturating_duration_since(status_request_started_at));
         let current = map_status_to_raw_position(&status)?;
         let pan_measure = current.pan_count as f64;
         let tilt_measure = current.tilt_count as f64;
@@ -846,6 +982,19 @@ fn run_closed_loop(
         );
         let command_error_norm =
             normalized_vector_error(pan_command_error, tilt_command_error, pan_span, tilt_span);
+        let edge_context = EdgePushContext {
+            pan_measure,
+            pan_min_count,
+            pan_max_count,
+            pan_span,
+            pan_error_measured,
+            pan_success_tolerance,
+            tilt_measure,
+            tilt_min_count,
+            tilt_max_count,
+            tilt_error_measured,
+            tilt_success_tolerance,
+        };
 
         if consider_best(
             &mut best_observed,
@@ -946,7 +1095,9 @@ fn run_closed_loop(
             }
         }
 
-        if Instant::now() >= deadline {
+        let timeout_budget = adaptive_timeout_budget(timeout_ms, timeout_rtt_estimator);
+        let adaptive_deadline = adaptive_timeout_deadline(deadline, timeout_budget);
+        if Instant::now() >= adaptive_deadline {
             let best = best_observed.unwrap_or(BestObservedState {
                 pan_count: current.pan_count,
                 tilt_count: current.tilt_count,
@@ -1022,8 +1173,8 @@ fn run_closed_loop(
             return Err(AppError::new(
                 ErrorKind::UnexpectedResponse,
                 format!(
-                    "set_absolute_raw timeout after {}ms on channel {channel}: target=({},{}) current=({},{}) measured_error=({:.1},{:.1}) measured_error_norm={:.5} estimated_error=({:.1},{:.1}) control_error=({:.1},{:.1}) command_error=({:.1},{:.1}) command_error_norm={:.5} tolerance={} control_tolerance=({:.1},{:.1}) command_tolerance=({:.1},{:.1}) success_tolerance=({:.1},{:.1}) reversals=({},{}) updates={} stable_steps={} failure_modes=(edge:{},model:{},axis_swap:{},stale:{}) timeout_blocker={} dominant_failure_mode={} best_within_success_tol={} latch_eligible={} best_age_steps={} online_beta=(pan+:{:.1},pan-:{:.1},tilt+:{:.1},tilt-:{:.1}) ekf_consistency=(pan_nis:{:.2}/{:.2},tilt_nis:{:.2}/{:.2},pan_r:{:.2},tilt_r:{:.2},pan_resvar:{:.2},tilt_resvar:{:.2}) last_dt_sec={:.3} backend_hint={} best=({},{}) best_error=({},{}) trace=[{}]{}",
-                    timeout_ms,
+                    "set_absolute_raw timeout after {}ms on channel {channel}: target=({},{}) current=({},{}) measured_error=({:.1},{:.1}) measured_error_norm={:.5} estimated_error=({:.1},{:.1}) control_error=({:.1},{:.1}) command_error=({:.1},{:.1}) command_error_norm={:.5} tolerance={} control_tolerance=({:.1},{:.1}) command_tolerance=({:.1},{:.1}) success_tolerance=({:.1},{:.1}) reversals=({},{}) updates={} stable_steps={} failure_modes=(edge:{},model:{},axis_swap:{},stale:{}) edge_lockout_blocks={} adaptive_timeout=(base_ms:{},raw_slack_ms:{},slack_cap_ms:{},applied_slack_ms:{},effective_ms:{},samples:{},srtt_ms:{:.1},rttvar_ms:{:.1},last_rtt_ms:{:.1}) timeout_blocker={} dominant_failure_mode={} best_within_success_tol={} latch_eligible={} best_age_steps={} online_beta=(pan+:{:.1},pan-:{:.1},tilt+:{:.1},tilt-:{:.1}) ekf_consistency=(pan_nis:{:.2}/{:.2},tilt_nis:{:.2}/{:.2},pan_r:{:.2},tilt_r:{:.2},pan_resvar:{:.2},tilt_resvar:{:.2}) last_dt_sec={:.3} backend_hint={} best=({},{}) best_error=({},{}) trace=[{}]{}",
+                    timeout_budget.effective_timeout_ms,
                     target_pan_count,
                     target_tilt_count,
                     current.pan_count,
@@ -1053,6 +1204,16 @@ fn run_closed_loop(
                     failure_modes.model_mismatch_hits,
                     failure_modes.axis_swap_lag_hits,
                     failure_modes.stale_status_hits,
+                    edge_lockout_blocks,
+                    timeout_budget.base_timeout_ms,
+                    timeout_budget.raw_slack_ms,
+                    timeout_budget.slack_cap_ms,
+                    timeout_budget.applied_slack_ms,
+                    timeout_budget.effective_timeout_ms,
+                    timeout_budget.sample_count,
+                    timeout_budget.srtt_ms,
+                    timeout_budget.rttvar_ms,
+                    timeout_budget.last_sample_ms,
                     timeout_blocker,
                     dominant_failure_mode,
                     best_within_success_tol,
@@ -1186,6 +1347,18 @@ fn run_closed_loop(
                     tilt_success_tolerance,
                 )
             });
+            let (selected_command, edge_lockout_blocked) = select_command_with_edge_push_lockout(
+                &mut edge_push_lockout,
+                selected_command,
+                pan_command_error,
+                tilt_command_error,
+                pan_command_tolerance,
+                tilt_command_tolerance,
+                edge_context,
+            );
+            if edge_lockout_blocked {
+                edge_lockout_blocks = edge_lockout_blocks.saturating_add(1);
+            }
             match selected_command {
                 Some((direction, command_error_abs)) => {
                     step_error_abs = command_error_abs;
@@ -1201,20 +1374,7 @@ fn run_closed_loop(
                         failure_modes.axis_swap_lag_hits =
                             failure_modes.axis_swap_lag_hits.saturating_add(1);
                     }
-                    if edge_saturation_detected(
-                        direction,
-                        pan_measure,
-                        pan_min_count,
-                        pan_max_count,
-                        pan_span,
-                        pan_error_measured,
-                        pan_success_tolerance,
-                        tilt_measure,
-                        tilt_min_count,
-                        tilt_max_count,
-                        tilt_error_measured,
-                        tilt_success_tolerance,
-                    ) {
+                    if edge_context.risky_push(direction) {
                         failure_modes.edge_saturation_hits =
                             failure_modes.edge_saturation_hits.saturating_add(1);
                     }
@@ -2024,6 +2184,122 @@ fn edge_saturation_detected(
         | PtzDirection::LeftDown
         | PtzDirection::RightUp
         | PtzDirection::RightDown => false,
+    }
+}
+
+impl EdgePushContext {
+    fn risky_push(self, direction: PtzDirection) -> bool {
+        edge_saturation_detected(
+            direction,
+            self.pan_measure,
+            self.pan_min_count,
+            self.pan_max_count,
+            self.pan_span,
+            self.pan_error_measured,
+            self.pan_success_tolerance,
+            self.tilt_measure,
+            self.tilt_min_count,
+            self.tilt_max_count,
+            self.tilt_error_measured,
+            self.tilt_success_tolerance,
+        )
+    }
+}
+
+impl EdgePushLockoutState {
+    fn slot_mut(&mut self, direction: PtzDirection) -> Option<&mut EdgePushDirectionLockout> {
+        match direction {
+            PtzDirection::Left => Some(&mut self.left),
+            PtzDirection::Right => Some(&mut self.right),
+            PtzDirection::Up => Some(&mut self.up),
+            PtzDirection::Down => Some(&mut self.down),
+            PtzDirection::LeftUp
+            | PtzDirection::LeftDown
+            | PtzDirection::RightUp
+            | PtzDirection::RightDown => None,
+        }
+    }
+
+    fn should_block_direction(&mut self, direction: PtzDirection, risky_push: bool) -> bool {
+        let Some(slot) = self.slot_mut(direction) else {
+            return false;
+        };
+        if !risky_push {
+            slot.risky_streak = 0;
+            slot.lockout_steps = 0;
+            return false;
+        }
+        if slot.lockout_steps > 0 {
+            slot.lockout_steps = slot.lockout_steps.saturating_sub(1);
+            return true;
+        }
+        slot.risky_streak = slot.risky_streak.saturating_add(1);
+        if slot.risky_streak < EDGE_PUSH_LOCKOUT_TRIGGER_STREAK {
+            return false;
+        }
+        slot.risky_streak = 0;
+        slot.lockout_steps = EDGE_PUSH_LOCKOUT_HOLD_STEPS;
+        true
+    }
+}
+
+fn fallback_command_for_edge_lockout(
+    blocked_direction: PtzDirection,
+    pan_command_error: f64,
+    tilt_command_error: f64,
+    pan_tolerance_count: f64,
+    tilt_tolerance_count: f64,
+) -> Option<(PtzDirection, f64)> {
+    let blocked_axis = control_axis_direction(blocked_direction).map(|(axis, _)| axis)?;
+    match blocked_axis {
+        ControlAxis::Pan => {
+            if tilt_command_error.abs() <= tilt_tolerance_count {
+                None
+            } else {
+                command_for_axis_error(ControlAxis::Tilt, tilt_command_error)
+            }
+        }
+        ControlAxis::Tilt => {
+            if pan_command_error.abs() <= pan_tolerance_count {
+                None
+            } else {
+                command_for_axis_error(ControlAxis::Pan, pan_command_error)
+            }
+        }
+    }
+}
+
+fn select_command_with_edge_push_lockout(
+    state: &mut EdgePushLockoutState,
+    selected_command: Option<(PtzDirection, f64)>,
+    pan_command_error: f64,
+    tilt_command_error: f64,
+    pan_tolerance_count: f64,
+    tilt_tolerance_count: f64,
+    edge_context: EdgePushContext,
+) -> (Option<(PtzDirection, f64)>, bool) {
+    let Some((direction, command_error_abs)) = selected_command else {
+        return (None, false);
+    };
+    let risky_push = edge_context.risky_push(direction);
+    if !state.should_block_direction(direction, risky_push) {
+        return (Some((direction, command_error_abs)), false);
+    }
+
+    let Some((fallback_direction, fallback_error_abs)) = fallback_command_for_edge_lockout(
+        direction,
+        pan_command_error,
+        tilt_command_error,
+        pan_tolerance_count,
+        tilt_tolerance_count,
+    ) else {
+        return (None, true);
+    };
+    let fallback_risky_push = edge_context.risky_push(fallback_direction);
+    if state.should_block_direction(fallback_direction, fallback_risky_push) {
+        (None, true)
+    } else {
+        (Some((fallback_direction, fallback_error_abs)), true)
     }
 }
 

@@ -41,8 +41,10 @@ const CALIBRATION_STALL_STEPS: usize = 3;
 const CALIBRATION_SWEEP_MAX_STEPS: usize = 64;
 const CALIBRATION_RESTORE_MAX_STEPS: usize = 36;
 const CALIBRATION_RESTORE_TOLERANCE: i64 = 10;
-const CALIBRATION_MODEL_SAMPLE_COUNT: usize = 100;
-const CALIBRATION_MODEL_MIN_SAMPLES_PER_AXIS: usize = 50;
+const CALIBRATION_MODEL_SAMPLE_COUNT_PAN: usize = 100;
+const CALIBRATION_MODEL_SAMPLE_COUNT_TILT: usize = 140;
+const CALIBRATION_MODEL_MIN_SAMPLES_PAN: usize = 50;
+const CALIBRATION_MODEL_MIN_SAMPLES_TILT: usize = 70;
 const CALIBRATION_SWEEP_RETRY_PASSES_MAX: usize = 8;
 const CALIBRATION_MODEL_TRIM_RATIO: f64 = 0.1;
 const CALIBRATION_MODEL_RESIDUAL_BLEND_START_RATIO: f64 = 0.0025;
@@ -475,7 +477,9 @@ fn sweep_axis_bounds(
     axis: AxisKind,
     motion: AxisMotion,
 ) -> AppResult<(i64, i64, Vec<f64>)> {
-    let mut sweep_deltas = Vec::new();
+    let sample_cap = axis_model_sample_cap(axis);
+    let min_samples = axis_model_min_samples(axis).min(sample_cap);
+    let mut sweep_deltas = Vec::with_capacity(sample_cap);
     let mut min = sweep_axis_limit(
         client,
         channel,
@@ -483,6 +487,7 @@ fn sweep_axis_bounds(
         motion.decrease,
         true,
         &mut sweep_deltas,
+        sample_cap,
     )?;
     let mut max = sweep_axis_limit(
         client,
@@ -491,8 +496,9 @@ fn sweep_axis_bounds(
         motion.increase,
         false,
         &mut sweep_deltas,
+        sample_cap,
     )?;
-    if sweep_deltas.len() < CALIBRATION_MODEL_MIN_SAMPLES_PER_AXIS {
+    if sweep_deltas.len() < min_samples {
         for _ in 0..CALIBRATION_SWEEP_RETRY_PASSES_MAX {
             let pass_min = sweep_axis_limit(
                 client,
@@ -501,6 +507,7 @@ fn sweep_axis_bounds(
                 motion.decrease,
                 true,
                 &mut sweep_deltas,
+                sample_cap,
             )?;
             min = min.min(pass_min);
             let pass_max = sweep_axis_limit(
@@ -510,9 +517,10 @@ fn sweep_axis_bounds(
                 motion.increase,
                 false,
                 &mut sweep_deltas,
+                sample_cap,
             )?;
             max = max.max(pass_max);
-            if sweep_deltas.len() >= CALIBRATION_MODEL_MIN_SAMPLES_PER_AXIS {
+            if sweep_deltas.len() >= min_samples {
                 break;
             }
         }
@@ -537,6 +545,7 @@ fn sweep_axis_limit(
     direction: crate::core::model::PtzDirection,
     toward_min: bool,
     sweep_deltas: &mut Vec<f64>,
+    sample_cap: usize,
 ) -> AppResult<i64> {
     let mut best = read_axis_position(client, channel, axis)?;
     let mut stall_steps = 0usize;
@@ -546,7 +555,7 @@ fn sweep_axis_limit(
         pulse(client, channel, axis, direction)?;
         let after = read_axis_position(client, channel, axis)?;
         let moved_count = (after - before).unsigned_abs() as f64;
-        if moved_count.is_finite() && moved_count > 0.0 {
+        if sweep_deltas.len() < sample_cap && moved_count.is_finite() && moved_count > 0.0 {
             sweep_deltas.push(moved_count);
         }
 
@@ -901,6 +910,20 @@ fn axis_quality_threshold(axis: AxisKind) -> AxisQualityThreshold {
     }
 }
 
+fn axis_model_sample_cap(axis: AxisKind) -> usize {
+    match axis {
+        AxisKind::Pan => CALIBRATION_MODEL_SAMPLE_COUNT_PAN,
+        AxisKind::Tilt => CALIBRATION_MODEL_SAMPLE_COUNT_TILT,
+    }
+}
+
+fn axis_model_min_samples(axis: AxisKind) -> usize {
+    match axis {
+        AxisKind::Pan => CALIBRATION_MODEL_MIN_SAMPLES_PAN,
+        AxisKind::Tilt => CALIBRATION_MODEL_MIN_SAMPLES_TILT,
+    }
+}
+
 fn axis_quality_threshold_count(axis: AxisKind, span: f64) -> i64 {
     let threshold = axis_quality_threshold(axis);
     let span_based = (span.abs() * threshold.ratio).round() as i64;
@@ -981,13 +1004,14 @@ fn estimate_model_from_sweep_with_quality(
     sweep_deltas: &[f64],
 ) -> AxisModelEstimate {
     let fallback = fallback_model_for_span(span);
+    let sample_cap = axis_model_sample_cap(axis);
     let mut samples = sweep_deltas
         .iter()
         .copied()
         .filter(|delta| delta.is_finite() && *delta > 0.0)
         .collect::<Vec<_>>();
-    if samples.len() > CALIBRATION_MODEL_SAMPLE_COUNT {
-        samples = evenly_spaced_samples(&samples, CALIBRATION_MODEL_SAMPLE_COUNT);
+    if samples.len() > sample_cap {
+        samples = evenly_spaced_samples(&samples, sample_cap);
     }
     if samples.len() < 2 {
         return AxisModelEstimate {

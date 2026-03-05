@@ -19,6 +19,7 @@ const EKF_ADAPTATION_LAMBDA: f64 = 0.08;
 const EKF_NIS_UPPER: f64 = 1.6;
 const EKF_NIS_LOWER: f64 = 0.7;
 const EKF_NIS_HARD_GATE: f64 = 9.0;
+const EKF_HUBER_DELTA: f64 = 1.5;
 const EKF_Q_SCALE_GROWTH: f64 = 1.08;
 const EKF_Q_SCALE_DECAY: f64 = 0.97;
 const EKF_CONSISTENCY_EWMA_ALPHA: f64 = 0.08;
@@ -26,6 +27,7 @@ const EKF_MEASUREMENT_HINT_MIN_SCALE: f64 = 0.75;
 const EKF_MEASUREMENT_HINT_MAX_SCALE: f64 = 1.8;
 const EKF_MEASUREMENT_HINT_BLEND_ALPHA: f64 = 0.35;
 const EKF_MAX_RESIDUAL_VARIANCE_PROXY: f64 = EKF_MAX_MEASUREMENT_R * 4.0;
+const EKF_MAX_COVARIANCE_ABS: f64 = 1.0e6;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct AxisControllerConfig {
@@ -358,9 +360,24 @@ impl AxisEkf {
         } else {
             f64::INFINITY
         };
+        let normalized_innovation = if innovation.is_finite() {
+            innovation / s.sqrt()
+        } else {
+            f64::INFINITY
+        };
+        let abs_normalized_innovation = normalized_innovation.abs();
+        let huber_weight = if abs_normalized_innovation.is_finite() {
+            if abs_normalized_innovation <= EKF_HUBER_DELTA {
+                1.0
+            } else {
+                (EKF_HUBER_DELTA / abs_normalized_innovation).clamp(0.0, 1.0)
+            }
+        } else {
+            0.0
+        };
         let measurement_rejected = !nis.is_finite() || nis > EKF_NIS_HARD_GATE;
 
-        let (corrected_state, p_corr) = if measurement_rejected {
+        let (corrected_state, p_corr, adaptation_innovation) = if measurement_rejected {
             (
                 AxisState {
                     position: predicted_state
@@ -374,25 +391,27 @@ impl AxisEkf {
                         .clamp(self.config.min_bias, self.config.max_bias),
                 },
                 p_pred,
+                innovation,
             )
         } else {
             let gain = scale_3(ph_t, 1.0 / s);
+            let weighted_innovation = innovation * huber_weight;
             let corrected_state = AxisState {
-                position: (predicted_state.position + gain[0] * innovation)
+                position: (predicted_state.position + gain[0] * weighted_innovation)
                     .clamp(self.config.min_position, self.config.max_position),
-                velocity: (predicted_state.velocity + gain[1] * innovation)
+                velocity: (predicted_state.velocity + gain[1] * weighted_innovation)
                     .clamp(self.config.min_velocity, self.config.max_velocity),
-                bias: (predicted_state.bias + gain[2] * innovation)
+                bias: (predicted_state.bias + gain[2] * weighted_innovation)
                     .clamp(self.config.min_bias, self.config.max_bias),
             };
-            let kh = outer_3x3(gain, h);
+            let kh = outer_3x3(scale_3(gain, huber_weight), h);
             let p_corr = mul_3x3(sub_3x3(identity_3(), kh), p_pred);
-            (corrected_state, p_corr)
+            (corrected_state, p_corr, weighted_innovation)
         };
 
         self.state = corrected_state;
-        self.covariance = p_corr;
-        self.adapt_noise(innovation, s);
+        self.covariance = sanitize_covariance(p_corr);
+        self.adapt_noise(adaptation_innovation, s);
 
         AxisEstimate {
             state: corrected_state,
@@ -474,8 +493,16 @@ fn is_finite_covariance(covariance: [[f64; 3]; 3]) -> bool {
 
 fn sanitize_covariance(covariance: [[f64; 3]; 3]) -> [[f64; 3]; 3] {
     let mut fixed = covariance;
+    for row in &mut fixed {
+        for value in row.iter_mut() {
+            if !value.is_finite() {
+                *value = 0.0;
+            }
+            *value = (*value).clamp(-EKF_MAX_COVARIANCE_ABS, EKF_MAX_COVARIANCE_ABS);
+        }
+    }
     for (index, row) in fixed.iter_mut().enumerate() {
-        row[index] = row[index].abs().max(1e-6);
+        row[index] = row[index].abs().clamp(1e-6, EKF_MAX_COVARIANCE_ABS);
     }
     fixed
 }
