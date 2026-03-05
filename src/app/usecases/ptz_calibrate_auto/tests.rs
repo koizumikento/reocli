@@ -15,7 +15,8 @@ use super::{
     deadband_upper_bound_for_span, estimate_deadband_from_samples, estimate_model_from_samples,
     estimate_model_from_sweep, estimate_model_from_sweep_with_quality, evenly_spaced_samples,
     execute, fallback_model_for_span, map_status_to_counts, robust_deadband_from_samples,
-    save_stored_calibration, validate_measured_calibration_quality, winsorize_samples,
+    save_stored_calibration, should_retry_tilt_sampling_after_quality_check,
+    validate_measured_calibration_quality, winsorize_samples,
 };
 use crate::core::error::{AppError, AppResult, ErrorKind};
 use crate::core::model::{
@@ -454,6 +455,39 @@ fn measured_quality_gate_rejects_when_tilt_p95_exceeds_threshold_by_one() {
     assert_eq!(error.kind, ErrorKind::UnexpectedResponse);
     assert!(error.message.contains(&format!("max={}", tilt_threshold)));
     assert!(error.message.contains("ratio="));
+}
+
+#[test]
+fn tilt_retry_is_enabled_only_for_tilt_only_quality_failure() {
+    let pan_span = 7_200.0;
+    let tilt_span = 1_800.0;
+    let pan_threshold = axis_quality_threshold_count(AxisKind::Pan, pan_span);
+    let tilt_threshold = axis_quality_threshold_count(AxisKind::Tilt, tilt_span);
+
+    assert!(should_retry_tilt_sampling_after_quality_check(
+        pan_span,
+        tilt_span,
+        pan_threshold,
+        tilt_threshold + 1
+    ));
+    assert!(!should_retry_tilt_sampling_after_quality_check(
+        pan_span,
+        tilt_span,
+        pan_threshold + 1,
+        tilt_threshold
+    ));
+    assert!(!should_retry_tilt_sampling_after_quality_check(
+        pan_span,
+        tilt_span,
+        pan_threshold + 1,
+        tilt_threshold + 1
+    ));
+    assert!(!should_retry_tilt_sampling_after_quality_check(
+        pan_span,
+        tilt_span,
+        pan_threshold,
+        tilt_threshold
+    ));
 }
 
 #[test]
