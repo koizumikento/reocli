@@ -94,3 +94,136 @@ fn ekf_tracks_measurement_and_estimates_velocity() {
     assert!(state.velocity > 0.0);
     assert!((ekf.output() - measurement).abs() < 5.0);
 }
+
+#[test]
+fn ekf_rejects_large_measurement_outlier() {
+    let mut ekf = AxisEkf::new(
+        AxisEkfConfig::with_default_noise(0.05, -180.0, 180.0),
+        AxisModelParams {
+            alpha: 0.92,
+            beta: 0.35,
+        },
+        0.0,
+    );
+    let _ = ekf.update(0.0, 2.0);
+    let output_before = ekf.output();
+
+    let outlier = 5_000.0;
+    let _ = ekf.update(0.0, outlier);
+    let output_after = ekf.output();
+
+    assert!(
+        (output_after - output_before).abs() < 10.0,
+        "outlier should be gated out, before={output_before}, after={output_after}"
+    );
+    assert!(
+        (output_after - outlier).abs() > 1_000.0,
+        "state should not be pulled close to the outlier, output={output_after}, outlier={outlier}"
+    );
+}
+
+#[test]
+fn ekf_normal_measurement_updates_state() {
+    let mut ekf = AxisEkf::new(
+        AxisEkfConfig::with_default_noise(0.05, -180.0, 180.0),
+        AxisModelParams {
+            alpha: 0.92,
+            beta: 0.35,
+        },
+        0.0,
+    );
+    let measurement = 5.0;
+    let error_before = (ekf.output() - measurement).abs();
+    let _ = ekf.update(0.0, measurement);
+    let error_after = (ekf.output() - measurement).abs();
+
+    assert!(error_after < error_before);
+}
+
+#[test]
+fn ekf_outlier_rejection_keeps_consistency_metrics_finite() {
+    let mut ekf = AxisEkf::new(
+        AxisEkfConfig::with_default_noise(0.05, -180.0, 180.0),
+        AxisModelParams {
+            alpha: 0.92,
+            beta: 0.35,
+        },
+        0.0,
+    );
+
+    let _ = ekf.update(0.0, 1.0e308);
+    let state = ekf.state();
+    let consistency = ekf.consistency();
+
+    assert!(state.position.is_finite());
+    assert!(state.velocity.is_finite());
+    assert!(state.bias.is_finite());
+    assert!(consistency.last_nis.is_finite());
+    assert!(consistency.ewma_nis.is_finite());
+    assert!(consistency.adaptive_r.is_finite());
+    assert!(consistency.residual_variance_proxy.is_finite());
+    assert!((0.05..=30.0).contains(&consistency.adaptive_r));
+    assert!((0.05..=120.0).contains(&consistency.residual_variance_proxy));
+}
+
+#[test]
+fn ekf_consistency_reports_nis_and_residual_proxy() {
+    let mut ekf = AxisEkf::new(
+        AxisEkfConfig::with_default_noise(0.05, -180.0, 180.0),
+        AxisModelParams {
+            alpha: 0.92,
+            beta: 0.35,
+        },
+        0.0,
+    );
+
+    let _ = ekf.update(0.3, 8.0);
+    let consistency = ekf.consistency();
+    assert!(consistency.last_nis.is_finite());
+    assert!(consistency.ewma_nis.is_finite());
+    assert!(consistency.adaptive_r.is_finite());
+    assert!(consistency.residual_variance_proxy.is_finite());
+}
+
+#[test]
+fn ekf_measurement_noise_hint_is_bounded() {
+    let mut ekf = AxisEkf::new(
+        AxisEkfConfig::with_default_noise(0.05, -180.0, 180.0),
+        AxisModelParams {
+            alpha: 0.92,
+            beta: 0.35,
+        },
+        0.0,
+    );
+    let baseline = ekf.consistency().adaptive_r;
+    ekf.apply_measurement_noise_hint(100.0);
+    let inflated = ekf.consistency().adaptive_r;
+    assert!(inflated > baseline);
+    assert!(inflated <= 30.0);
+
+    ekf.apply_measurement_noise_hint(0.0);
+    let reduced = ekf.consistency().adaptive_r;
+    assert!(reduced < inflated);
+    assert!(reduced >= 0.05);
+}
+
+#[test]
+fn ekf_snapshot_restores_consistency_metrics() {
+    let config = AxisEkfConfig::with_default_noise(0.05, -180.0, 180.0);
+    let model = AxisModelParams {
+        alpha: 0.92,
+        beta: 0.35,
+    };
+    let mut ekf = AxisEkf::new(config, model, 0.0);
+    let _ = ekf.update(0.4, 10.0);
+    ekf.apply_measurement_noise_hint(1.4);
+    let before = ekf.consistency();
+    let snapshot = ekf.snapshot();
+
+    let restored = AxisEkf::from_snapshot(config, model, snapshot).expect("snapshot is valid");
+    let after = restored.consistency();
+    assert!((after.last_nis - before.last_nis).abs() < 1e-9);
+    assert!((after.ewma_nis - before.ewma_nis).abs() < 1e-9);
+    assert!((after.residual_variance_proxy - before.residual_variance_proxy).abs() < 1e-9);
+    assert!((after.adaptive_r - before.adaptive_r).abs() < 1e-9);
+}

@@ -7,9 +7,12 @@ use mockito::{Matcher, Server};
 use super::{
     AxisKind, AxisMotion, CALIBRATION_SCHEMA_VERSION, CALIBRATION_SOURCE_MEASURED,
     DirectionalDeadband, StoredCalibration, attempt_home_restore_on_failure,
-    build_axis_count_range, can_reuse_saved_calibration, deadband_upper_bound_for_span,
-    estimate_deadband_from_samples, estimate_model_from_sweep, evenly_spaced_samples, execute,
-    map_status_to_counts, robust_deadband_from_samples, save_stored_calibration,
+    axis_quality_threshold_count, build_axis_count_range, calibration_min_move_delta,
+    calibration_pulse_ms, calibration_pulse_speed, calibration_stall_delta,
+    can_reuse_saved_calibration, deadband_upper_bound_for_span, estimate_deadband_from_samples,
+    estimate_model_from_sweep, estimate_model_from_sweep_with_quality, evenly_spaced_samples,
+    execute, map_status_to_counts, robust_deadband_from_samples, save_stored_calibration,
+    validate_measured_calibration_quality, winsorize_samples,
 };
 use crate::core::error::{AppError, AppResult, ErrorKind};
 use crate::core::model::{
@@ -266,6 +269,34 @@ fn estimate_model_from_sweep_produces_finite_model() {
 }
 
 #[test]
+fn estimate_model_from_sweep_with_quality_applies_fallback_blend_for_noisy_samples() {
+    let estimate = estimate_model_from_sweep_with_quality(
+        AxisKind::Pan,
+        7_200.0,
+        &[10.0, 10.0, 10.0, 300.0, 10.0, 10.0, 10.0, 300.0],
+    );
+    assert!(estimate.fallback_blend_ratio > 0.0);
+    assert!(estimate.residual_p95_count > 0);
+}
+
+#[test]
+fn winsorize_samples_clamps_large_outliers() {
+    let winsorized = winsorize_samples(&[10.0, 11.0, 12.0, 800.0, 13.0, 14.0], 0.1);
+    assert_eq!(winsorized.len(), 6);
+    assert!(winsorized[3] < 800.0);
+}
+
+#[test]
+fn tilt_calibration_pulse_profile_is_finer_than_pan() {
+    assert!(calibration_pulse_speed(AxisKind::Tilt) < calibration_pulse_speed(AxisKind::Pan));
+    assert!(calibration_pulse_ms(AxisKind::Tilt) < calibration_pulse_ms(AxisKind::Pan));
+    assert!(
+        calibration_min_move_delta(AxisKind::Tilt) <= calibration_min_move_delta(AxisKind::Pan)
+    );
+    assert!(calibration_stall_delta(AxisKind::Tilt) <= calibration_stall_delta(AxisKind::Pan));
+}
+
+#[test]
 fn evenly_spaced_samples_caps_to_target_count() {
     let source = (0..100).map(|value| value as f64).collect::<Vec<_>>();
     let sampled = evenly_spaced_samples(&source, 50);
@@ -286,6 +317,56 @@ fn estimate_deadband_from_samples_clips_to_span_upper_bound() {
     let span = 1_000.0;
     let clipped = estimate_deadband_from_samples(&[240, 250, 260, 270, 280], span);
     assert_eq!(clipped, deadband_upper_bound_for_span(span));
+}
+
+#[test]
+fn measured_quality_gate_accepts_values_on_axis_thresholds() {
+    let pan_span = 7_200.0;
+    let tilt_span = 1_800.0;
+    let pan_threshold = axis_quality_threshold_count(AxisKind::Pan, pan_span);
+    let tilt_threshold = axis_quality_threshold_count(AxisKind::Tilt, tilt_span);
+
+    validate_measured_calibration_quality(pan_span, tilt_span, pan_threshold, tilt_threshold)
+        .expect("threshold-edge values should be accepted");
+}
+
+#[test]
+fn measured_quality_gate_rejects_when_pan_p95_exceeds_threshold_by_one() {
+    let pan_span = 7_200.0;
+    let tilt_span = 1_800.0;
+    let pan_threshold = axis_quality_threshold_count(AxisKind::Pan, pan_span);
+    let tilt_threshold = axis_quality_threshold_count(AxisKind::Tilt, tilt_span);
+
+    let error = validate_measured_calibration_quality(
+        pan_span,
+        tilt_span,
+        pan_threshold + 1,
+        tilt_threshold,
+    )
+    .expect_err("pan above threshold should be rejected");
+    assert_eq!(error.kind, ErrorKind::UnexpectedResponse);
+    assert!(error.message.contains("pan_p95="));
+    assert!(error.message.contains("tilt_p95="));
+    assert!(error.message.contains(&format!("max={}", pan_threshold)));
+}
+
+#[test]
+fn measured_quality_gate_rejects_when_tilt_p95_exceeds_threshold_by_one() {
+    let pan_span = 7_200.0;
+    let tilt_span = 1_800.0;
+    let pan_threshold = axis_quality_threshold_count(AxisKind::Pan, pan_span);
+    let tilt_threshold = axis_quality_threshold_count(AxisKind::Tilt, tilt_span);
+
+    let error = validate_measured_calibration_quality(
+        pan_span,
+        tilt_span,
+        pan_threshold,
+        tilt_threshold + 1,
+    )
+    .expect_err("tilt above threshold should be rejected");
+    assert_eq!(error.kind, ErrorKind::UnexpectedResponse);
+    assert!(error.message.contains(&format!("max={}", tilt_threshold)));
+    assert!(error.message.contains("ratio="));
 }
 
 #[test]

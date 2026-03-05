@@ -1,25 +1,28 @@
 use std::fs;
 use std::path::PathBuf;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use super::{
-    AxisOnlineGainTracker, DualAxisInterleaveState, FailureModeCounters, adaptive_axis_tolerance,
-    apply_fine_phase_feedforward, apply_pending_pulse_observation, apply_reversal_guard,
-    axis_count_bounds, axis_one_percent_threshold, axis_swap_lag_detected,
-    best_stagnation_near_miss_eligible, best_within_success_tolerance,
-    calibrated_success_tolerance, clamp_tilt_edge_control, command_from_errors,
-    control_axis_direction, control_pulse_ms_for_error, dominant_failure_mode_label,
-    edge_saturation_detected, ekf_config, enforce_residual_command_activity,
+    AxisOnlineGainTracker, DualAxisInterleaveState, FailureModeCounters, OnlineLearningState,
+    adaptive_axis_tolerance, apply_fine_phase_feedforward, apply_pending_pulse_observation,
+    apply_reversal_guard, apply_tilt_backlash_compensation, axis_count_bounds,
+    axis_one_percent_threshold, axis_percent_threshold, axis_stale_detected,
+    axis_swap_lag_detected, best_stagnation_near_miss_eligible, best_within_success_tolerance,
+    calibrated_success_tolerance, clamp_pan_reversal_micro_control, clamp_tilt_edge_control,
+    clamp_tilt_reversal_micro_control, command_activation_tolerance, command_from_errors,
+    control_axis_direction, control_pulse_ms_for_error, control_step_ms_for_error,
+    dominant_failure_mode_label, edge_saturation_detected, ekf_config,
+    enforce_residual_command_activity, ensure_active_command_pulse_ms,
     forced_secondary_axis_command, format_failure_mode_counters, load_stored_ekf_state,
-    max_failure_mode_counters, model_mismatch_detected, near_target_speed1_pulse_ms,
-    normalized_vector_error, oscillation_damping_active, parse_failure_mode_counters,
-    parse_onvif_duration_ms, pending_pulse_observation_for_command,
+    max_failure_mode_counters, measurement_noise_hint_scale, model_mismatch_detected,
+    near_target_speed1_pulse_ms, normalized_vector_error, oscillation_damping_active,
+    parse_failure_mode_counters, parse_onvif_duration_ms, pending_pulse_observation_for_command,
     position_stable_threshold_count, pulse_ms_for_direction_with_lut, relative_delta_from_error,
-    required_stable_steps_for_oscillation, save_stored_ekf_state,
-    secondary_axis_interleave_interval, select_control_error, should_force_cgi_for_onvif_options,
-    should_retry_after_timeout, stale_status_detected, success_latch_ready,
-    success_latch_stagnation_ready, timeout_blocker_label, timeout_retry_budget_ms,
-    update_reversal_counter,
+    remaining_control_step_sleep_duration, required_stable_steps_for_oscillation,
+    save_stored_ekf_state, secondary_axis_interleave_interval, select_control_error,
+    should_force_cgi_for_onvif_options, should_retry_after_timeout, stale_status_detected,
+    strict_axis_focus_command, success_latch_ready, success_latch_stagnation_ready,
+    timeout_blocker_label, timeout_retry_budget_ms, update_reversal_counter,
 };
 use crate::app::usecases::ptz_controller::AxisEkf;
 use crate::app::usecases::ptz_pulse_lut::AxisPulseLut;
@@ -47,21 +50,24 @@ fn axis_count_bounds_maps_range_and_applies_margin() {
 
 #[test]
 fn command_from_errors_prioritizes_dominant_axis_and_uses_tie_break() {
-    let dominant = command_from_errors(220.0, -100.0, 10.0, true, 1000.0, 1000.0, 120.0, 68.0)
-        .expect("command should be produced");
+    let dominant =
+        command_from_errors(220.0, -100.0, 10.0, 10.0, true, 1000.0, 1000.0, 120.0, 68.0)
+            .expect("command should be produced");
     assert_eq!(dominant.0, PtzDirection::Right);
 
-    let tie_break_pan = command_from_errors(120.0, -68.0, 10.0, true, 1000.0, 1000.0, 120.0, 68.0)
-        .expect("command should be produced");
+    let tie_break_pan =
+        command_from_errors(120.0, -68.0, 10.0, 10.0, true, 1000.0, 1000.0, 120.0, 68.0)
+            .expect("command should be produced");
     assert_eq!(tie_break_pan.0, PtzDirection::Right);
 
     let tie_break_tilt =
-        command_from_errors(120.0, -68.0, 10.0, false, 1000.0, 1000.0, 120.0, 68.0)
+        command_from_errors(120.0, -68.0, 10.0, 10.0, false, 1000.0, 1000.0, 120.0, 68.0)
             .expect("command should be produced");
     assert_eq!(tie_break_tilt.0, PtzDirection::Down);
 
-    let single_axis = command_from_errors(0.0, -110.0, 10.0, true, 1000.0, 1000.0, 120.0, 68.0)
-        .expect("command should be produced");
+    let single_axis =
+        command_from_errors(0.0, -110.0, 10.0, 10.0, true, 1000.0, 1000.0, 120.0, 68.0)
+            .expect("command should be produced");
     assert_eq!(single_axis.0, PtzDirection::Down);
     assert!(dominant.1 >= 1.0);
 }
@@ -69,11 +75,12 @@ fn command_from_errors_prioritizes_dominant_axis_and_uses_tie_break() {
 #[test]
 fn command_from_errors_uses_success_tolerance_priority_for_asymmetric_span() {
     assert_eq!(
-        command_from_errors(200.0, 100.0, 10.0, true, 7360.0, 1240.0, 120.0, 68.0).map(|cmd| cmd.0),
+        command_from_errors(200.0, 100.0, 10.0, 10.0, true, 7360.0, 1240.0, 120.0, 68.0)
+            .map(|cmd| cmd.0),
         Some(PtzDirection::Right)
     );
     assert_eq!(
-        command_from_errors(8.0, 8.0, 10.0, true, 7360.0, 1240.0, 120.0, 68.0),
+        command_from_errors(8.0, 8.0, 10.0, 10.0, true, 7360.0, 1240.0, 120.0, 68.0),
         None
     );
 }
@@ -83,8 +90,8 @@ fn secondary_axis_interleave_interval_scales_with_ratio() {
     assert_eq!(secondary_axis_interleave_interval(0.30, 0.25), 1);
     assert_eq!(secondary_axis_interleave_interval(0.30, 0.18), 2);
     assert_eq!(secondary_axis_interleave_interval(0.30, 0.12), 3);
-    assert_eq!(secondary_axis_interleave_interval(0.30, 0.08), 4);
-    assert_eq!(secondary_axis_interleave_interval(0.30, 0.04), 5);
+    assert_eq!(secondary_axis_interleave_interval(0.30, 0.08), 3);
+    assert_eq!(secondary_axis_interleave_interval(0.30, 0.04), 3);
 }
 
 #[test]
@@ -93,7 +100,7 @@ fn forced_secondary_axis_command_alternates_for_balanced_dual_axis_error() {
     let mut directions = Vec::new();
     for _ in 0..4 {
         let forced = forced_secondary_axis_command(
-            &mut state, -180.0, 120.0, 12.0, 7_360.0, 1_240.0, 120.0, 68.0,
+            &mut state, -180.0, 120.0, 12.0, 12.0, 7_360.0, 1_240.0, 120.0, 68.0, 50.0, 24.0,
         )
         .map(|(direction, _)| direction);
         directions.push(forced);
@@ -104,11 +111,12 @@ fn forced_secondary_axis_command_alternates_for_balanced_dual_axis_error() {
     assert_eq!(directions[2], None);
     assert_eq!(directions[3], Some(PtzDirection::Left));
 
-    let reset =
-        forced_secondary_axis_command(&mut state, -80.0, 0.0, 12.0, 7_360.0, 1_240.0, 120.0, 68.0);
+    let reset = forced_secondary_axis_command(
+        &mut state, -80.0, 0.0, 12.0, 12.0, 7_360.0, 1_240.0, 120.0, 68.0, 50.0, 24.0,
+    );
     assert_eq!(reset, None);
     let first_after_reset = forced_secondary_axis_command(
-        &mut state, -400.0, 200.0, 12.0, 7_360.0, 1_240.0, 120.0, 68.0,
+        &mut state, -400.0, 200.0, 12.0, 12.0, 7_360.0, 1_240.0, 120.0, 68.0, 50.0, 24.0,
     );
     assert_eq!(first_after_reset, None);
 }
@@ -119,7 +127,7 @@ fn forced_secondary_axis_command_does_not_starve_pan_near_target() {
     let mut forced_pan = 0usize;
     for _ in 0..8 {
         let forced = forced_secondary_axis_command(
-            &mut state, 145.0, -125.0, 12.0, 7_360.0, 1_240.0, 120.0, 68.0,
+            &mut state, 145.0, -125.0, 12.0, 12.0, 7_360.0, 1_240.0, 120.0, 68.0, 50.0, 24.0,
         )
         .map(|(direction, _)| direction);
         if matches!(forced, Some(PtzDirection::Right)) {
@@ -127,6 +135,32 @@ fn forced_secondary_axis_command_does_not_starve_pan_near_target() {
         }
     }
     assert!(forced_pan >= 2);
+}
+
+#[test]
+fn strict_axis_focus_command_prefers_remaining_axis_when_other_is_within_strict() {
+    assert_eq!(
+        strict_axis_focus_command(40.0, 30.0, 50.0, 24.0).map(|(direction, _)| direction),
+        Some(PtzDirection::Up)
+    );
+    assert_eq!(
+        strict_axis_focus_command(-70.0, 20.0, 50.0, 24.0).map(|(direction, _)| direction),
+        Some(PtzDirection::Left)
+    );
+    assert_eq!(strict_axis_focus_command(70.0, 30.0, 50.0, 24.0), None);
+}
+
+#[test]
+fn forced_secondary_axis_command_uses_strict_threshold_in_endgame() {
+    let mut state = DualAxisInterleaveState::default();
+    let mut forced = None;
+    for _ in 0..3 {
+        forced = forced_secondary_axis_command(
+            &mut state, 80.0, 30.0, 12.0, 12.0, 7_360.0, 1_240.0, 120.0, 60.0, 50.0, 24.0,
+        )
+        .map(|(direction, _)| direction);
+    }
+    assert_eq!(forced, Some(PtzDirection::Up));
 }
 
 #[test]
@@ -139,9 +173,15 @@ fn one_percent_and_vector_helpers_are_finite() {
 }
 
 #[test]
+fn two_percent_threshold_is_capped_per_axis_span() {
+    assert_eq!(axis_percent_threshold(7360.0, 0.02), 147.0);
+    assert_eq!(axis_percent_threshold(1240.0, 0.02), 24.0);
+}
+
+#[test]
 fn calibrated_success_tolerance_respects_deadband_floor_and_cap() {
-    assert_eq!(calibrated_success_tolerance(73.0, 240.0, 12.0), 120.0);
-    assert_eq!(calibrated_success_tolerance(12.0, 62.0, 12.0), 68.0);
+    assert_eq!(calibrated_success_tolerance(73.0, 240.0, 12.0), 73.0);
+    assert_eq!(calibrated_success_tolerance(12.0, 62.0, 12.0), 60.0);
     assert_eq!(calibrated_success_tolerance(12.0, 0.0, 12.0), 12.0);
     assert_eq!(calibrated_success_tolerance(12.0, f64::NAN, 12.0), 12.0);
 }
@@ -217,6 +257,22 @@ fn failure_mode_helpers_detect_expected_patterns() {
 }
 
 #[test]
+fn axis_stale_detected_tracks_per_axis_motion_stalls() {
+    assert!(axis_stale_detected(0.6, Some(0.2)));
+    assert!(!axis_stale_detected(0.04, Some(0.2)));
+    assert!(!axis_stale_detected(0.6, Some(2.0)));
+    assert!(!axis_stale_detected(0.6, None));
+}
+
+#[test]
+fn measurement_noise_hint_scale_inflates_on_mismatch_and_stale() {
+    let inflated = measurement_noise_hint_scale(true, true, 3, 120.0, 60.0);
+    assert!(inflated > 1.0);
+    let settled = measurement_noise_hint_scale(false, false, 0, 20.0, 60.0);
+    assert!(settled < 1.0);
+}
+
+#[test]
 fn failure_mode_counter_parsing_and_max_are_stable() {
     let parsed = parse_failure_mode_counters(
         "set_absolute_raw timeout ... failure_modes=(edge:7,model:3,axis_swap:0,stale:1)",
@@ -284,8 +340,8 @@ fn success_latch_helpers_gate_by_age_and_motion() {
     assert!(!success_latch_ready(1, 0.005, moving));
     assert!(success_latch_ready(0, 0.01, idle));
     assert!(!success_latch_ready(0, 0.08, idle));
-    assert!(success_latch_stagnation_ready(4, idle));
-    assert!(!success_latch_stagnation_ready(3, idle));
+    assert!(success_latch_stagnation_ready(6, idle));
+    assert!(!success_latch_stagnation_ready(5, idle));
     assert!(!success_latch_stagnation_ready(10, moving));
 
     assert!(best_within_success_tolerance(
@@ -316,7 +372,7 @@ fn best_stagnation_near_miss_allows_single_axis_small_overrun_only() {
         within_margin,
         120.0,
         68.0,
-        15.0
+        8.0
     ));
 
     let both_over = super::BestObservedState {
@@ -326,7 +382,7 @@ fn best_stagnation_near_miss_allows_single_axis_small_overrun_only() {
         tilt_abs_error: 90,
     };
     assert!(!best_stagnation_near_miss_eligible(
-        both_over, 120.0, 68.0, 15.0
+        both_over, 120.0, 68.0, 8.0
     ));
 
     let over_margin = super::BestObservedState {
@@ -339,7 +395,7 @@ fn best_stagnation_near_miss_allows_single_axis_small_overrun_only() {
         over_margin,
         120.0,
         68.0,
-        15.0
+        8.0
     ));
 }
 
@@ -401,7 +457,8 @@ fn apply_reversal_guard_blocks_small_reverse_commands() {
     assert_eq!(allowed, -220.0);
 
     let blocked_by_deadband = apply_reversal_guard(-70.0, 0.5, 10.0, 180.0);
-    assert_eq!(blocked_by_deadband, 0.0);
+    assert!(blocked_by_deadband < 0.0);
+    assert!(blocked_by_deadband.abs() <= 14.0);
 }
 
 #[test]
@@ -558,6 +615,22 @@ fn near_target_speed1_pulse_ms_clamps_to_guard_band() {
 }
 
 #[test]
+fn ensure_active_command_pulse_ms_restores_zero_pulse_outside_strict_band() {
+    assert_eq!(
+        ensure_active_command_pulse_ms(0, PtzDirection::Down, 10.0, 40.0, 20.0, 20.0),
+        8
+    );
+    assert_eq!(
+        ensure_active_command_pulse_ms(0, PtzDirection::Right, 12.0, 40.0, 20.0, 20.0),
+        0
+    );
+    assert_eq!(
+        ensure_active_command_pulse_ms(18, PtzDirection::Down, 10.0, 40.0, 20.0, 20.0),
+        18
+    );
+}
+
+#[test]
 fn update_reversal_counter_detects_near_target_sign_flips() {
     let mut counter = 0usize;
     let mut previous = None;
@@ -582,8 +655,15 @@ fn oscillation_damping_active_only_near_success_band_and_after_reversals() {
 #[test]
 fn adaptive_axis_tolerance_relaxes_after_repeated_reversals() {
     assert_eq!(adaptive_axis_tolerance(50.0, 0, 120.0), 50.0);
-    assert_eq!(adaptive_axis_tolerance(50.0, 4, 200.0), 94.0);
-    assert_eq!(adaptive_axis_tolerance(180.0, 8, 200.0), 224.0);
+    assert_eq!(adaptive_axis_tolerance(50.0, 4, 200.0), 74.0);
+    assert_eq!(adaptive_axis_tolerance(180.0, 8, 200.0), 204.0);
+}
+
+#[test]
+fn command_activation_tolerance_clamps_to_strict_threshold() {
+    assert_eq!(command_activation_tolerance(45.9, 20.0), 20.0);
+    assert_eq!(command_activation_tolerance(12.0, 20.0), 12.0);
+    assert_eq!(command_activation_tolerance(45.9, f64::NAN), 45.9);
 }
 
 #[test]
@@ -591,6 +671,91 @@ fn control_pulse_ms_uses_micro_pulses_near_target() {
     assert_eq!(control_pulse_ms_for_error(80.0), 0);
     assert_eq!(control_pulse_ms_for_error(150.0), 20);
     assert_eq!(control_pulse_ms_for_error(300.0), 35);
+}
+
+#[test]
+fn control_step_ms_is_compact_for_closed_loop_updates() {
+    assert_eq!(control_step_ms_for_error(80.0), 140);
+    assert_eq!(control_step_ms_for_error(150.0), 130);
+    assert_eq!(control_step_ms_for_error(300.0), 120);
+    assert_eq!(control_step_ms_for_error(800.0), 110);
+    assert_eq!(control_step_ms_for_error(2_000.0), 130);
+}
+
+#[test]
+fn remaining_control_step_sleep_duration_returns_only_budget_left() {
+    assert_eq!(
+        remaining_control_step_sleep_duration(120, Duration::from_millis(35)),
+        Duration::from_millis(85)
+    );
+    assert_eq!(
+        remaining_control_step_sleep_duration(120, Duration::from_millis(120)),
+        Duration::ZERO
+    );
+}
+
+#[test]
+fn remaining_control_step_sleep_duration_saturates_at_zero_when_over_budget() {
+    assert_eq!(
+        remaining_control_step_sleep_duration(120, Duration::from_millis(220)),
+        Duration::ZERO
+    );
+}
+
+#[test]
+fn clamp_pan_reversal_micro_control_restricts_pan_after_reversal() {
+    assert_eq!(
+        clamp_pan_reversal_micro_control(PtzDirection::Right, 3, 45, true, 180.0),
+        (1, 10)
+    );
+    assert_eq!(
+        clamp_pan_reversal_micro_control(PtzDirection::Up, 3, 45, true, 180.0),
+        (3, 45)
+    );
+    assert_eq!(
+        clamp_pan_reversal_micro_control(PtzDirection::Left, 3, 45, true, 260.0),
+        (3, 45)
+    );
+    assert_eq!(
+        clamp_pan_reversal_micro_control(PtzDirection::Left, 3, 45, false, 180.0),
+        (3, 45)
+    );
+}
+
+#[test]
+fn clamp_tilt_reversal_micro_control_restricts_tilt_after_reversal() {
+    assert_eq!(
+        clamp_tilt_reversal_micro_control(PtzDirection::Down, 3, 45, true, 80.0, 30.0),
+        (1, 10)
+    );
+    assert_eq!(
+        clamp_tilt_reversal_micro_control(PtzDirection::Right, 3, 45, true, 80.0, 30.0),
+        (3, 45)
+    );
+    assert_eq!(
+        clamp_tilt_reversal_micro_control(PtzDirection::Up, 3, 45, true, 260.0, 30.0),
+        (3, 45)
+    );
+}
+
+#[test]
+fn apply_tilt_backlash_compensation_boosts_small_reversal_commands() {
+    assert_eq!(
+        apply_tilt_backlash_compensation(8.0, 32.0, 24.0, true),
+        24.0
+    );
+    assert_eq!(
+        apply_tilt_backlash_compensation(-8.0, -32.0, 24.0, true),
+        -24.0
+    );
+    assert_eq!(
+        apply_tilt_backlash_compensation(30.0, 32.0, 24.0, true),
+        30.0
+    );
+    assert_eq!(
+        apply_tilt_backlash_compensation(8.0, 32.0, 24.0, false),
+        8.0
+    );
 }
 
 #[test]
@@ -612,6 +777,22 @@ fn ekf_state_roundtrip_save_and_load() {
     let mut tilt_filter = AxisEkf::new(ekf_config(-1500.0, 1500.0), model, -200.0);
     let _ = pan_filter.update(0.3, 1230.0);
     let _ = tilt_filter.update(-0.2, -180.0);
+    let mut pan_gain_tracker = AxisOnlineGainTracker::seeded(model.beta);
+    let mut tilt_gain_tracker = AxisOnlineGainTracker::seeded(model.beta);
+    pan_gain_tracker.observe(0.5, Some(90.0), 7_360.0);
+    tilt_gain_tracker.observe(-0.5, Some(-70.0), 1_240.0);
+    let mut pan_lut = AxisPulseLut::seeded(model.beta);
+    let mut tilt_lut = AxisPulseLut::seeded(model.beta);
+    pan_lut.update(
+        crate::app::usecases::ptz_pulse_lut::AxisDirection::Positive,
+        100,
+        280.0,
+    );
+    tilt_lut.update(
+        crate::app::usecases::ptz_pulse_lut::AxisDirection::Negative,
+        120,
+        180.0,
+    );
 
     save_stored_ekf_state(
         &temp_file,
@@ -619,8 +800,14 @@ fn ekf_state_roundtrip_save_and_load() {
         channel,
         &pan_filter,
         &tilt_filter,
-        0.25,
-        -0.5,
+        OnlineLearningState {
+            pan_gain_tracker: &pan_gain_tracker,
+            tilt_gain_tracker: &tilt_gain_tracker,
+            pan_pulse_lut: &pan_lut,
+            tilt_pulse_lut: &tilt_lut,
+            last_pan_u: 0.25,
+            last_tilt_u: -0.5,
+        },
     )
     .expect("EKF state save should succeed");
 
@@ -633,6 +820,96 @@ fn ekf_state_roundtrip_save_and_load() {
     assert!((loaded.last_tilt_u + 0.5).abs() < 1e-9);
     assert!(loaded.pan.position.is_finite());
     assert!(loaded.tilt.position.is_finite());
+    assert!(loaded.pan_positive_beta.is_some());
+    assert!(loaded.pan_negative_beta.is_some());
+    assert!(loaded.tilt_positive_beta.is_some());
+    assert!(loaded.tilt_negative_beta.is_some());
+    assert!(loaded.pan_positive_counts_per_ms.is_some());
+    assert!(loaded.pan_negative_counts_per_ms.is_some());
+    assert!(loaded.tilt_positive_counts_per_ms.is_some());
+    assert!(loaded.tilt_negative_counts_per_ms.is_some());
+    assert!(loaded.pan.last_nis.is_some());
+    assert!(loaded.pan.ewma_nis.is_some());
+    assert!(loaded.pan.residual_variance_proxy.is_some());
+    assert!(loaded.tilt.last_nis.is_some());
+    assert!(loaded.tilt.ewma_nis.is_some());
+    assert!(loaded.tilt.residual_variance_proxy.is_some());
+
+    let _ = fs::remove_file(PathBuf::from(&temp_file));
+}
+
+#[test]
+fn legacy_ekf_state_loads_and_seeds_online_learning_params() {
+    let temp_file = std::env::temp_dir().join(format!(
+        "reocli-ekf-count-legacy-{}.json",
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos()
+    ));
+    let channel = 1u8;
+    let state_key = "camera-a.ch1";
+    let legacy = serde_json::json!({
+        "schema_version": 1,
+        "state_key": state_key,
+        "channel": channel,
+        "updated_at": 123_u64,
+        "last_pan_u": 0.1,
+        "last_tilt_u": -0.2,
+        "pan": {
+            "position": 1000.0,
+            "velocity": 10.0,
+            "bias": 0.5,
+            "covariance": [
+                [4.0, 0.0, 0.0],
+                [0.0, 16.0, 0.0],
+                [0.0, 0.0, 4.0]
+            ]
+        },
+        "tilt": {
+            "position": -200.0,
+            "velocity": -5.0,
+            "bias": -0.3,
+            "covariance": [
+                [4.0, 0.0, 0.0],
+                [0.0, 16.0, 0.0],
+                [0.0, 0.0, 4.0]
+            ]
+        }
+    });
+    fs::write(
+        &temp_file,
+        serde_json::to_string_pretty(&legacy).expect("legacy state should serialize"),
+    )
+    .expect("legacy state file should be written");
+
+    let loaded = load_stored_ekf_state(&temp_file, state_key, channel)
+        .expect("legacy EKF state load should succeed")
+        .expect("legacy EKF state should exist");
+    assert!(loaded.pan_positive_beta.is_none());
+    assert!(loaded.pan_negative_beta.is_none());
+    assert!(loaded.pan_positive_counts_per_ms.is_none());
+    assert!(loaded.pan_negative_counts_per_ms.is_none());
+
+    let pan_tracker = AxisOnlineGainTracker::from_seed_and_betas(
+        140.0,
+        loaded.pan_positive_beta,
+        loaded.pan_negative_beta,
+    );
+    assert!((pan_tracker.positive_beta() - 140.0).abs() < 1e-9);
+    assert!((pan_tracker.negative_beta() - 140.0).abs() < 1e-9);
+
+    let pan_lut = AxisPulseLut::from_seed_and_rates(
+        120.0,
+        loaded.pan_positive_counts_per_ms,
+        loaded.pan_negative_counts_per_ms,
+    );
+    let positive =
+        pan_lut.counts_per_ms(crate::app::usecases::ptz_pulse_lut::AxisDirection::Positive);
+    let negative =
+        pan_lut.counts_per_ms(crate::app::usecases::ptz_pulse_lut::AxisDirection::Negative);
+    assert!((positive - 1.0).abs() < 1e-9);
+    assert!((negative - 1.0).abs() < 1e-9);
 
     let _ = fs::remove_file(PathBuf::from(&temp_file));
 }

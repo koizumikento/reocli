@@ -26,19 +26,51 @@ const MODEL_ALPHA_MIN: f64 = 0.75;
 const MODEL_ALPHA_MAX: f64 = 0.98;
 const MODEL_BETA_MIN: f64 = 20.0;
 const MODEL_BETA_MAX: f64 = 600.0;
-const CALIBRATION_PULSE_SPEED: u8 = 6;
-const CALIBRATION_PULSE_MS: u64 = 220;
+const CALIBRATION_RESTORE_CRUISE_SPEED: u8 = 6;
+const CALIBRATION_RESTORE_PULSE_MS: u64 = 220;
+const CALIBRATION_PULSE_SPEED_PAN: u8 = 6;
+const CALIBRATION_PULSE_SPEED_TILT: u8 = 4;
+const CALIBRATION_PULSE_MS_PAN: u64 = 220;
+const CALIBRATION_PULSE_MS_TILT: u64 = 170;
 const CALIBRATION_SETTLE_MS: u64 = 80;
-const CALIBRATION_MIN_MOVE_DELTA: i64 = 8;
-const CALIBRATION_STALL_DELTA: i64 = 4;
+const CALIBRATION_MIN_MOVE_DELTA_PAN: i64 = 8;
+const CALIBRATION_MIN_MOVE_DELTA_TILT: i64 = 4;
+const CALIBRATION_STALL_DELTA_PAN: i64 = 4;
+const CALIBRATION_STALL_DELTA_TILT: i64 = 2;
 const CALIBRATION_STALL_STEPS: usize = 3;
-const CALIBRATION_SWEEP_MAX_STEPS: usize = 48;
+const CALIBRATION_SWEEP_MAX_STEPS: usize = 64;
 const CALIBRATION_RESTORE_MAX_STEPS: usize = 36;
 const CALIBRATION_RESTORE_TOLERANCE: i64 = 10;
-const CALIBRATION_MODEL_SAMPLE_COUNT: usize = 50;
+const CALIBRATION_MODEL_SAMPLE_COUNT: usize = 100;
+const CALIBRATION_MODEL_MIN_SAMPLES_PER_AXIS: usize = 50;
+const CALIBRATION_SWEEP_RETRY_PASSES_MAX: usize = 8;
+const CALIBRATION_MODEL_TRIM_RATIO: f64 = 0.1;
+const CALIBRATION_MODEL_RESIDUAL_BLEND_START_RATIO: f64 = 0.0025;
+const CALIBRATION_MODEL_RESIDUAL_BLEND_END_RATIO: f64 = 0.0075;
+const CALIBRATION_MODEL_RESIDUAL_BLEND_START_MULTIPLIER: f64 = 1.0;
+const CALIBRATION_MODEL_RESIDUAL_BLEND_END_MULTIPLIER: f64 = 2.0;
+const CALIBRATION_MODEL_RESIDUAL_BLEND_MIN_COUNT: f64 = 5.0;
+const CALIBRATION_QUALITY_P95_MAX_RATIO_PAN: f64 = 0.02;
+const CALIBRATION_QUALITY_P95_MAX_RATIO_TILT: f64 = 0.03;
+const CALIBRATION_QUALITY_P95_FLOOR_PAN: i64 = 12;
+const CALIBRATION_QUALITY_P95_FLOOR_TILT: i64 = 8;
+const CALIBRATION_QUALITY_P95_CEILING_PAN: i64 = 220;
+const CALIBRATION_QUALITY_P95_CEILING_TILT: i64 = 120;
 const DEFAULT_DEADBAND_COUNT: i64 = 6;
 const CALIBRATION_DEADBAND_PROBE_SPEED: u8 = 2;
 const CALIBRATION_DEADBAND_PROBE_MS: u64 = 80;
+const CALIBRATION_DEADBAND_PRELOAD_MS: u64 = 24;
+const CALIBRATION_DEADBAND_PROBE_STEPS_MS: [u64; 9] = [
+    8,
+    12,
+    16,
+    24,
+    32,
+    48,
+    64,
+    CALIBRATION_DEADBAND_PROBE_MS,
+    110,
+];
 const CALIBRATION_DEADBAND_PROBE_COUNT: usize = 7;
 const CALIBRATION_DEADBAND_TRIM_RATIO: f64 = 0.2;
 const CALIBRATION_DEADBAND_SPAN_CLIP_RATIO: f64 = 0.05;
@@ -99,16 +131,7 @@ pub fn execute(client: &Client, channel: u8) -> AppResult<PtzCalibrationReport> 
 
     let (calibration, report, source) =
         match try_build_measured_calibration(client, channel, &device_info, &status) {
-            Ok(calibration) => (
-                calibration,
-                CalibrationReport {
-                    samples: CALIBRATION_MODEL_SAMPLE_COUNT,
-                    pan_error_p95_count: 0,
-                    tilt_error_p95_count: 0,
-                    notes: "created_from_measured_sweep".to_string(),
-                },
-                CALIBRATION_SOURCE_MEASURED,
-            ),
+            Ok((calibration, report)) => (calibration, report, CALIBRATION_SOURCE_MEASURED),
             Err(error) => (
                 build_heuristic_calibration(&device_info, &status),
                 CalibrationReport {
@@ -251,7 +274,7 @@ fn try_build_measured_calibration(
     channel: u8,
     device_info: &DeviceInfo,
     status: &PtzStatus,
-) -> AppResult<CalibrationParams> {
+) -> AppResult<(CalibrationParams, CalibrationReport)> {
     let home_pan = axis_position(status, AxisKind::Pan)?;
     let home_tilt = axis_position(status, AxisKind::Tilt)?;
     let mut pan_motion = None;
@@ -284,8 +307,16 @@ fn try_build_measured_calibration(
         )?;
         let pan_span = (pan_max - pan_min).unsigned_abs() as f64;
         let tilt_span = (tilt_max - tilt_min).unsigned_abs() as f64;
-        let pan_model = estimate_model_from_sweep(pan_span, &pan_sweep_deltas);
-        let tilt_model = estimate_model_from_sweep(tilt_span, &tilt_sweep_deltas);
+        let pan_estimate =
+            estimate_model_from_sweep_with_quality(AxisKind::Pan, pan_span, &pan_sweep_deltas);
+        let tilt_estimate =
+            estimate_model_from_sweep_with_quality(AxisKind::Tilt, tilt_span, &tilt_sweep_deltas);
+        validate_measured_calibration_quality(
+            pan_span,
+            tilt_span,
+            pan_estimate.residual_p95_count,
+            tilt_estimate.residual_p95_count,
+        )?;
         let pan_deadband = estimate_directional_deadband_count(
             client,
             channel,
@@ -305,24 +336,38 @@ fn try_build_measured_calibration(
         let pan_deadband_count = pan_deadband.compatibility_count();
         let tilt_deadband_count = tilt_deadband.compatibility_count();
 
-        Ok(CalibrationParams {
-            serial_number: device_info.serial_number.clone(),
-            model: device_info.model.clone(),
-            firmware: device_info.firmware.clone(),
-            pan_min_count: pan_min,
-            pan_max_count: pan_max,
-            pan_deadband_count,
-            pan_deadband_increase_count: Some(pan_deadband.increase_count),
-            pan_deadband_decrease_count: Some(pan_deadband.decrease_count),
-            tilt_min_count: tilt_min,
-            tilt_max_count: tilt_max,
-            tilt_deadband_count,
-            tilt_deadband_increase_count: Some(tilt_deadband.increase_count),
-            tilt_deadband_decrease_count: Some(tilt_deadband.decrease_count),
-            pan_model,
-            tilt_model,
-            created_at: now_epoch_millis().to_string(),
-        })
+        Ok((
+            CalibrationParams {
+                serial_number: device_info.serial_number.clone(),
+                model: device_info.model.clone(),
+                firmware: device_info.firmware.clone(),
+                pan_min_count: pan_min,
+                pan_max_count: pan_max,
+                pan_deadband_count,
+                pan_deadband_increase_count: Some(pan_deadband.increase_count),
+                pan_deadband_decrease_count: Some(pan_deadband.decrease_count),
+                tilt_min_count: tilt_min,
+                tilt_max_count: tilt_max,
+                tilt_deadband_count,
+                tilt_deadband_increase_count: Some(tilt_deadband.increase_count),
+                tilt_deadband_decrease_count: Some(tilt_deadband.decrease_count),
+                pan_model: pan_estimate.model,
+                tilt_model: tilt_estimate.model,
+                created_at: now_epoch_millis().to_string(),
+            },
+            CalibrationReport {
+                samples: pan_estimate.sample_count.max(tilt_estimate.sample_count),
+                pan_error_p95_count: pan_estimate.residual_p95_count,
+                tilt_error_p95_count: tilt_estimate.residual_p95_count,
+                notes: format!(
+                    "created_from_measured_sweep; pan_samples={}; tilt_samples={}; pan_blend={:.2}; tilt_blend={:.2}",
+                    pan_estimate.sample_count,
+                    tilt_estimate.sample_count,
+                    pan_estimate.fallback_blend_ratio,
+                    tilt_estimate.fallback_blend_ratio
+                ),
+            },
+        ))
     })();
 
     attempt_home_restore_on_failure(
@@ -340,8 +385,8 @@ fn try_build_measured_calibration(
     measured
 }
 
-fn attempt_home_restore_on_failure<F>(
-    measured_result: &AppResult<CalibrationParams>,
+fn attempt_home_restore_on_failure<T, F>(
+    measured_result: &AppResult<T>,
     home_pan: i64,
     home_tilt: i64,
     pan_motion: Option<AxisMotion>,
@@ -376,12 +421,12 @@ fn detect_axis_motion(client: &Client, channel: u8, axis: AxisKind) -> AppResult
     };
 
     let before_primary = read_axis_position(client, channel, axis)?;
-    pulse(client, channel, primary)?;
+    pulse(client, channel, axis, primary)?;
     let after_primary = read_axis_position(client, channel, axis)?;
     let primary_delta = after_primary - before_primary;
-    pulse(client, channel, secondary)?;
+    pulse(client, channel, axis, secondary)?;
 
-    if primary_delta.abs() >= CALIBRATION_MIN_MOVE_DELTA {
+    if primary_delta.abs() >= calibration_min_move_delta(axis) {
         return if primary_delta > 0 {
             Ok(AxisMotion {
                 increase: primary,
@@ -396,12 +441,12 @@ fn detect_axis_motion(client: &Client, channel: u8, axis: AxisKind) -> AppResult
     }
 
     let before_secondary = read_axis_position(client, channel, axis)?;
-    pulse(client, channel, secondary)?;
+    pulse(client, channel, axis, secondary)?;
     let after_secondary = read_axis_position(client, channel, axis)?;
     let secondary_delta = after_secondary - before_secondary;
-    pulse(client, channel, primary)?;
+    pulse(client, channel, axis, primary)?;
 
-    if secondary_delta.abs() < CALIBRATION_MIN_MOVE_DELTA {
+    if secondary_delta.abs() < calibration_min_move_delta(axis) {
         return Err(AppError::new(
             ErrorKind::UnexpectedResponse,
             format!(
@@ -431,7 +476,7 @@ fn sweep_axis_bounds(
     motion: AxisMotion,
 ) -> AppResult<(i64, i64, Vec<f64>)> {
     let mut sweep_deltas = Vec::new();
-    let min = sweep_axis_limit(
+    let mut min = sweep_axis_limit(
         client,
         channel,
         axis,
@@ -439,7 +484,7 @@ fn sweep_axis_bounds(
         true,
         &mut sweep_deltas,
     )?;
-    let max = sweep_axis_limit(
+    let mut max = sweep_axis_limit(
         client,
         channel,
         axis,
@@ -447,6 +492,31 @@ fn sweep_axis_bounds(
         false,
         &mut sweep_deltas,
     )?;
+    if sweep_deltas.len() < CALIBRATION_MODEL_MIN_SAMPLES_PER_AXIS {
+        for _ in 0..CALIBRATION_SWEEP_RETRY_PASSES_MAX {
+            let pass_min = sweep_axis_limit(
+                client,
+                channel,
+                axis,
+                motion.decrease,
+                true,
+                &mut sweep_deltas,
+            )?;
+            min = min.min(pass_min);
+            let pass_max = sweep_axis_limit(
+                client,
+                channel,
+                axis,
+                motion.increase,
+                false,
+                &mut sweep_deltas,
+            )?;
+            max = max.max(pass_max);
+            if sweep_deltas.len() >= CALIBRATION_MODEL_MIN_SAMPLES_PER_AXIS {
+                break;
+            }
+        }
+    }
     if max <= min {
         return Err(AppError::new(
             ErrorKind::UnexpectedResponse,
@@ -473,16 +543,11 @@ fn sweep_axis_limit(
 
     for _ in 0..CALIBRATION_SWEEP_MAX_STEPS {
         let before = read_axis_position(client, channel, axis)?;
-        pulse(client, channel, direction)?;
+        pulse(client, channel, axis, direction)?;
         let after = read_axis_position(client, channel, axis)?;
-        let delta_signed = after - before;
-        let moved_toward_target = if toward_min {
-            -(delta_signed as f64)
-        } else {
-            delta_signed as f64
-        };
-        if moved_toward_target.is_finite() && moved_toward_target > 0.0 {
-            sweep_deltas.push(moved_toward_target);
+        let moved_count = (after - before).unsigned_abs() as f64;
+        if moved_count.is_finite() && moved_count > 0.0 {
+            sweep_deltas.push(moved_count);
         }
 
         best = if toward_min {
@@ -491,7 +556,7 @@ fn sweep_axis_limit(
             best.max(after)
         };
 
-        if (after - before).abs() <= CALIBRATION_STALL_DELTA {
+        if (after - before).abs() <= calibration_stall_delta(axis) {
             stall_steps += 1;
             if stall_steps >= CALIBRATION_STALL_STEPS {
                 break;
@@ -528,7 +593,7 @@ fn restore_axis_to_home(
         } else if error.abs() <= 140 {
             4
         } else {
-            CALIBRATION_PULSE_SPEED
+            CALIBRATION_RESTORE_CRUISE_SPEED
         };
 
         ptz_transport::move_ptz(
@@ -536,7 +601,7 @@ fn restore_axis_to_home(
             channel,
             direction,
             speed,
-            Some(CALIBRATION_PULSE_MS),
+            Some(CALIBRATION_RESTORE_PULSE_MS),
         )?;
         thread::sleep(Duration::from_millis(CALIBRATION_SETTLE_MS));
     }
@@ -572,30 +637,62 @@ fn measure_directional_deadband_probe(
     axis: AxisKind,
     motion: AxisMotion,
 ) -> AppResult<DirectionalDeadband> {
-    let before = read_axis_position(client, channel, axis)?;
-    ptz_transport::move_ptz(
+    let increase_count = measure_directional_deadband_count(
         client,
         channel,
+        axis,
         motion.increase,
-        CALIBRATION_DEADBAND_PROBE_SPEED,
-        Some(CALIBRATION_DEADBAND_PROBE_MS),
+        motion.decrease,
     )?;
-    thread::sleep(Duration::from_millis(CALIBRATION_SETTLE_MS));
-    let after_increase = read_axis_position(client, channel, axis)?;
+    let decrease_count = measure_directional_deadband_count(
+        client,
+        channel,
+        axis,
+        motion.decrease,
+        motion.increase,
+    )?;
+    Ok(DirectionalDeadband {
+        increase_count,
+        decrease_count,
+    })
+}
+
+fn measure_directional_deadband_count(
+    client: &Client,
+    channel: u8,
+    axis: AxisKind,
+    probe_direction: crate::core::model::PtzDirection,
+    preload_direction: crate::core::model::PtzDirection,
+) -> AppResult<i64> {
     ptz_transport::move_ptz(
         client,
         channel,
-        motion.decrease,
+        preload_direction,
         CALIBRATION_DEADBAND_PROBE_SPEED,
-        Some(CALIBRATION_DEADBAND_PROBE_MS),
+        Some(CALIBRATION_DEADBAND_PRELOAD_MS),
     )?;
     thread::sleep(Duration::from_millis(CALIBRATION_SETTLE_MS));
-    let after_decrease = read_axis_position(client, channel, axis)?;
 
-    Ok(DirectionalDeadband {
-        increase_count: (after_increase - before).abs().max(1),
-        decrease_count: (after_decrease - after_increase).abs().max(1),
-    })
+    let min_move = calibration_min_move_delta(axis).max(1);
+
+    for pulse_ms in CALIBRATION_DEADBAND_PROBE_STEPS_MS {
+        let before = read_axis_position(client, channel, axis)?;
+        ptz_transport::move_ptz(
+            client,
+            channel,
+            probe_direction,
+            CALIBRATION_DEADBAND_PROBE_SPEED,
+            Some(pulse_ms),
+        )?;
+        thread::sleep(Duration::from_millis(CALIBRATION_SETTLE_MS));
+        let after = read_axis_position(client, channel, axis)?;
+        let delta = (after - before).abs().max(1);
+        if delta >= min_move {
+            return Ok(delta);
+        }
+    }
+
+    Ok(min_move)
 }
 
 fn estimate_deadband_from_samples(samples: &[i64], span: f64) -> i64 {
@@ -664,17 +761,46 @@ fn deadband_upper_bound_for_span(span: f64) -> i64 {
 fn pulse(
     client: &Client,
     channel: u8,
+    axis: AxisKind,
     direction: crate::core::model::PtzDirection,
 ) -> AppResult<()> {
     ptz_transport::move_ptz(
         client,
         channel,
         direction,
-        CALIBRATION_PULSE_SPEED,
-        Some(CALIBRATION_PULSE_MS),
+        calibration_pulse_speed(axis),
+        Some(calibration_pulse_ms(axis)),
     )?;
     thread::sleep(Duration::from_millis(CALIBRATION_SETTLE_MS));
     Ok(())
+}
+
+fn calibration_pulse_speed(axis: AxisKind) -> u8 {
+    match axis {
+        AxisKind::Pan => CALIBRATION_PULSE_SPEED_PAN,
+        AxisKind::Tilt => CALIBRATION_PULSE_SPEED_TILT,
+    }
+}
+
+fn calibration_pulse_ms(axis: AxisKind) -> u64 {
+    match axis {
+        AxisKind::Pan => CALIBRATION_PULSE_MS_PAN,
+        AxisKind::Tilt => CALIBRATION_PULSE_MS_TILT,
+    }
+}
+
+fn calibration_min_move_delta(axis: AxisKind) -> i64 {
+    match axis {
+        AxisKind::Pan => CALIBRATION_MIN_MOVE_DELTA_PAN,
+        AxisKind::Tilt => CALIBRATION_MIN_MOVE_DELTA_TILT,
+    }
+}
+
+fn calibration_stall_delta(axis: AxisKind) -> i64 {
+    match axis {
+        AxisKind::Pan => CALIBRATION_STALL_DELTA_PAN,
+        AxisKind::Tilt => CALIBRATION_STALL_DELTA_TILT,
+    }
 }
 
 fn read_axis_position(client: &Client, channel: u8, axis: AxisKind) -> AppResult<i64> {
@@ -745,6 +871,75 @@ struct AxisCountRange {
     max_count: i64,
 }
 
+#[derive(Debug, Clone, Copy)]
+struct AxisModelEstimate {
+    model: AxisModelParams,
+    residual_p95_count: i64,
+    fallback_blend_ratio: f64,
+    sample_count: usize,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct AxisQualityThreshold {
+    ratio: f64,
+    floor_count: i64,
+    ceiling_count: i64,
+}
+
+fn axis_quality_threshold(axis: AxisKind) -> AxisQualityThreshold {
+    match axis {
+        AxisKind::Pan => AxisQualityThreshold {
+            ratio: CALIBRATION_QUALITY_P95_MAX_RATIO_PAN,
+            floor_count: CALIBRATION_QUALITY_P95_FLOOR_PAN,
+            ceiling_count: CALIBRATION_QUALITY_P95_CEILING_PAN,
+        },
+        AxisKind::Tilt => AxisQualityThreshold {
+            ratio: CALIBRATION_QUALITY_P95_MAX_RATIO_TILT,
+            floor_count: CALIBRATION_QUALITY_P95_FLOOR_TILT,
+            ceiling_count: CALIBRATION_QUALITY_P95_CEILING_TILT,
+        },
+    }
+}
+
+fn axis_quality_threshold_count(axis: AxisKind, span: f64) -> i64 {
+    let threshold = axis_quality_threshold(axis);
+    let span_based = (span.abs() * threshold.ratio).round() as i64;
+    span_based
+        .clamp(threshold.floor_count, threshold.ceiling_count)
+        .max(1)
+}
+
+fn validate_measured_calibration_quality(
+    pan_span: f64,
+    tilt_span: f64,
+    pan_residual_p95_count: i64,
+    tilt_residual_p95_count: i64,
+) -> AppResult<()> {
+    let pan_threshold = axis_quality_threshold(AxisKind::Pan);
+    let tilt_threshold = axis_quality_threshold(AxisKind::Tilt);
+    let pan_max_allowed = axis_quality_threshold_count(AxisKind::Pan, pan_span);
+    let tilt_max_allowed = axis_quality_threshold_count(AxisKind::Tilt, tilt_span);
+
+    if pan_residual_p95_count <= pan_max_allowed && tilt_residual_p95_count <= tilt_max_allowed {
+        return Ok(());
+    }
+
+    Err(AppError::new(
+        ErrorKind::UnexpectedResponse,
+        format!(
+            "measured calibration rejected by quality gate: pan_p95={pan_residual_p95_count} (max={pan_max_allowed}, ratio={:.4}, floor={}, ceiling={}, span={:.0}); tilt_p95={tilt_residual_p95_count} (max={tilt_max_allowed}, ratio={:.4}, floor={}, ceiling={}, span={:.0})",
+            pan_threshold.ratio,
+            pan_threshold.floor_count,
+            pan_threshold.ceiling_count,
+            pan_span,
+            tilt_threshold.ratio,
+            tilt_threshold.floor_count,
+            tilt_threshold.ceiling_count,
+            tilt_span,
+        ),
+    ))
+}
+
 fn build_axis_count_range(
     range: Option<&NumericRange>,
     current_position: Option<i64>,
@@ -775,7 +970,16 @@ fn build_axis_count_range(
     }
 }
 
+#[cfg(test)]
 fn estimate_model_from_sweep(span: f64, sweep_deltas: &[f64]) -> AxisModelParams {
+    estimate_model_from_sweep_with_quality(AxisKind::Pan, span, sweep_deltas).model
+}
+
+fn estimate_model_from_sweep_with_quality(
+    axis: AxisKind,
+    span: f64,
+    sweep_deltas: &[f64],
+) -> AxisModelEstimate {
     let fallback = fallback_model_for_span(span);
     let mut samples = sweep_deltas
         .iter()
@@ -785,6 +989,35 @@ fn estimate_model_from_sweep(span: f64, sweep_deltas: &[f64]) -> AxisModelParams
     if samples.len() > CALIBRATION_MODEL_SAMPLE_COUNT {
         samples = evenly_spaced_samples(&samples, CALIBRATION_MODEL_SAMPLE_COUNT);
     }
+    if samples.len() < 2 {
+        return AxisModelEstimate {
+            model: fallback,
+            residual_p95_count: 0,
+            fallback_blend_ratio: 1.0,
+            sample_count: samples.len(),
+        };
+    }
+
+    let stabilized = winsorize_samples(&samples, CALIBRATION_MODEL_TRIM_RATIO);
+    let estimated = estimate_model_from_samples(axis, &stabilized, fallback);
+    let estimated_p95 = model_residual_p95_count(axis, &samples, estimated);
+    let fallback_blend_ratio = residual_fallback_blend_ratio(estimated_p95 as f64, span, &samples);
+    let blended = blend_axis_models(estimated, fallback, fallback_blend_ratio);
+    let blended_p95 = model_residual_p95_count(axis, &samples, blended);
+
+    AxisModelEstimate {
+        model: blended,
+        residual_p95_count: blended_p95,
+        fallback_blend_ratio,
+        sample_count: samples.len(),
+    }
+}
+
+fn estimate_model_from_samples(
+    axis: AxisKind,
+    samples: &[f64],
+    fallback: AxisModelParams,
+) -> AxisModelParams {
     if samples.len() < 2 {
         return fallback;
     }
@@ -803,14 +1036,116 @@ fn estimate_model_from_sweep(span: f64, sweep_deltas: &[f64]) -> AxisModelParams
 
     let alpha = (alpha_numer / alpha_denom).clamp(MODEL_ALPHA_MIN, MODEL_ALPHA_MAX);
     let mean_delta = samples.iter().sum::<f64>() / samples.len() as f64;
-    let velocity = mean_delta / calibration_effective_ts_sec();
-    let beta =
-        (velocity * (1.0 - alpha) / calibration_control_u()).clamp(MODEL_BETA_MIN, MODEL_BETA_MAX);
+    let velocity = mean_delta / calibration_effective_ts_sec(axis);
+    let beta = (velocity * (1.0 - alpha) / calibration_control_u(axis))
+        .clamp(MODEL_BETA_MIN, MODEL_BETA_MAX);
     if !alpha.is_finite() || !beta.is_finite() {
         return fallback;
     }
 
     AxisModelParams { alpha, beta }
+}
+
+fn winsorize_samples(samples: &[f64], trim_ratio: f64) -> Vec<f64> {
+    if samples.len() < 4 {
+        return samples.to_vec();
+    }
+
+    let trim = trim_ratio.clamp(0.0, 0.49);
+    let mut sorted = samples.to_vec();
+    sorted.sort_by(|lhs, rhs| lhs.total_cmp(rhs));
+    let lower = quantile_of_sorted_f64(&sorted, trim);
+    let upper = quantile_of_sorted_f64(&sorted, 1.0 - trim);
+    samples
+        .iter()
+        .map(|sample| sample.clamp(lower, upper))
+        .collect()
+}
+
+fn quantile_of_sorted_f64(sorted: &[f64], quantile: f64) -> f64 {
+    if sorted.is_empty() {
+        return 0.0;
+    }
+    if sorted.len() == 1 {
+        return sorted[0];
+    }
+
+    let q = quantile.clamp(0.0, 1.0);
+    let position = q * (sorted.len() - 1) as f64;
+    let lower_index = position.floor() as usize;
+    let upper_index = position.ceil() as usize;
+    if lower_index == upper_index {
+        return sorted[lower_index];
+    }
+
+    let fraction = position - lower_index as f64;
+    sorted[lower_index] + (sorted[upper_index] - sorted[lower_index]) * fraction
+}
+
+fn model_residual_p95_count(axis: AxisKind, samples: &[f64], model: AxisModelParams) -> i64 {
+    if samples.len() < 2 {
+        return 0;
+    }
+
+    let input_gain = model.beta * calibration_control_u(axis) * calibration_effective_ts_sec(axis);
+    let mut residuals = Vec::with_capacity(samples.len().saturating_sub(1));
+    for window in samples.windows(2) {
+        let predicted = model.alpha * window[0] + input_gain;
+        let residual = (window[1] - predicted).abs();
+        if residual.is_finite() {
+            residuals.push(residual);
+        }
+    }
+    percentile_count_from_f64(&residuals, 0.95)
+}
+
+fn percentile_count_from_f64(samples: &[f64], quantile: f64) -> i64 {
+    if samples.is_empty() {
+        return 0;
+    }
+
+    let mut sorted = samples.to_vec();
+    sorted.sort_by(|lhs, rhs| lhs.total_cmp(rhs));
+    let q = quantile.clamp(0.0, 1.0);
+    let index = ((sorted.len().saturating_sub(1)) as f64 * q).ceil() as usize;
+    let bounded_index = index.min(sorted.len().saturating_sub(1));
+    sorted[bounded_index].round().max(0.0) as i64
+}
+
+fn residual_fallback_blend_ratio(residual_p95: f64, span: f64, samples: &[f64]) -> f64 {
+    if !residual_p95.is_finite() {
+        return 1.0;
+    }
+
+    let mean_delta = if samples.is_empty() {
+        0.0
+    } else {
+        samples.iter().sum::<f64>() / samples.len() as f64
+    };
+    let start = CALIBRATION_MODEL_RESIDUAL_BLEND_MIN_COUNT.max(
+        (span.abs() * CALIBRATION_MODEL_RESIDUAL_BLEND_START_RATIO)
+            .max(mean_delta * CALIBRATION_MODEL_RESIDUAL_BLEND_START_MULTIPLIER),
+    );
+    let end = (start + 1.0).max(
+        (span.abs() * CALIBRATION_MODEL_RESIDUAL_BLEND_END_RATIO)
+            .max(mean_delta * CALIBRATION_MODEL_RESIDUAL_BLEND_END_MULTIPLIER),
+    );
+
+    ((residual_p95 - start) / (end - start)).clamp(0.0, 1.0)
+}
+
+fn blend_axis_models(
+    estimated: AxisModelParams,
+    fallback: AxisModelParams,
+    blend_ratio: f64,
+) -> AxisModelParams {
+    let blend = blend_ratio.clamp(0.0, 1.0);
+    let keep = 1.0 - blend;
+    AxisModelParams {
+        alpha: (estimated.alpha * keep + fallback.alpha * blend)
+            .clamp(MODEL_ALPHA_MIN, MODEL_ALPHA_MAX),
+        beta: (estimated.beta * keep + fallback.beta * blend).clamp(MODEL_BETA_MIN, MODEL_BETA_MAX),
+    }
 }
 
 fn evenly_spaced_samples(samples: &[f64], target_count: usize) -> Vec<f64> {
@@ -841,14 +1176,14 @@ fn fallback_model_for_span(span: f64) -> AxisModelParams {
     }
 }
 
-fn calibration_control_u() -> f64 {
-    let speed_factor = (CALIBRATION_PULSE_SPEED as f64 / 64.0).clamp(0.0, 1.0);
-    let pulse_factor = (CALIBRATION_PULSE_MS as f64 / 120.0).clamp(0.5, 1.5);
+fn calibration_control_u(axis: AxisKind) -> f64 {
+    let speed_factor = (calibration_pulse_speed(axis) as f64 / 64.0).clamp(0.0, 1.0);
+    let pulse_factor = (calibration_pulse_ms(axis) as f64 / 120.0).clamp(0.5, 1.5);
     (speed_factor * pulse_factor).clamp(1e-3, 1.0)
 }
 
-fn calibration_effective_ts_sec() -> f64 {
-    ((CALIBRATION_PULSE_MS + CALIBRATION_SETTLE_MS) as f64 / 1_000.0).clamp(0.05, 0.5)
+fn calibration_effective_ts_sec(axis: AxisKind) -> f64 {
+    ((calibration_pulse_ms(axis) + CALIBRATION_SETTLE_MS) as f64 / 1_000.0).clamp(0.05, 0.5)
 }
 
 fn save_stored_calibration(path: &Path, stored: &StoredCalibration) -> AppResult<()> {

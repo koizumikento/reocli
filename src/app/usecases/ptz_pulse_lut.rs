@@ -33,6 +33,21 @@ impl AxisPulseLut {
         }
     }
 
+    pub(crate) fn from_seed_and_rates(
+        model_beta: f64,
+        positive_counts_per_ms: Option<f64>,
+        negative_counts_per_ms: Option<f64>,
+    ) -> Self {
+        let mut lut = Self::seeded(model_beta);
+        if let Some(value) = sanitize_stored_rate(positive_counts_per_ms) {
+            lut.positive_counts_per_ms = value;
+        }
+        if let Some(value) = sanitize_stored_rate(negative_counts_per_ms) {
+            lut.negative_counts_per_ms = value;
+        }
+        lut
+    }
+
     pub fn counts_per_ms(&self, direction: AxisDirection) -> f64 {
         match direction {
             AxisDirection::Positive => self.positive_counts_per_ms,
@@ -101,6 +116,14 @@ fn sample_rate_from_observation(pulse_ms: u64, observed_delta_count: f64) -> Opt
         return None;
     }
     Some(sample_rate.clamp(COUNTS_PER_MS_MIN, COUNTS_PER_MS_MAX))
+}
+
+fn sanitize_stored_rate(value: Option<f64>) -> Option<f64> {
+    let value = value?;
+    if !value.is_finite() {
+        return None;
+    }
+    Some(value.clamp(COUNTS_PER_MS_MIN, COUNTS_PER_MS_MAX))
 }
 
 fn normalize_pulse_bounds(min_ms: u64, max_ms: u64) -> (u64, u64) {

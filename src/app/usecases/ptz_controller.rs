@@ -18,8 +18,14 @@ const EKF_MAX_Q_SCALE: f64 = 8.0;
 const EKF_ADAPTATION_LAMBDA: f64 = 0.08;
 const EKF_NIS_UPPER: f64 = 1.6;
 const EKF_NIS_LOWER: f64 = 0.7;
+const EKF_NIS_HARD_GATE: f64 = 9.0;
 const EKF_Q_SCALE_GROWTH: f64 = 1.08;
 const EKF_Q_SCALE_DECAY: f64 = 0.97;
+const EKF_CONSISTENCY_EWMA_ALPHA: f64 = 0.08;
+const EKF_MEASUREMENT_HINT_MIN_SCALE: f64 = 0.75;
+const EKF_MEASUREMENT_HINT_MAX_SCALE: f64 = 1.8;
+const EKF_MEASUREMENT_HINT_BLEND_ALPHA: f64 = 0.35;
+const EKF_MAX_RESIDUAL_VARIANCE_PROXY: f64 = EKF_MAX_MEASUREMENT_R * 4.0;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct AxisControllerConfig {
@@ -129,6 +135,9 @@ pub struct AxisEkf {
     covariance: [[f64; 3]; 3],
     adaptive_r: f64,
     adaptive_q_scale: f64,
+    last_nis: f64,
+    ewma_nis: f64,
+    residual_variance_proxy: f64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -137,6 +146,17 @@ pub struct AxisEkfSnapshot {
     pub covariance: [[f64; 3]; 3],
     pub adaptive_r: f64,
     pub adaptive_q_scale: f64,
+    pub last_nis: Option<f64>,
+    pub ewma_nis: Option<f64>,
+    pub residual_variance_proxy: Option<f64>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct AxisEkfConsistency {
+    pub last_nis: f64,
+    pub ewma_nis: f64,
+    pub residual_variance_proxy: f64,
+    pub adaptive_r: f64,
 }
 
 impl AxisEkf {
@@ -159,6 +179,11 @@ impl AxisEkf {
                 .r_measurement
                 .clamp(EKF_MIN_MEASUREMENT_R, EKF_MAX_MEASUREMENT_R),
             adaptive_q_scale: 1.0,
+            last_nis: 1.0,
+            ewma_nis: 1.0,
+            residual_variance_proxy: config
+                .r_measurement
+                .clamp(EKF_MIN_MEASUREMENT_R, EKF_MAX_RESIDUAL_VARIANCE_PROXY),
         }
     }
 
@@ -170,12 +195,44 @@ impl AxisEkf {
         output_from_state(self.state)
     }
 
+    pub fn consistency(&self) -> AxisEkfConsistency {
+        AxisEkfConsistency {
+            last_nis: self.last_nis,
+            ewma_nis: self.ewma_nis,
+            residual_variance_proxy: self.residual_variance_proxy,
+            adaptive_r: self.adaptive_r,
+        }
+    }
+
+    pub fn apply_measurement_noise_hint(&mut self, scale: f64) {
+        if !scale.is_finite() {
+            return;
+        }
+        let bounded_scale = scale.clamp(
+            EKF_MEASUREMENT_HINT_MIN_SCALE,
+            EKF_MEASUREMENT_HINT_MAX_SCALE,
+        );
+        let alpha = EKF_MEASUREMENT_HINT_BLEND_ALPHA.clamp(0.0, 1.0);
+        let target_r =
+            (self.adaptive_r * bounded_scale).clamp(EKF_MIN_MEASUREMENT_R, EKF_MAX_MEASUREMENT_R);
+        self.adaptive_r = ((1.0 - alpha) * self.adaptive_r + alpha * target_r)
+            .clamp(EKF_MIN_MEASUREMENT_R, EKF_MAX_MEASUREMENT_R);
+        let target_residual = (self.residual_variance_proxy * bounded_scale)
+            .clamp(EKF_MIN_MEASUREMENT_R, EKF_MAX_RESIDUAL_VARIANCE_PROXY);
+        self.residual_variance_proxy = ((1.0 - alpha) * self.residual_variance_proxy
+            + alpha * target_residual)
+            .clamp(EKF_MIN_MEASUREMENT_R, EKF_MAX_RESIDUAL_VARIANCE_PROXY);
+    }
+
     pub fn snapshot(&self) -> AxisEkfSnapshot {
         AxisEkfSnapshot {
             state: self.state,
             covariance: self.covariance,
             adaptive_r: self.adaptive_r,
             adaptive_q_scale: self.adaptive_q_scale,
+            last_nis: Some(self.last_nis),
+            ewma_nis: Some(self.ewma_nis),
+            residual_variance_proxy: Some(self.residual_variance_proxy),
         }
     }
 
@@ -184,10 +241,16 @@ impl AxisEkf {
         model: AxisModelParams,
         snapshot: AxisEkfSnapshot,
     ) -> Option<Self> {
+        let last_nis_ok = snapshot.last_nis.is_none_or(f64::is_finite);
+        let ewma_nis_ok = snapshot.ewma_nis.is_none_or(f64::is_finite);
+        let residual_variance_ok = snapshot.residual_variance_proxy.is_none_or(f64::is_finite);
         if !is_finite_state(snapshot.state)
             || !is_finite_covariance(snapshot.covariance)
             || !snapshot.adaptive_r.is_finite()
             || !snapshot.adaptive_q_scale.is_finite()
+            || !last_nis_ok
+            || !ewma_nis_ok
+            || !residual_variance_ok
         {
             return None;
         }
@@ -216,6 +279,12 @@ impl AxisEkf {
             adaptive_q_scale: snapshot
                 .adaptive_q_scale
                 .clamp(EKF_MIN_Q_SCALE, EKF_MAX_Q_SCALE),
+            last_nis: snapshot.last_nis.unwrap_or(1.0).clamp(0.0, 1_000.0),
+            ewma_nis: snapshot.ewma_nis.unwrap_or(1.0).clamp(0.0, 1_000.0),
+            residual_variance_proxy: snapshot
+                .residual_variance_proxy
+                .unwrap_or(snapshot.adaptive_r)
+                .clamp(EKF_MIN_MEASUREMENT_R, EKF_MAX_RESIDUAL_VARIANCE_PROXY),
         })
     }
 
@@ -277,20 +346,49 @@ impl AxisEkf {
         let measurement_r = self
             .adaptive_r
             .clamp(EKF_MIN_MEASUREMENT_R, EKF_MAX_MEASUREMENT_R);
-        let s = dot_3(h, ph_t) + measurement_r.max(1e-6);
-        let gain = scale_3(ph_t, 1.0 / s);
-
-        let corrected_state = AxisState {
-            position: (predicted_state.position + gain[0] * innovation)
-                .clamp(self.config.min_position, self.config.max_position),
-            velocity: (predicted_state.velocity + gain[1] * innovation)
-                .clamp(self.config.min_velocity, self.config.max_velocity),
-            bias: (predicted_state.bias + gain[2] * innovation)
-                .clamp(self.config.min_bias, self.config.max_bias),
+        let s_raw = dot_3(h, ph_t) + measurement_r.max(1e-6);
+        let s = if s_raw.is_finite() {
+            s_raw.max(1e-6)
+        } else {
+            1e-6
         };
+        let residual_energy = innovation * innovation;
+        let nis = if residual_energy.is_finite() {
+            residual_energy / s
+        } else {
+            f64::INFINITY
+        };
+        let measurement_rejected = !nis.is_finite() || nis > EKF_NIS_HARD_GATE;
 
-        let kh = outer_3x3(gain, h);
-        let p_corr = mul_3x3(sub_3x3(identity_3(), kh), p_pred);
+        let (corrected_state, p_corr) = if measurement_rejected {
+            (
+                AxisState {
+                    position: predicted_state
+                        .position
+                        .clamp(self.config.min_position, self.config.max_position),
+                    velocity: predicted_state
+                        .velocity
+                        .clamp(self.config.min_velocity, self.config.max_velocity),
+                    bias: predicted_state
+                        .bias
+                        .clamp(self.config.min_bias, self.config.max_bias),
+                },
+                p_pred,
+            )
+        } else {
+            let gain = scale_3(ph_t, 1.0 / s);
+            let corrected_state = AxisState {
+                position: (predicted_state.position + gain[0] * innovation)
+                    .clamp(self.config.min_position, self.config.max_position),
+                velocity: (predicted_state.velocity + gain[1] * innovation)
+                    .clamp(self.config.min_velocity, self.config.max_velocity),
+                bias: (predicted_state.bias + gain[2] * innovation)
+                    .clamp(self.config.min_bias, self.config.max_bias),
+            };
+            let kh = outer_3x3(gain, h);
+            let p_corr = mul_3x3(sub_3x3(identity_3(), kh), p_pred);
+            (corrected_state, p_corr)
+        };
 
         self.state = corrected_state;
         self.covariance = p_corr;
@@ -316,12 +414,44 @@ impl AxisEkf {
     }
 
     fn adapt_noise(&mut self, innovation: f64, innovation_variance: f64) {
-        let residual_energy = innovation * innovation;
+        let residual_energy = if innovation.is_finite() {
+            let squared = innovation * innovation;
+            if squared.is_finite() {
+                squared.max(0.0)
+            } else {
+                f64::MAX
+            }
+        } else {
+            f64::MAX
+        };
+        let safe_innovation_variance = if innovation_variance.is_finite() {
+            innovation_variance.max(1e-6)
+        } else {
+            1e-6
+        };
         let lambda = EKF_ADAPTATION_LAMBDA;
-        self.adaptive_r = ((1.0 - lambda) * self.adaptive_r + lambda * residual_energy)
+
+        let nis = (residual_energy / safe_innovation_variance).clamp(0.0, 1_000.0);
+        self.last_nis = nis;
+        let ewma_nis =
+            (1.0 - EKF_CONSISTENCY_EWMA_ALPHA) * self.ewma_nis + EKF_CONSISTENCY_EWMA_ALPHA * nis;
+        self.ewma_nis = if ewma_nis.is_finite() {
+            ewma_nis.clamp(0.0, 1_000.0)
+        } else {
+            1_000.0
+        };
+        let residual_energy = residual_energy.clamp(0.0, EKF_MAX_RESIDUAL_VARIANCE_PROXY);
+        let residual_variance_proxy =
+            (1.0 - lambda) * self.residual_variance_proxy + lambda * residual_energy;
+        self.residual_variance_proxy = if residual_variance_proxy.is_finite() {
+            residual_variance_proxy.clamp(EKF_MIN_MEASUREMENT_R, EKF_MAX_RESIDUAL_VARIANCE_PROXY)
+        } else {
+            EKF_MAX_RESIDUAL_VARIANCE_PROXY
+        };
+        self.adaptive_r = self
+            .residual_variance_proxy
             .clamp(EKF_MIN_MEASUREMENT_R, EKF_MAX_MEASUREMENT_R);
 
-        let nis = residual_energy / innovation_variance.max(1e-6);
         if nis > EKF_NIS_UPPER {
             self.adaptive_q_scale = (self.adaptive_q_scale * EKF_Q_SCALE_GROWTH)
                 .clamp(EKF_MIN_Q_SCALE, EKF_MAX_Q_SCALE);

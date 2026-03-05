@@ -148,3 +148,42 @@ cargo test --test live_smoke -- --nocapture
 - `REOCLI_PTZ_BACKEND=onvif` の場合、目標近傍では ONVIF `RelativeMove` を優先します。
 - ただし `supports_relative_pan_tilt_translation=false` かつ `has_timeout_range=true` で `timeout_min >= PT1S` の機種では、`set-absolute` のパルス移動/停止は CGI に自動フォールバックします。
 - 判定に使う値は `REOCLI_PTZ_BACKEND=onvif reocli ptz onvif options --channel <ch>` で確認できます。
+
+## PTZ Random Re-eval Script
+
+`scripts/ptz/re_eval_random.sh` で、`random_round_<n>.tsv` を使った再キャリブレーション + 再評価を実行できます。
+
+前提:
+
+```bash
+cargo build --bin reocli
+```
+
+実行例:
+
+```bash
+ROUND_DIR=/path/to/random_rounds \
+ROUND_COUNT=5 \
+REOCLI_ENDPOINT=https://192.168.0.220 \
+REOCLI_USER=admin \
+REOCLI_PASSWORD='******' \
+REOCLI_PTZ_BACKEND=onvif \
+./scripts/ptz/re_eval_random.sh
+```
+
+主な環境変数:
+
+- `ROUND_DIR` (必須): `random_round_1.tsv` などがあるディレクトリ
+- `ROUND_COUNT` (既定 `5`)
+- `SKIP_CALIB=1`: キャリブレーションをスキップ
+- `STRICT_PAN_MAX` / `STRICT_TILT_MAX` (既定 `50` / `50`)
+- `TOL_COUNT` / `TIMEOUT_MS` (`set-absolute` の制御パラメータ)
+- `SETTLE_EVAL_MODE` (`return_only` | `post_get_once` | `post_get_stable`)
+- `RESET_EKF=1`: EKF state (`<endpoint>.ch<channel>.ekf-count.json`) を実行前に削除
+- `ISOLATE_STATE=auto|1|0` (既定 `auto`): `auto` は `SKIP_CALIB!=1` のとき一時ディレクトリで calibration/EKF state を隔離
+
+出力:
+
+- `REVAL_RESULT_DIR`: 実行結果ディレクトリ
+- `REVAL_RESULTS_TSV`: 詳細 TSV
+- `REVAL_SUMMARY_TXT`: 集計サマリ
