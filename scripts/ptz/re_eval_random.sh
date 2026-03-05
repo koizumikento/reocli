@@ -20,6 +20,7 @@ STRICT_TILT_MAX="${STRICT_TILT_MAX:-24}"
 SKIP_CALIB="${SKIP_CALIB:-0}"
 RESET_EKF="${RESET_EKF:-0}"
 ISOLATE_STATE="${ISOLATE_STATE:-auto}"
+# modes: return_only | post_get_once | post_get_stable | post_get_stable_median
 SETTLE_EVAL_MODE="${SETTLE_EVAL_MODE:-return_only}"
 SETTLE_POLL_MAX="${SETTLE_POLL_MAX:-8}"
 SETTLE_STABLE_HITS="${SETTLE_STABLE_HITS:-1}"
@@ -185,6 +186,21 @@ stats_sum_line() {
   echo "${label}_n=${n} median=${median} p95=${p95v} mean=${mean}"
 }
 
+median_from_lines() {
+  local lines="$1"
+  local sorted
+  sorted=$(printf '%s\n' "$lines" | sed '/^$/d' | sort -n)
+  local n
+  n=$(printf '%s\n' "$sorted" | sed '/^$/d' | wc -l | tr -d ' ')
+  if [ "$n" -eq 0 ]; then
+    echo ""
+    return
+  fi
+  local mid
+  mid=$(((n + 1) / 2))
+  printf '%s\n' "$sorted" | sed -n "${mid}p"
+}
+
 echo -e "round\tseq\ttarget_pan\ttarget_tilt\tset_status\telapsed_ms\tfinal_pan\tfinal_tilt\tpan_abs_err\ttilt_abs_err\tset_output\tret_pan\tret_tilt\tobs_pan\tobs_tilt\teval_mode\tsettle_polls\tret_pan_abs_err\tret_tilt_abs_err" > "$RESULTS_TSV"
 
 if [ "$RESET_EKF" = "1" ]; then
@@ -288,6 +304,56 @@ for round in $(seq 1 "$ROUND_COUNT"); do
             break
           fi
         done
+        ;;
+      post_get_stable_median)
+        prev_pan=""
+        prev_tilt=""
+        stable_hits=0
+        last_valid_pan=""
+        last_valid_tilt=""
+        stable_window_pan=""
+        stable_window_tilt=""
+        for poll in $(seq 1 "$SETTLE_POLL_MAX"); do
+          sleep "$SETTLE_SLEEP_SEC"
+          settle_polls=$poll
+          pos_out=$(run_reocli ptz get-absolute --channel "$CHANNEL" 2>&1 || true)
+          cand_pan=$(printf '%s\n' "$pos_out" | sed -n 's/.*pan_count=\([-0-9]*\).*/\1/p' | tail -n1)
+          cand_tilt=$(printf '%s\n' "$pos_out" | sed -n 's/.*tilt_count=\([-0-9]*\).*/\1/p' | tail -n1)
+          if [ -z "$cand_pan" ] || [ -z "$cand_tilt" ]; then
+            continue
+          fi
+
+          obs_pan="$cand_pan"
+          obs_tilt="$cand_tilt"
+          last_valid_pan="$cand_pan"
+          last_valid_tilt="$cand_tilt"
+
+          if [ "$prev_pan" = "$cand_pan" ] && [ "$prev_tilt" = "$cand_tilt" ]; then
+            stable_hits=$((stable_hits + 1))
+            stable_window_pan=$(printf '%s\n%s\n' "$stable_window_pan" "$cand_pan")
+            stable_window_tilt=$(printf '%s\n%s\n' "$stable_window_tilt" "$cand_tilt")
+          else
+            stable_hits=0
+            stable_window_pan="$cand_pan"
+            stable_window_tilt="$cand_tilt"
+          fi
+
+          prev_pan="$cand_pan"
+          prev_tilt="$cand_tilt"
+          if [ "$stable_hits" -ge "$SETTLE_STABLE_HITS" ]; then
+            break
+          fi
+        done
+
+        med_pan=$(median_from_lines "$stable_window_pan")
+        med_tilt=$(median_from_lines "$stable_window_tilt")
+        if [ -n "$med_pan" ] && [ -n "$med_tilt" ]; then
+          obs_pan="$med_pan"
+          obs_tilt="$med_tilt"
+        elif [ -n "$last_valid_pan" ] && [ -n "$last_valid_tilt" ]; then
+          obs_pan="$last_valid_pan"
+          obs_tilt="$last_valid_tilt"
+        fi
         ;;
       *)
         echo "invalid SETTLE_EVAL_MODE: $SETTLE_EVAL_MODE" >&2
