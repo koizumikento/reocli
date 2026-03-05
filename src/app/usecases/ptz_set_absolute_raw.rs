@@ -106,8 +106,6 @@ const CALIBRATION_DEADBAND_HINT_MAX_COUNT: f64 = 200.0;
 const CALIBRATION_GUARD_DEADBAND_RATIO: f64 = 0.45;
 const SUCCESS_TOLERANCE_DEADBAND_MARGIN_RATIO: f64 = 0.3;
 const SUCCESS_TOLERANCE_DEADBAND_MAX_COUNT: f64 = 60.0;
-const STRICT_SUCCESS_PAN_COUNT: f64 = 20.0;
-const STRICT_SUCCESS_TILT_COUNT: f64 = 20.0;
 
 const DEFAULT_PAN_MIN_COUNT: f64 = 0.0;
 const DEFAULT_PAN_MAX_COUNT: f64 = 7360.0;
@@ -139,6 +137,7 @@ const EKF_MAX_R_MEASUREMENT: f64 = 30.0;
 const SUCCESS_LATCH_MIN_SETTLING_STEPS: usize = 1;
 const SUCCESS_LATCH_CURRENT_NORM_MAX: f64 = 0.04;
 const SUCCESS_LATCH_STAGNATION_MIN_BEST_AGE_STEPS: usize = 6;
+const SUCCESS_LATCH_STAGNATION_NEAR_MISS_MARGIN_COUNT: f64 = 8.0;
 const STRICT_COMPLETION_GRACE_STEPS: usize = 3;
 const OSCILLATION_STABLE_STEP_REDUCTION_REVERSAL_SUM: usize = 6;
 const SECONDARY_AXIS_INTERLEAVE_INTERVAL_MIN: usize = 1;
@@ -652,8 +651,7 @@ fn run_closed_loop(
         deadband_hints.tilt_count,
         tolerance_count as f64,
     );
-    let strict_pan_tolerance = STRICT_SUCCESS_PAN_COUNT;
-    let strict_tilt_tolerance = STRICT_SUCCESS_TILT_COUNT;
+    let (strict_pan_tolerance, strict_tilt_tolerance) = strict_success_tolerances();
     let pan_model = saved_calibration
         .as_ref()
         .map(|stored| sanitize_model_params(stored.calibration.pan_model, pan_span))
@@ -1071,7 +1069,14 @@ fn run_closed_loop(
                 success_latch_stagnation_ready(best_age_steps, backend_motion_hint);
             let best_within_success_tol =
                 best_within_success_tolerance(best, strict_pan_tolerance, strict_tilt_tolerance);
-            if stagnation_ready && best_within_success_tol {
+            let near_miss_latch_eligible = stagnation_near_miss_latch_eligible(
+                best,
+                strict_pan_tolerance,
+                strict_tilt_tolerance,
+                stagnation_ready,
+                backend_motion_hint,
+            );
+            if (stagnation_ready && best_within_success_tol) || near_miss_latch_eligible {
                 let success_position = PtzRawPosition {
                     channel: current.channel,
                     pan_count: best.pan_count,
@@ -1109,12 +1114,23 @@ fn run_closed_loop(
             });
             let best_within_success_tol =
                 best_within_success_tolerance(best, strict_pan_tolerance, strict_tilt_tolerance);
-            let latch_eligible = best_within_success_tol
-                && (success_latch_ready(
-                    position_settling.stable_steps(),
-                    measured_error_norm,
-                    backend_motion_hint,
-                ) || success_latch_stagnation_ready(best_age_steps, backend_motion_hint));
+            let stagnation_ready =
+                success_latch_stagnation_ready(best_age_steps, backend_motion_hint);
+            let near_miss_latch_eligible = stagnation_near_miss_latch_eligible(
+                best,
+                strict_pan_tolerance,
+                strict_tilt_tolerance,
+                stagnation_ready,
+                backend_motion_hint,
+            );
+            let latch_eligible = timeout_latch_eligible(
+                position_settling.stable_steps(),
+                measured_error_norm,
+                best_within_success_tol,
+                stagnation_ready,
+                near_miss_latch_eligible,
+                backend_motion_hint,
+            );
             if (within_strict_tolerance && backend_completion_with_grace) || latch_eligible {
                 let success_position = if within_strict_tolerance && backend_completion_with_grace {
                     current.clone()
@@ -1649,6 +1665,11 @@ fn sanitize_stored_beta(value: Option<f64>) -> Option<f64> {
     Some(value.clamp(MODEL_BETA_MIN, MODEL_BETA_MAX))
 }
 
+fn strict_success_tolerances() -> (f64, f64) {
+    let thresholds = runtime::ptz_strict_success_thresholds_from_env();
+    (thresholds.pan_count, thresholds.tilt_count)
+}
+
 fn best_within_success_tolerance(
     best: BestObservedState,
     pan_success_tolerance: f64,
@@ -1684,7 +1705,6 @@ fn success_latch_stagnation_ready(
     best_age_steps >= SUCCESS_LATCH_STAGNATION_MIN_BEST_AGE_STEPS
 }
 
-#[cfg(test)]
 fn best_stagnation_near_miss_eligible(
     best: BestObservedState,
     pan_success_tolerance: f64,
@@ -1705,6 +1725,46 @@ fn best_stagnation_near_miss_eligible(
         return false;
     }
     pan_excess.max(tilt_excess) <= margin_count
+}
+
+fn backend_hint_unavailable_or_unknown(
+    backend_hint: Option<ptz_transport::TransportMotionHint>,
+) -> bool {
+    backend_hint.and_then(|hint| hint.moving).is_none()
+}
+
+fn stagnation_near_miss_latch_eligible(
+    best: BestObservedState,
+    pan_success_tolerance: f64,
+    tilt_success_tolerance: f64,
+    stagnation_ready: bool,
+    backend_hint: Option<ptz_transport::TransportMotionHint>,
+) -> bool {
+    if !stagnation_ready || !backend_hint_unavailable_or_unknown(backend_hint) {
+        return false;
+    }
+    best_stagnation_near_miss_eligible(
+        best,
+        pan_success_tolerance,
+        tilt_success_tolerance,
+        SUCCESS_LATCH_STAGNATION_NEAR_MISS_MARGIN_COUNT,
+    )
+}
+
+fn timeout_latch_eligible(
+    settling_steps: usize,
+    measured_error_norm: f64,
+    best_within_success_tol: bool,
+    stagnation_ready: bool,
+    near_miss_latch_eligible: bool,
+    backend_hint: Option<ptz_transport::TransportMotionHint>,
+) -> bool {
+    if near_miss_latch_eligible {
+        return true;
+    }
+    best_within_success_tol
+        && (success_latch_ready(settling_steps, measured_error_norm, backend_hint)
+            || stagnation_ready)
 }
 
 fn timeout_blocker_label(

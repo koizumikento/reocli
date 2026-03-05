@@ -14,11 +14,15 @@ const PTZ_BACKEND_ENV: &str = "REOCLI_PTZ_BACKEND";
 const ONVIF_DEVICE_SERVICE_URL_ENV: &str = "REOCLI_ONVIF_DEVICE_SERVICE_URL";
 const ONVIF_PROFILE_TOKEN_ENV: &str = "REOCLI_ONVIF_PROFILE_TOKEN";
 const ONVIF_PORT_ENV: &str = "REOCLI_ONVIF_PORT";
+const PTZ_STRICT_SUCCESS_PAN_COUNT_ENV: &str = "REOCLI_PTZ_STRICT_SUCCESS_PAN_COUNT";
+const PTZ_STRICT_SUCCESS_TILT_COUNT_ENV: &str = "REOCLI_PTZ_STRICT_SUCCESS_TILT_COUNT";
 const HOME_ENV: &str = "HOME";
 const DEFAULT_USER: &str = "admin";
 const DEFAULT_TOKEN_CACHE_SUBDIR: &str = ".reocli/tokens";
 const DEFAULT_CALIBRATION_SUBDIR: &str = ".reocli/calibration";
 const DEFAULT_ONVIF_PORT: u16 = 8_000;
+const DEFAULT_PTZ_STRICT_SUCCESS_PAN_COUNT: f64 = 50.0;
+const DEFAULT_PTZ_STRICT_SUCCESS_TILT_COUNT: f64 = 24.0;
 const UNKNOWN_KEY_COMPONENT: &str = "unknown";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -33,6 +37,12 @@ pub(crate) struct OnvifConfig {
     pub user_name: String,
     pub password: String,
     pub profile_token: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct PtzStrictSuccessThresholds {
+    pub pan_count: f64,
+    pub tilt_count: f64,
 }
 
 pub(crate) fn client_from_env() -> Client {
@@ -105,6 +115,19 @@ pub(crate) fn onvif_config_from_env() -> Option<OnvifConfig> {
         password,
         profile_token,
     })
+}
+
+pub(crate) fn ptz_strict_success_thresholds_from_env() -> PtzStrictSuccessThresholds {
+    PtzStrictSuccessThresholds {
+        pan_count: parse_positive_f64_or_default(
+            env_var_trimmed(PTZ_STRICT_SUCCESS_PAN_COUNT_ENV).as_deref(),
+            DEFAULT_PTZ_STRICT_SUCCESS_PAN_COUNT,
+        ),
+        tilt_count: parse_positive_f64_or_default(
+            env_var_trimmed(PTZ_STRICT_SUCCESS_TILT_COUNT_ENV).as_deref(),
+            DEFAULT_PTZ_STRICT_SUCCESS_TILT_COUNT,
+        ),
+    }
 }
 
 fn endpoint_from_env() -> String {
@@ -189,6 +212,12 @@ fn env_var_trimmed(name: &str) -> Option<String> {
         .filter(|value| !value.is_empty())
 }
 
+fn parse_positive_f64_or_default(raw: Option<&str>, default_value: f64) -> f64 {
+    raw.and_then(|value| value.parse::<f64>().ok())
+        .filter(|value| value.is_finite() && *value > 0.0)
+        .unwrap_or(default_value)
+}
+
 fn sanitize_key_component(raw: &str) -> String {
     let mut normalized = String::with_capacity(raw.len());
     let mut previous_was_separator = false;
@@ -208,5 +237,27 @@ fn sanitize_key_component(raw: &str) -> String {
         UNKNOWN_KEY_COMPONENT.to_string()
     } else {
         trimmed.to_string()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_positive_f64_or_default;
+
+    #[test]
+    fn parse_positive_f64_or_default_accepts_positive_finite_values() {
+        assert_eq!(parse_positive_f64_or_default(Some("50"), 24.0), 50.0);
+        assert_eq!(parse_positive_f64_or_default(Some("24.5"), 10.0), 24.5);
+    }
+
+    #[test]
+    fn parse_positive_f64_or_default_falls_back_on_invalid_values() {
+        assert_eq!(parse_positive_f64_or_default(None, 24.0), 24.0);
+        assert_eq!(parse_positive_f64_or_default(Some(""), 24.0), 24.0);
+        assert_eq!(parse_positive_f64_or_default(Some("abc"), 24.0), 24.0);
+        assert_eq!(parse_positive_f64_or_default(Some("0"), 24.0), 24.0);
+        assert_eq!(parse_positive_f64_or_default(Some("-1"), 24.0), 24.0);
+        assert_eq!(parse_positive_f64_or_default(Some("NaN"), 24.0), 24.0);
+        assert_eq!(parse_positive_f64_or_default(Some("inf"), 24.0), 24.0);
     }
 }

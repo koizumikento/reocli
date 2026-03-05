@@ -22,9 +22,11 @@ use super::{
     remaining_control_step_sleep_duration, required_stable_steps_for_oscillation,
     save_stored_ekf_state, secondary_axis_interleave_interval,
     select_command_with_edge_push_lockout, select_control_error,
-    should_force_cgi_for_onvif_options, should_retry_after_timeout, stale_status_detected,
-    strict_axis_focus_command, success_latch_ready, success_latch_stagnation_ready,
-    timeout_blocker_label, timeout_retry_budget_ms, update_reversal_counter,
+    should_force_cgi_for_onvif_options, should_retry_after_timeout,
+    stagnation_near_miss_latch_eligible, stale_status_detected, strict_axis_focus_command,
+    strict_success_tolerances, success_latch_ready, success_latch_stagnation_ready,
+    timeout_blocker_label, timeout_latch_eligible, timeout_retry_budget_ms,
+    update_reversal_counter,
 };
 use crate::app::usecases::ptz_controller::AxisEkf;
 use crate::app::usecases::ptz_pulse_lut::AxisPulseLut;
@@ -165,6 +167,13 @@ fn forced_secondary_axis_command_uses_strict_threshold_in_endgame() {
         .map(|(direction, _)| direction);
     }
     assert_eq!(forced, Some(PtzDirection::Up));
+}
+
+#[test]
+fn strict_success_tolerances_defaults_match_runtime_defaults() {
+    let (pan, tilt) = strict_success_tolerances();
+    assert_eq!(pan, 50.0);
+    assert_eq!(tilt, 24.0);
 }
 
 #[test]
@@ -404,6 +413,108 @@ fn best_stagnation_near_miss_allows_single_axis_small_overrun_only() {
         120.0,
         68.0,
         8.0
+    ));
+}
+
+#[test]
+fn stagnation_near_miss_latch_requires_unknown_backend_hint_and_stagnation() {
+    let near_miss_best = super::BestObservedState {
+        pan_count: 0,
+        tilt_count: 0,
+        pan_abs_error: 54,
+        tilt_abs_error: 20,
+    };
+    let unknown_hint = Some(crate::app::usecases::ptz_transport::TransportMotionHint {
+        moving: None,
+        move_age_ms: Some(180),
+    });
+    let known_stopped_hint = Some(crate::app::usecases::ptz_transport::TransportMotionHint {
+        moving: Some(false),
+        move_age_ms: Some(180),
+    });
+    let moving_hint = Some(crate::app::usecases::ptz_transport::TransportMotionHint {
+        moving: Some(true),
+        move_age_ms: Some(40),
+    });
+
+    assert!(stagnation_near_miss_latch_eligible(
+        near_miss_best,
+        50.0,
+        24.0,
+        true,
+        None
+    ));
+    assert!(stagnation_near_miss_latch_eligible(
+        near_miss_best,
+        50.0,
+        24.0,
+        true,
+        unknown_hint
+    ));
+    assert!(!stagnation_near_miss_latch_eligible(
+        near_miss_best,
+        50.0,
+        24.0,
+        true,
+        known_stopped_hint
+    ));
+    assert!(!stagnation_near_miss_latch_eligible(
+        near_miss_best,
+        50.0,
+        24.0,
+        true,
+        moving_hint
+    ));
+    assert!(!stagnation_near_miss_latch_eligible(
+        near_miss_best,
+        50.0,
+        24.0,
+        false,
+        None
+    ));
+}
+
+#[test]
+fn timeout_latch_eligible_allows_conservative_near_miss_path() {
+    let near_miss_best = super::BestObservedState {
+        pan_count: 0,
+        tilt_count: 0,
+        pan_abs_error: 54,
+        tilt_abs_error: 20,
+    };
+    let stagnation_ready = true;
+    let near_miss =
+        stagnation_near_miss_latch_eligible(near_miss_best, 50.0, 24.0, stagnation_ready, None);
+    assert!(near_miss);
+
+    assert!(timeout_latch_eligible(
+        0,
+        0.20,
+        false,
+        stagnation_ready,
+        near_miss,
+        None
+    ));
+
+    let known_stopped_hint = Some(crate::app::usecases::ptz_transport::TransportMotionHint {
+        moving: Some(false),
+        move_age_ms: Some(180),
+    });
+    let known_near_miss = stagnation_near_miss_latch_eligible(
+        near_miss_best,
+        50.0,
+        24.0,
+        stagnation_ready,
+        known_stopped_hint,
+    );
+    assert!(!known_near_miss);
+    assert!(!timeout_latch_eligible(
+        0,
+        0.20,
+        false,
+        stagnation_ready,
+        known_near_miss,
+        known_stopped_hint
     ));
 }
 
