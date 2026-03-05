@@ -5,13 +5,13 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 
-use crate::app::usecases::ptz_calibrate_auto::{load_saved_params_for_device, StoredCalibration};
+use crate::app::usecases::ptz_calibrate_auto::{StoredCalibration, load_saved_params_for_device};
 use crate::app::usecases::ptz_controller::{AxisEkf, AxisEkfConfig, AxisEkfSnapshot};
 use crate::app::usecases::ptz_deadband::scale_directional_deadband;
-use crate::app::usecases::ptz_get_absolute_raw::{map_status_to_raw_position, PtzRawPosition};
+use crate::app::usecases::ptz_get_absolute_raw::{PtzRawPosition, map_status_to_raw_position};
 use crate::app::usecases::ptz_pulse_lut::{AxisDirection, AxisPulseLut};
 use crate::app::usecases::ptz_settle_gate::{
-    completion_gate_allows_success, CompletionGateCapabilities, PositionSettlingTracker,
+    CompletionGateCapabilities, PositionSettlingTracker, completion_gate_allows_success,
 };
 use crate::app::usecases::ptz_transport;
 use crate::core::error::{AppError, AppResult, ErrorKind};

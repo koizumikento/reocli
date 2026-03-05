@@ -1,4 +1,4 @@
-use super::{completion_gate_allows_success, CompletionGateCapabilities, PositionSettlingTracker};
+use super::{CompletionGateCapabilities, PositionSettlingTracker, completion_gate_allows_success};
 
 #[test]
 fn tracker_accumulates_when_both_axes_are_within_threshold() {
