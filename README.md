@@ -17,10 +17,13 @@ Rust ベースの Reolink CLI/MCP 実験用プロジェクトです。
 - `REOCLI_TOKEN_CACHE_PATH`: トークンキャッシュファイルパス。未設定時は `~/.reocli/tokens/<endpoint>.token`。
 - `REOCLI_USER`: ユーザー名。`REOCLI_PASSWORD` が設定されていて未設定/空文字の場合は `admin` を使用。
 - `REOCLI_PASSWORD`: パスワード認証に使用。
+- `REOCLI_CALIBRATION_DIR`: PTZ キャリブレーション JSON と EKF state の保存ディレクトリ。未設定時は `~/.reocli/calibration`。
 - `REOCLI_PTZ_BACKEND`: PTZ制御バックエンド。`cgi`（既定）または `onvif`。
 - `REOCLI_ONVIF_DEVICE_SERVICE_URL`: ONVIF Device Service URL（例: `http://<camera-ip>:8000/onvif/device_service`）。
 - `REOCLI_ONVIF_PROFILE_TOKEN`: ONVIF ProfileToken の明示指定（未指定時は `GetProfiles` から自動解決）。
 - `REOCLI_ONVIF_PORT`: `REOCLI_ONVIF_DEVICE_SERVICE_URL` 未設定時の既定ポート（既定: `8000`）。
+- `REOCLI_PTZ_STRICT_SUCCESS_PAN_COUNT`: `ptz set-absolute` の strict 完了判定で使う pan 側閾値。既定値は `50`。
+- `REOCLI_PTZ_STRICT_SUCCESS_TILT_COUNT`: `ptz set-absolute` の strict 完了判定で使う tilt 側閾値。既定値は `24`。
 
 認証の優先順:
 
@@ -30,6 +33,9 @@ Rust ベースの Reolink CLI/MCP 実験用プロジェクトです。
 4. 匿名認証
 
 `REOCLI_PASSWORD` がある状態でログインが発生すると、取得したトークンはキャッシュファイルへ更新されます。認証失敗で再ログインが必要になった場合は古いキャッシュを削除してから更新します。
+`REOCLI_TOKEN` またはキャッシュトークンで認証し、`Authentication` エラーになった場合は、`REOCLI_PASSWORD` が設定されていれば user/password 認証に自動フォールバックします。
+
+ONVIF backend を使うときは `REOCLI_PTZ_BACKEND=onvif` に加えて `REOCLI_PASSWORD` が必要です。`REOCLI_USER` を省略した場合は `admin` を使い、`REOCLI_ONVIF_DEVICE_SERVICE_URL` が未指定なら `REOCLI_ENDPOINT` と `REOCLI_ONVIF_PORT` から `http://<host>:<port>/onvif/device_service` を組み立てます。
 
 ## Implemented CLI Commands
 
@@ -56,6 +62,7 @@ Rust ベースの Reolink CLI/MCP 実験用プロジェクトです。
 - `reocli preflight [user]`
 
 `snap` と PTZ 制御系コマンド（`move` / `stop` / `preset goto` / `calibrate auto` / `set-absolute`）は実行前に `GetAbility` でサポート確認し、未対応なら `UnsupportedCommand` で失敗します。
+`preflight` は `GetAbility` と `GetDevInfo` をまとめて実行する事前確認コマンドです。
 
 ## Implemented MCP Tools
 
@@ -78,11 +85,15 @@ Rust ベースの Reolink CLI/MCP 実験用プロジェクトです。
 - `reolink.ptz_set_absolute`
 - `reolink.ptz_get_absolute`
 
+引数なしの `reocli-mcp` は `mcp.list_tools` を実行します。
+`reocli ptz onvif ...` と `reocli preflight` は現状 CLI 専用で、MCP ツールとしては公開していません。
+
 ## Examples
 
 ```bash
 # Auth
 reocli get-user-auth admin secret
+reocli preflight admin
 
 # Device / time
 reocli get-dev-info
@@ -116,6 +127,7 @@ reocli ptz set-absolute 1500 -180 --tol-count 12 --timeout-ms 25000 --channel 0
 
 ```bash
 # MCP
+reocli-mcp
 reocli-mcp reolink.get_net_port
 reocli-mcp reolink.set_onvif_enabled on 8000
 reocli-mcp reolink.ptz_calibrate_auto 0
@@ -143,9 +155,12 @@ cargo test --test live_smoke -- --nocapture
 ## PTZ Absolute (Raw Count)
 
 - `set-absolute` / `get-absolute` は角度ではなく `GetPtzCurPos` の生カウント値で扱います。
+- `ptz calibrate auto` は `REOCLI_CALIBRATION_DIR` 配下に `<serial>__<model>__<firmware>.json` を保存し、同一デバイス・同一チャネルなら再利用します。
 - `set-absolute` は `pan_count` / `tilt_count` を目標として、`tol_count` 以内になるまで PTZ 制御を繰り返します。
 - `set-absolute` の既定値は `tol_count=10`、`timeout_ms=25000` です。
+- `set-absolute` は保存済みキャリブレーションを自動読込し、同じディレクトリに `<endpoint>.ch<channel>.ekf-count.json` として EKF state を保存します。
 - パルス制御経路では、中域と端部で別々の `counts/ms` を online 学習し、EKF state に保持します。
+- strict 完了判定の pan/tilt 閾値は `REOCLI_PTZ_STRICT_SUCCESS_PAN_COUNT` / `REOCLI_PTZ_STRICT_SUCCESS_TILT_COUNT` で上書きできます。
 - `REOCLI_PTZ_BACKEND=onvif` の場合、目標近傍では ONVIF `RelativeMove` を優先します。
 - ただし `supports_relative_pan_tilt_translation=false` かつ `has_timeout_range=true` で `timeout_min >= PT1S` の機種では、`set-absolute` のパルス移動/停止は CGI に自動フォールバックします。
 - 判定に使う値は `REOCLI_PTZ_BACKEND=onvif reocli ptz onvif options --channel <ch>` で確認できます。

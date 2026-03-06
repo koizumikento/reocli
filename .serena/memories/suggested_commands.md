@@ -1,0 +1,1 @@
+From repo root: `cargo check --all-targets --all-features`, `cargo fmt --all -- --check`, `cargo clippy --all-targets --all-features -- -D warnings`, `cargo test --all-targets --all-features`. Run CLI help with `cargo run --quiet --bin reocli -- help`. Run MCP tool listing with `cargo run --quiet --bin reocli-mcp --` or `cargo run --quiet --bin reocli-mcp -- mcp.list_tools`.

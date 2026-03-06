@@ -1,6 +1,12 @@
-# Reolink 公式 CGI 利用メモ（初版）
+# Reolink 公式 CGI 利用メモ
 
 このドキュメントは、Reolink 公式サポート記事に書かれている CGI 利用手順を、最初に動かすための最小セットとして整理したものです。
+
+## このドキュメントのスコープ
+
+- ここでは raw な CGI endpoint と、その疎通確認に使う最小コマンドだけを扱う。
+- `reocli` / `reocli-mcp` の公開コマンド一覧と環境変数は `README.md` を参照する。
+- ONVIF backend や PTZ absolute 制御の詳細は `docs/ptz-absolute-control-spec.md` を参照する。
 
 ## 1. まず確認すること
 
@@ -83,21 +89,39 @@ https://<USER>:<PASSWORD>@<IP>/cgi-bin/api.cgi?cmd=Snap&channel=0&rs=flsYJfZgM6R
 
 ---
 
-## 6. `reocli` 実装済みコマンド（2026-02-26 時点）
+## 6. `reocli` が利用している CGI コマンド
 
-- 認証/能力
-  - `GetUserAuth` / `GetAbility`
-- デバイス/時刻/チャネル
+`reocli` の公開コマンドは raw CGI と 1 対 1 ではありません。内部では主に次の CGI を組み合わせています。
+
+- 認証/能力確認
+  - `GetUserAuth`
+  - `GetAbility`
+  - `Login`
+- デバイス/ネットワーク/時刻
   - `GetDevInfo`
   - `GetChannelStatus`
-  - `GetTime` / `SetTime`（入力は RFC3339 形式を検証）
+  - `GetTime`
+  - `SetTime`
+  - `GetNetPort`
+  - `SetNetPort`
 - スナップショット
-  - `Snap`（保存先指定可。`snapshots/channel-<n>.jpg` 既定）
-- PTZ
-  - 状態: `GetPtzCurPos`, `GetZoomFocus`, `GetPtzPreset`, `GetPtzCheckState`
-  - 制御: `PtzCtrl`（move/stop/preset goto）
+  - `Snap`
+- PTZ 状態/制御
+  - `GetPtzCurPos`
+  - `GetZoomFocus`
+  - `GetPtzPreset`
+  - `GetPtzCheckState`
+  - `PtzCtrl`
+
+対応関係の目安:
+
+- `reocli preflight [user]` は `GetAbility` と `GetDevInfo` をまとめて実行する。
+- `reocli set-onvif <on|off> [--port ...]` は `GetNetPort` / `SetNetPort` を使う。
+- `reocli ptz move` / `stop` / `preset goto` は主に `PtzCtrl` を使う。
+- `reocli ptz set-absolute` は高レベルの閉ループ制御で、内部的に CGI と ONVIF の両方を使い分けることがある。
 
 ## 7. 既知の機種差分メモ
 
-- `GetAbility` の結果は機種・FWで差があるため、`snap` と `ptz` 実行前に対応可否をガードしている。
+- `GetAbility` の結果は機種・FWで差があるため、`snap` と PTZ 実行前に対応可否をガードしている。
 - `GetChannelStatus` は機種によりレスポンスキー名差分（`channel/channelId/channelNo`, `online/status/state`）があるため、実装側で吸収している。
+- ONVIF backend を使う補助コマンド（`reocli ptz onvif ...`）は CGI の 1 対 1 ラッパーではなく、CLI 専用の診断/制御入口として別実装になっている。
