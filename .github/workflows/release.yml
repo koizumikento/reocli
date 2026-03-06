@@ -70,7 +70,7 @@ jobs:
             target: x86_64-pc-windows-msvc
             archive_ext: zip
             bin_ext: ".exe"
-          - runner: macos-13
+          - runner: macos-15-intel
             target: x86_64-apple-darwin
             archive_ext: tar.gz
             bin_ext: ""
