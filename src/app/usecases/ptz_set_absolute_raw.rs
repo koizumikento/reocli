@@ -7,11 +7,13 @@ use serde::{Deserialize, Serialize};
 
 use crate::app::usecases::ptz_calibrate_auto::{StoredCalibration, load_saved_params_for_device};
 use crate::app::usecases::ptz_controller::{AxisEkf, AxisEkfConfig, AxisEkfSnapshot};
-use crate::app::usecases::ptz_deadband::scale_directional_deadband;
+use crate::app::usecases::ptz_deadband::{
+    PositionBand, classify_position_band, scale_directional_deadband,
+};
 use crate::app::usecases::ptz_get_absolute_raw::{PtzRawPosition, map_status_to_raw_position};
 use crate::app::usecases::ptz_pulse_lut::{AxisDirection, AxisPulseLut};
 use crate::app::usecases::ptz_settle_gate::{
-    PositionSettlingTracker, completion_gate_allows_success,
+    CompletionGateCapabilities, PositionSettlingTracker, completion_gate_allows_success,
 };
 use crate::app::usecases::ptz_transport;
 use crate::core::error::{AppError, AppResult, ErrorKind};
@@ -58,6 +60,7 @@ const FINE_FEEDFORWARD_GAIN: f64 = 0.28;
 const FINE_FEEDFORWARD_MAX_COUNT: f64 = 72.0;
 const BACKEND_COMPLETION_MIN_AGE_MS: u64 = 120;
 const BACKEND_POSITION_STABLE_REQUIRED_STEPS: usize = 2;
+const BACKEND_POSITION_STABLE_REQUIRED_STEPS_FALLBACK: usize = 4;
 const BACKEND_POSITION_STABLE_TOLERANCE_RATIO: f64 = 0.35;
 const BACKEND_POSITION_STABLE_MIN_COUNT: f64 = 2.0;
 const BACKEND_POSITION_STABLE_MAX_COUNT: f64 = 24.0;
@@ -105,8 +108,6 @@ const CALIBRATION_DEADBAND_HINT_MAX_COUNT: f64 = 200.0;
 const CALIBRATION_GUARD_DEADBAND_RATIO: f64 = 0.45;
 const SUCCESS_TOLERANCE_DEADBAND_MARGIN_RATIO: f64 = 0.3;
 const SUCCESS_TOLERANCE_DEADBAND_MAX_COUNT: f64 = 60.0;
-const STRICT_SUCCESS_PAN_COUNT: f64 = 20.0;
-const STRICT_SUCCESS_TILT_COUNT: f64 = 20.0;
 
 const DEFAULT_PAN_MIN_COUNT: f64 = 0.0;
 const DEFAULT_PAN_MAX_COUNT: f64 = 7360.0;
@@ -138,6 +139,7 @@ const EKF_MAX_R_MEASUREMENT: f64 = 30.0;
 const SUCCESS_LATCH_MIN_SETTLING_STEPS: usize = 1;
 const SUCCESS_LATCH_CURRENT_NORM_MAX: f64 = 0.04;
 const SUCCESS_LATCH_STAGNATION_MIN_BEST_AGE_STEPS: usize = 6;
+const SUCCESS_LATCH_STAGNATION_NEAR_MISS_MARGIN_COUNT: f64 = 8.0;
 const STRICT_COMPLETION_GRACE_STEPS: usize = 3;
 const OSCILLATION_STABLE_STEP_REDUCTION_REVERSAL_SUM: usize = 6;
 const SECONDARY_AXIS_INTERLEAVE_INTERVAL_MIN: usize = 1;
@@ -186,9 +188,17 @@ struct StoredPtzEkfState {
     #[serde(default)]
     pan_negative_counts_per_ms: Option<f64>,
     #[serde(default)]
+    pan_positive_edge_counts_per_ms: Option<f64>,
+    #[serde(default)]
+    pan_negative_edge_counts_per_ms: Option<f64>,
+    #[serde(default)]
     tilt_positive_counts_per_ms: Option<f64>,
     #[serde(default)]
     tilt_negative_counts_per_ms: Option<f64>,
+    #[serde(default)]
+    tilt_positive_edge_counts_per_ms: Option<f64>,
+    #[serde(default)]
+    tilt_negative_edge_counts_per_ms: Option<f64>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -238,6 +248,7 @@ struct PendingPulseObservation {
     axis: ControlAxis,
     direction: AxisDirection,
     pulse_ms: u64,
+    edge_band: bool,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -651,8 +662,7 @@ fn run_closed_loop(
         deadband_hints.tilt_count,
         tolerance_count as f64,
     );
-    let strict_pan_tolerance = STRICT_SUCCESS_PAN_COUNT;
-    let strict_tilt_tolerance = STRICT_SUCCESS_TILT_COUNT;
+    let (strict_pan_tolerance, strict_tilt_tolerance) = strict_success_tolerances();
     let pan_model = saved_calibration
         .as_ref()
         .map(|stored| sanitize_model_params(stored.calibration.pan_model, pan_span))
@@ -744,11 +754,15 @@ fn run_closed_loop(
             pan_model.beta,
             stored.pan_positive_counts_per_ms,
             stored.pan_negative_counts_per_ms,
+            stored.pan_positive_edge_counts_per_ms,
+            stored.pan_negative_edge_counts_per_ms,
         );
         tilt_pulse_lut = AxisPulseLut::from_seed_and_rates(
             tilt_model.beta,
             stored.tilt_positive_counts_per_ms,
             stored.tilt_negative_counts_per_ms,
+            stored.tilt_positive_edge_counts_per_ms,
+            stored.tilt_negative_edge_counts_per_ms,
         );
     }
 
@@ -872,6 +886,8 @@ fn run_closed_loop(
         }
         let pan_axis_stale = axis_stale_detected(last_pan_u, pan_observed_delta);
         let tilt_axis_stale = axis_stale_detected(last_tilt_u, tilt_observed_delta);
+        let pan_lut_sample_reliable = !pan_model_mismatch_now && !pan_axis_stale;
+        let tilt_lut_sample_reliable = !tilt_model_mismatch_now && !tilt_axis_stale;
         let pan_noise_hint = measurement_noise_hint_scale(
             pan_model_mismatch_now,
             pan_axis_stale,
@@ -892,6 +908,8 @@ fn run_closed_loop(
             &mut pending_pulse_observation,
             pan_observed_delta,
             tilt_observed_delta,
+            pan_lut_sample_reliable,
+            tilt_lut_sample_reliable,
             &mut pan_pulse_lut,
             &mut tilt_pulse_lut,
         );
@@ -1027,9 +1045,11 @@ fn run_closed_loop(
             completion_gate_allows_success(
                 hint.moving,
                 hint.move_age_ms,
+                CompletionGateCapabilities::from_hint(hint.moving, hint.move_age_ms),
                 backend_completion_min_age_ms,
                 position_settling.stable_steps(),
                 BACKEND_POSITION_STABLE_REQUIRED_STEPS,
+                BACKEND_POSITION_STABLE_REQUIRED_STEPS_FALLBACK,
             )
         } else {
             position_settling.stable_steps() >= BACKEND_POSITION_STABLE_REQUIRED_STEPS
@@ -1068,7 +1088,14 @@ fn run_closed_loop(
                 success_latch_stagnation_ready(best_age_steps, backend_motion_hint);
             let best_within_success_tol =
                 best_within_success_tolerance(best, strict_pan_tolerance, strict_tilt_tolerance);
-            if stagnation_ready && best_within_success_tol {
+            let near_miss_latch_eligible = stagnation_near_miss_latch_eligible(
+                best,
+                strict_pan_tolerance,
+                strict_tilt_tolerance,
+                stagnation_ready,
+                backend_motion_hint,
+            );
+            if (stagnation_ready && best_within_success_tol) || near_miss_latch_eligible {
                 let success_position = PtzRawPosition {
                     channel: current.channel,
                     pan_count: best.pan_count,
@@ -1106,12 +1133,23 @@ fn run_closed_loop(
             });
             let best_within_success_tol =
                 best_within_success_tolerance(best, strict_pan_tolerance, strict_tilt_tolerance);
-            let latch_eligible = best_within_success_tol
-                && (success_latch_ready(
-                    position_settling.stable_steps(),
-                    measured_error_norm,
-                    backend_motion_hint,
-                ) || success_latch_stagnation_ready(best_age_steps, backend_motion_hint));
+            let stagnation_ready =
+                success_latch_stagnation_ready(best_age_steps, backend_motion_hint);
+            let near_miss_latch_eligible = stagnation_near_miss_latch_eligible(
+                best,
+                strict_pan_tolerance,
+                strict_tilt_tolerance,
+                stagnation_ready,
+                backend_motion_hint,
+            );
+            let latch_eligible = timeout_latch_eligible(
+                position_settling.stable_steps(),
+                measured_error_norm,
+                best_within_success_tol,
+                stagnation_ready,
+                near_miss_latch_eligible,
+                backend_motion_hint,
+            );
             if (within_strict_tolerance && backend_completion_with_grace) || latch_eligible {
                 let success_position = if within_strict_tolerance && backend_completion_with_grace {
                     current.clone()
@@ -1384,6 +1422,15 @@ fn run_closed_loop(
                         speed_cap_for_error(command_error_abs).max(1)
                     };
                     let base_pulse_ms = if pulse_lut_candidate {
+                        let lut_edge_band = pulse_lut_edge_band_for_command(
+                            direction,
+                            pan_measure,
+                            pan_min_count,
+                            pan_max_count,
+                            tilt_measure,
+                            tilt_min_count,
+                            tilt_max_count,
+                        );
                         pulse_ms_for_direction_with_lut(
                             direction,
                             pan_command_error,
@@ -1391,6 +1438,7 @@ fn run_closed_loop(
                             &pan_pulse_lut,
                             &tilt_pulse_lut,
                             command_error_abs,
+                            lut_edge_band,
                         )
                     } else {
                         control_pulse_ms_for_error(command_error_abs)
@@ -1451,8 +1499,27 @@ fn run_closed_loop(
                         pulse_ms,
                         force_cgi_pulse_transport,
                     )?;
-                    pending_pulse_observation =
-                        pending_pulse_observation_for_command(direction, pulse_ms);
+                    let lut_edge_band = pulse_lut_edge_band_for_command(
+                        direction,
+                        pan_measure,
+                        pan_min_count,
+                        pan_max_count,
+                        tilt_measure,
+                        tilt_min_count,
+                        tilt_max_count,
+                    );
+                    pending_pulse_observation = pending_pulse_observation_for_lut_command(
+                        direction,
+                        pulse_ms,
+                        lut_edge_band,
+                        pulse_lut_learning_allowed(
+                            direction,
+                            pulse_lut_candidate,
+                            pulse_ms,
+                            pan_reversal_now,
+                            tilt_reversal_now,
+                        ),
+                    );
                     let elapsed_ms = Instant::now()
                         .saturating_duration_since(started)
                         .as_millis();
@@ -1646,6 +1713,11 @@ fn sanitize_stored_beta(value: Option<f64>) -> Option<f64> {
     Some(value.clamp(MODEL_BETA_MIN, MODEL_BETA_MAX))
 }
 
+fn strict_success_tolerances() -> (f64, f64) {
+    let thresholds = runtime::ptz_strict_success_thresholds_from_env();
+    (thresholds.pan_count, thresholds.tilt_count)
+}
+
 fn best_within_success_tolerance(
     best: BestObservedState,
     pan_success_tolerance: f64,
@@ -1681,7 +1753,6 @@ fn success_latch_stagnation_ready(
     best_age_steps >= SUCCESS_LATCH_STAGNATION_MIN_BEST_AGE_STEPS
 }
 
-#[cfg(test)]
 fn best_stagnation_near_miss_eligible(
     best: BestObservedState,
     pan_success_tolerance: f64,
@@ -1702,6 +1773,46 @@ fn best_stagnation_near_miss_eligible(
         return false;
     }
     pan_excess.max(tilt_excess) <= margin_count
+}
+
+fn backend_hint_unavailable_or_unknown(
+    backend_hint: Option<ptz_transport::TransportMotionHint>,
+) -> bool {
+    backend_hint.and_then(|hint| hint.moving).is_none()
+}
+
+fn stagnation_near_miss_latch_eligible(
+    best: BestObservedState,
+    pan_success_tolerance: f64,
+    tilt_success_tolerance: f64,
+    stagnation_ready: bool,
+    backend_hint: Option<ptz_transport::TransportMotionHint>,
+) -> bool {
+    if !stagnation_ready || !backend_hint_unavailable_or_unknown(backend_hint) {
+        return false;
+    }
+    best_stagnation_near_miss_eligible(
+        best,
+        pan_success_tolerance,
+        tilt_success_tolerance,
+        SUCCESS_LATCH_STAGNATION_NEAR_MISS_MARGIN_COUNT,
+    )
+}
+
+fn timeout_latch_eligible(
+    settling_steps: usize,
+    measured_error_norm: f64,
+    best_within_success_tol: bool,
+    stagnation_ready: bool,
+    near_miss_latch_eligible: bool,
+    backend_hint: Option<ptz_transport::TransportMotionHint>,
+) -> bool {
+    if near_miss_latch_eligible {
+        return true;
+    }
+    best_within_success_tol
+        && (success_latch_ready(settling_steps, measured_error_norm, backend_hint)
+            || stagnation_ready)
 }
 
 fn timeout_blocker_label(
@@ -2586,6 +2697,7 @@ fn pulse_ms_for_direction_with_lut(
     pan_lut: &AxisPulseLut,
     tilt_lut: &AxisPulseLut,
     command_error_abs: f64,
+    edge_band: bool,
 ) -> u64 {
     let fallback = control_pulse_ms_for_error(command_error_abs);
     let Some((axis, axis_direction)) = control_axis_direction(direction) else {
@@ -2605,8 +2717,9 @@ fn pulse_ms_for_direction_with_lut(
         ControlAxis::Pan => pan_lut,
         ControlAxis::Tilt => tilt_lut,
     };
-    lut.pulse_ms_for_target(
+    lut.pulse_ms_for_target_in_band(
         axis_direction,
+        edge_band,
         target_count,
         PULSE_LUT_MIN_MS,
         PULSE_LUT_MAX_MS,
@@ -2626,6 +2739,42 @@ fn control_axis_direction(direction: PtzDirection) -> Option<(ControlAxis, AxisD
     }
 }
 
+fn pulse_lut_edge_band_for_command(
+    direction: PtzDirection,
+    pan_measure: f64,
+    pan_min_count: f64,
+    pan_max_count: f64,
+    tilt_measure: f64,
+    tilt_min_count: f64,
+    tilt_max_count: f64,
+) -> bool {
+    let band = match control_axis_direction(direction).map(|(axis, _)| axis) {
+        Some(ControlAxis::Pan) => classify_position_band(pan_measure, pan_min_count, pan_max_count),
+        Some(ControlAxis::Tilt) => {
+            classify_position_band(tilt_measure, tilt_min_count, tilt_max_count)
+        }
+        None => PositionBand::Mid,
+    };
+    matches!(band, PositionBand::Low | PositionBand::High)
+}
+
+fn pulse_lut_learning_allowed(
+    direction: PtzDirection,
+    pulse_lut_candidate: bool,
+    pulse_ms: u64,
+    pan_reversal_now: bool,
+    tilt_reversal_now: bool,
+) -> bool {
+    if !pulse_lut_candidate || pulse_ms < PULSE_LUT_MIN_MS {
+        return false;
+    }
+    match control_axis_direction(direction).map(|(axis, _)| axis) {
+        Some(ControlAxis::Pan) => !pan_reversal_now,
+        Some(ControlAxis::Tilt) => !tilt_reversal_now,
+        None => false,
+    }
+}
+
 fn pending_pulse_observation_for_command(
     direction: PtzDirection,
     pulse_ms: u64,
@@ -2638,13 +2787,30 @@ fn pending_pulse_observation_for_command(
         axis,
         direction: axis_direction,
         pulse_ms,
+        edge_band: false,
     })
+}
+
+fn pending_pulse_observation_for_lut_command(
+    direction: PtzDirection,
+    pulse_ms: u64,
+    edge_band: bool,
+    learning_enabled: bool,
+) -> Option<PendingPulseObservation> {
+    if !learning_enabled {
+        return None;
+    }
+    let mut observation = pending_pulse_observation_for_command(direction, pulse_ms)?;
+    observation.edge_band = edge_band;
+    Some(observation)
 }
 
 fn apply_pending_pulse_observation(
     pending: &mut Option<PendingPulseObservation>,
     pan_observed_delta: Option<f64>,
     tilt_observed_delta: Option<f64>,
+    pan_sample_reliable: bool,
+    tilt_sample_reliable: bool,
     pan_lut: &mut AxisPulseLut,
     tilt_lut: &mut AxisPulseLut,
 ) {
@@ -2663,12 +2829,19 @@ fn apply_pending_pulse_observation(
     }
 
     match observation.axis {
-        ControlAxis::Pan => {
-            pan_lut.update(observation.direction, observation.pulse_ms, observed_delta)
-        }
-        ControlAxis::Tilt => {
-            tilt_lut.update(observation.direction, observation.pulse_ms, observed_delta)
-        }
+        ControlAxis::Pan if pan_sample_reliable => pan_lut.update_in_band(
+            observation.direction,
+            observation.edge_band,
+            observation.pulse_ms,
+            observed_delta,
+        ),
+        ControlAxis::Tilt if tilt_sample_reliable => tilt_lut.update_in_band(
+            observation.direction,
+            observation.edge_band,
+            observation.pulse_ms,
+            observed_delta,
+        ),
+        ControlAxis::Pan | ControlAxis::Tilt => {}
     }
 }
 
@@ -3257,22 +3430,42 @@ fn save_stored_ekf_state(
         pan_positive_counts_per_ms: Some(
             learning
                 .pan_pulse_lut
-                .counts_per_ms(AxisDirection::Positive),
+                .counts_per_ms_in_band(AxisDirection::Positive, false),
         ),
         pan_negative_counts_per_ms: Some(
             learning
                 .pan_pulse_lut
-                .counts_per_ms(AxisDirection::Negative),
+                .counts_per_ms_in_band(AxisDirection::Negative, false),
+        ),
+        pan_positive_edge_counts_per_ms: Some(
+            learning
+                .pan_pulse_lut
+                .counts_per_ms_in_band(AxisDirection::Positive, true),
+        ),
+        pan_negative_edge_counts_per_ms: Some(
+            learning
+                .pan_pulse_lut
+                .counts_per_ms_in_band(AxisDirection::Negative, true),
         ),
         tilt_positive_counts_per_ms: Some(
             learning
                 .tilt_pulse_lut
-                .counts_per_ms(AxisDirection::Positive),
+                .counts_per_ms_in_band(AxisDirection::Positive, false),
         ),
         tilt_negative_counts_per_ms: Some(
             learning
                 .tilt_pulse_lut
-                .counts_per_ms(AxisDirection::Negative),
+                .counts_per_ms_in_band(AxisDirection::Negative, false),
+        ),
+        tilt_positive_edge_counts_per_ms: Some(
+            learning
+                .tilt_pulse_lut
+                .counts_per_ms_in_band(AxisDirection::Positive, true),
+        ),
+        tilt_negative_edge_counts_per_ms: Some(
+            learning
+                .tilt_pulse_lut
+                .counts_per_ms_in_band(AxisDirection::Negative, true),
         ),
     };
 
@@ -3501,10 +3694,42 @@ impl StoredAxisEkfState {
 
 impl StoredPtzEkfState {
     fn is_finite(&self) -> bool {
+        let pan_positive_ok = self
+            .pan_positive_counts_per_ms
+            .is_none_or(|value| value.is_finite());
+        let pan_negative_ok = self
+            .pan_negative_counts_per_ms
+            .is_none_or(|value| value.is_finite());
+        let pan_positive_edge_ok = self
+            .pan_positive_edge_counts_per_ms
+            .is_none_or(|value| value.is_finite());
+        let pan_negative_edge_ok = self
+            .pan_negative_edge_counts_per_ms
+            .is_none_or(|value| value.is_finite());
+        let tilt_positive_ok = self
+            .tilt_positive_counts_per_ms
+            .is_none_or(|value| value.is_finite());
+        let tilt_negative_ok = self
+            .tilt_negative_counts_per_ms
+            .is_none_or(|value| value.is_finite());
+        let tilt_positive_edge_ok = self
+            .tilt_positive_edge_counts_per_ms
+            .is_none_or(|value| value.is_finite());
+        let tilt_negative_edge_ok = self
+            .tilt_negative_edge_counts_per_ms
+            .is_none_or(|value| value.is_finite());
         self.last_pan_u.is_finite()
             && self.last_tilt_u.is_finite()
             && self.pan.is_finite()
             && self.tilt.is_finite()
+            && pan_positive_ok
+            && pan_negative_ok
+            && pan_positive_edge_ok
+            && pan_negative_edge_ok
+            && tilt_positive_ok
+            && tilt_negative_ok
+            && tilt_positive_edge_ok
+            && tilt_negative_edge_ok
     }
 }
 

@@ -18,17 +18,22 @@ use super::{
     max_failure_mode_counters, measurement_noise_hint_scale, model_mismatch_detected,
     near_target_speed1_pulse_ms, normalized_vector_error, oscillation_damping_active,
     parse_failure_mode_counters, parse_onvif_duration_ms, pending_pulse_observation_for_command,
-    position_stable_threshold_count, pulse_ms_for_direction_with_lut, relative_delta_from_error,
-    remaining_control_step_sleep_duration, required_stable_steps_for_oscillation,
-    save_stored_ekf_state, secondary_axis_interleave_interval,
-    select_command_with_edge_push_lockout, select_control_error,
-    should_force_cgi_for_onvif_options, should_retry_after_timeout, stale_status_detected,
-    strict_axis_focus_command, success_latch_ready, success_latch_stagnation_ready,
-    timeout_blocker_label, timeout_retry_budget_ms, update_reversal_counter,
+    pending_pulse_observation_for_lut_command, position_stable_threshold_count,
+    pulse_lut_edge_band_for_command, pulse_lut_learning_allowed, pulse_ms_for_direction_with_lut,
+    relative_delta_from_error, remaining_control_step_sleep_duration,
+    required_stable_steps_for_oscillation, save_stored_ekf_state,
+    secondary_axis_interleave_interval, select_command_with_edge_push_lockout,
+    select_control_error, should_force_cgi_for_onvif_options, should_retry_after_timeout,
+    stagnation_near_miss_latch_eligible, stale_status_detected, strict_axis_focus_command,
+    strict_success_tolerances, success_latch_ready, success_latch_stagnation_ready,
+    timeout_blocker_label, timeout_latch_eligible, timeout_retry_budget_ms,
+    update_reversal_counter,
 };
 use crate::app::usecases::ptz_controller::AxisEkf;
 use crate::app::usecases::ptz_pulse_lut::AxisPulseLut;
-use crate::app::usecases::ptz_settle_gate::completion_gate_allows_success;
+use crate::app::usecases::ptz_settle_gate::{
+    CompletionGateCapabilities, completion_gate_allows_success,
+};
 use crate::core::error::{AppError, ErrorKind};
 use crate::core::model::{AxisModelParams, NumericRange, PtzDirection};
 use crate::reolink::onvif::OnvifPtzConfigurationOptions;
@@ -163,6 +168,13 @@ fn forced_secondary_axis_command_uses_strict_threshold_in_endgame() {
         .map(|(direction, _)| direction);
     }
     assert_eq!(forced, Some(PtzDirection::Up));
+}
+
+#[test]
+fn strict_success_tolerances_defaults_match_runtime_defaults() {
+    let (pan, tilt) = strict_success_tolerances();
+    assert_eq!(pan, 50.0);
+    assert_eq!(tilt, 24.0);
 }
 
 #[test]
@@ -360,6 +372,10 @@ fn success_latch_helpers_gate_by_age_and_motion() {
         timeout_blocker_label(false, false, true, false),
         "latch_gate"
     );
+    assert_eq!(
+        timeout_blocker_label(true, false, true, true),
+        "completion_gate"
+    );
 }
 
 #[test]
@@ -398,6 +414,108 @@ fn best_stagnation_near_miss_allows_single_axis_small_overrun_only() {
         120.0,
         68.0,
         8.0
+    ));
+}
+
+#[test]
+fn stagnation_near_miss_latch_requires_unknown_backend_hint_and_stagnation() {
+    let near_miss_best = super::BestObservedState {
+        pan_count: 0,
+        tilt_count: 0,
+        pan_abs_error: 54,
+        tilt_abs_error: 20,
+    };
+    let unknown_hint = Some(crate::app::usecases::ptz_transport::TransportMotionHint {
+        moving: None,
+        move_age_ms: Some(180),
+    });
+    let known_stopped_hint = Some(crate::app::usecases::ptz_transport::TransportMotionHint {
+        moving: Some(false),
+        move_age_ms: Some(180),
+    });
+    let moving_hint = Some(crate::app::usecases::ptz_transport::TransportMotionHint {
+        moving: Some(true),
+        move_age_ms: Some(40),
+    });
+
+    assert!(stagnation_near_miss_latch_eligible(
+        near_miss_best,
+        50.0,
+        24.0,
+        true,
+        None
+    ));
+    assert!(stagnation_near_miss_latch_eligible(
+        near_miss_best,
+        50.0,
+        24.0,
+        true,
+        unknown_hint
+    ));
+    assert!(!stagnation_near_miss_latch_eligible(
+        near_miss_best,
+        50.0,
+        24.0,
+        true,
+        known_stopped_hint
+    ));
+    assert!(!stagnation_near_miss_latch_eligible(
+        near_miss_best,
+        50.0,
+        24.0,
+        true,
+        moving_hint
+    ));
+    assert!(!stagnation_near_miss_latch_eligible(
+        near_miss_best,
+        50.0,
+        24.0,
+        false,
+        None
+    ));
+}
+
+#[test]
+fn timeout_latch_eligible_allows_conservative_near_miss_path() {
+    let near_miss_best = super::BestObservedState {
+        pan_count: 0,
+        tilt_count: 0,
+        pan_abs_error: 54,
+        tilt_abs_error: 20,
+    };
+    let stagnation_ready = true;
+    let near_miss =
+        stagnation_near_miss_latch_eligible(near_miss_best, 50.0, 24.0, stagnation_ready, None);
+    assert!(near_miss);
+
+    assert!(timeout_latch_eligible(
+        0,
+        0.20,
+        false,
+        stagnation_ready,
+        near_miss,
+        None
+    ));
+
+    let known_stopped_hint = Some(crate::app::usecases::ptz_transport::TransportMotionHint {
+        moving: Some(false),
+        move_age_ms: Some(180),
+    });
+    let known_near_miss = stagnation_near_miss_latch_eligible(
+        near_miss_best,
+        50.0,
+        24.0,
+        stagnation_ready,
+        known_stopped_hint,
+    );
+    assert!(!known_near_miss);
+    assert!(!timeout_latch_eligible(
+        0,
+        0.20,
+        false,
+        stagnation_ready,
+        known_near_miss,
+        known_stopped_hint
     ));
 }
 
@@ -677,27 +795,81 @@ fn should_force_cgi_for_onvif_options_when_relative_move_unavailable_and_timeout
 
 #[test]
 fn completion_gate_respects_backend_motion_hint() {
-    assert!(!completion_gate_allows_success(None, None, 120, 2, 2));
     assert!(!completion_gate_allows_success(
         Some(true),
         Some(250),
+        CompletionGateCapabilities::from_hint(Some(true), Some(250)),
         120,
         2,
-        2
+        2,
+        4,
     ));
     assert!(!completion_gate_allows_success(
         Some(false),
         Some(70),
+        CompletionGateCapabilities::from_hint(Some(false), Some(70)),
         120,
         2,
-        2
+        2,
+        4,
     ));
     assert!(completion_gate_allows_success(
         Some(false),
         Some(260),
+        CompletionGateCapabilities::from_hint(Some(false), Some(260)),
         120,
         2,
-        2
+        2,
+        4,
+    ));
+}
+
+#[test]
+fn completion_gate_partial_backend_hint_requires_more_stability() {
+    assert!(!completion_gate_allows_success(
+        Some(false),
+        None,
+        CompletionGateCapabilities::from_hint(Some(false), None),
+        120,
+        2,
+        2,
+        4,
+    ));
+    assert!(completion_gate_allows_success(
+        Some(false),
+        None,
+        CompletionGateCapabilities::from_hint(Some(false), None),
+        120,
+        4,
+        2,
+        4,
+    ));
+    assert!(!completion_gate_allows_success(
+        None,
+        Some(260),
+        CompletionGateCapabilities::from_hint(None, Some(260)),
+        120,
+        2,
+        2,
+        4,
+    ));
+    assert!(completion_gate_allows_success(
+        None,
+        Some(260),
+        CompletionGateCapabilities::from_hint(None, Some(260)),
+        120,
+        4,
+        2,
+        4,
+    ));
+    assert!(completion_gate_allows_success(
+        None,
+        None,
+        CompletionGateCapabilities::from_hint(None, None),
+        120,
+        4,
+        2,
+        4,
     ));
 }
 
@@ -705,10 +877,102 @@ fn completion_gate_respects_backend_motion_hint() {
 fn pulse_lut_path_produces_short_pulse_for_small_error() {
     let pan_lut = AxisPulseLut::seeded(120.0);
     let tilt_lut = AxisPulseLut::seeded(120.0);
-    let pulse =
-        pulse_ms_for_direction_with_lut(PtzDirection::Right, 90.0, 0.0, &pan_lut, &tilt_lut, 90.0);
+    let pulse = pulse_ms_for_direction_with_lut(
+        PtzDirection::Right,
+        90.0,
+        0.0,
+        &pan_lut,
+        &tilt_lut,
+        90.0,
+        false,
+    );
     assert!(pulse >= 10);
     assert!(pulse <= 140);
+}
+
+#[test]
+fn pulse_lut_path_uses_edge_band_rate_when_requested() {
+    let pan_lut = AxisPulseLut::from_seed_and_rates(120.0, Some(1.0), Some(1.0), Some(4.0), None);
+    let tilt_lut = AxisPulseLut::seeded(120.0);
+    let mid_pulse = pulse_ms_for_direction_with_lut(
+        PtzDirection::Right,
+        80.0,
+        0.0,
+        &pan_lut,
+        &tilt_lut,
+        80.0,
+        false,
+    );
+    let edge_pulse = pulse_ms_for_direction_with_lut(
+        PtzDirection::Right,
+        80.0,
+        0.0,
+        &pan_lut,
+        &tilt_lut,
+        80.0,
+        true,
+    );
+    assert!(edge_pulse < mid_pulse);
+}
+
+#[test]
+fn pulse_lut_helpers_detect_edge_band_and_gate_learning() {
+    assert!(pulse_lut_edge_band_for_command(
+        PtzDirection::Right,
+        7_250.0,
+        0.0,
+        7_360.0,
+        620.0,
+        0.0,
+        1_240.0,
+    ));
+    assert!(!pulse_lut_edge_band_for_command(
+        PtzDirection::Right,
+        3_680.0,
+        0.0,
+        7_360.0,
+        620.0,
+        0.0,
+        1_240.0,
+    ));
+    assert!(pulse_lut_edge_band_for_command(
+        PtzDirection::Up,
+        3_680.0,
+        0.0,
+        7_360.0,
+        1_200.0,
+        0.0,
+        1_240.0,
+    ));
+
+    assert!(pulse_lut_learning_allowed(
+        PtzDirection::Right,
+        true,
+        20,
+        false,
+        false,
+    ));
+    assert!(!pulse_lut_learning_allowed(
+        PtzDirection::Right,
+        true,
+        8,
+        false,
+        false,
+    ));
+    assert!(!pulse_lut_learning_allowed(
+        PtzDirection::Right,
+        true,
+        20,
+        true,
+        false,
+    ));
+    assert!(!pulse_lut_learning_allowed(
+        PtzDirection::Down,
+        true,
+        20,
+        false,
+        true,
+    ));
 }
 
 #[test]
@@ -720,12 +984,86 @@ fn pending_pulse_observation_updates_axis_lut() {
         &mut pending,
         Some(120.0),
         Some(0.0),
+        true,
+        true,
         &mut pan_lut,
         &mut tilt_lut,
     );
     assert!(pending.is_none());
     assert!(
         pan_lut.counts_per_ms(crate::app::usecases::ptz_pulse_lut::AxisDirection::Positive) > 1.0
+    );
+}
+
+#[test]
+fn pending_pulse_observation_updates_edge_band_only() {
+    let mut pan_lut = AxisPulseLut::seeded(120.0);
+    let mut tilt_lut = AxisPulseLut::seeded(120.0);
+    let base_mid = pan_lut.counts_per_ms_in_band(
+        crate::app::usecases::ptz_pulse_lut::AxisDirection::Positive,
+        false,
+    );
+    let base_edge = pan_lut.counts_per_ms_in_band(
+        crate::app::usecases::ptz_pulse_lut::AxisDirection::Positive,
+        true,
+    );
+    let mut pending =
+        pending_pulse_observation_for_lut_command(PtzDirection::Right, 40, true, true);
+    apply_pending_pulse_observation(
+        &mut pending,
+        Some(120.0),
+        Some(0.0),
+        true,
+        true,
+        &mut pan_lut,
+        &mut tilt_lut,
+    );
+
+    assert!(pending.is_none());
+    assert!(
+        (pan_lut.counts_per_ms_in_band(
+            crate::app::usecases::ptz_pulse_lut::AxisDirection::Positive,
+            false,
+        ) - base_mid)
+            .abs()
+            < 1e-6
+    );
+    assert!(
+        pan_lut.counts_per_ms_in_band(
+            crate::app::usecases::ptz_pulse_lut::AxisDirection::Positive,
+            true,
+        ) > base_edge
+    );
+}
+
+#[test]
+fn pending_pulse_observation_skips_unreliable_axis_sample() {
+    let mut pan_lut = AxisPulseLut::seeded(120.0);
+    let mut tilt_lut = AxisPulseLut::seeded(120.0);
+    let base = pan_lut.counts_per_ms_in_band(
+        crate::app::usecases::ptz_pulse_lut::AxisDirection::Positive,
+        true,
+    );
+    let mut pending =
+        pending_pulse_observation_for_lut_command(PtzDirection::Right, 40, true, true);
+    apply_pending_pulse_observation(
+        &mut pending,
+        Some(120.0),
+        Some(0.0),
+        false,
+        true,
+        &mut pan_lut,
+        &mut tilt_lut,
+    );
+
+    assert!(pending.is_none());
+    assert!(
+        (pan_lut.counts_per_ms_in_band(
+            crate::app::usecases::ptz_pulse_lut::AxisDirection::Positive,
+            true,
+        ) - base)
+            .abs()
+            < 1e-6
     );
 }
 
@@ -933,10 +1271,22 @@ fn ekf_state_roundtrip_save_and_load() {
         100,
         280.0,
     );
+    pan_lut.update_in_band(
+        crate::app::usecases::ptz_pulse_lut::AxisDirection::Positive,
+        true,
+        80,
+        240.0,
+    );
     tilt_lut.update(
         crate::app::usecases::ptz_pulse_lut::AxisDirection::Negative,
         120,
         180.0,
+    );
+    tilt_lut.update_in_band(
+        crate::app::usecases::ptz_pulse_lut::AxisDirection::Negative,
+        true,
+        90,
+        210.0,
     );
 
     save_stored_ekf_state(
@@ -971,8 +1321,12 @@ fn ekf_state_roundtrip_save_and_load() {
     assert!(loaded.tilt_negative_beta.is_some());
     assert!(loaded.pan_positive_counts_per_ms.is_some());
     assert!(loaded.pan_negative_counts_per_ms.is_some());
+    assert!(loaded.pan_positive_edge_counts_per_ms.is_some());
+    assert!(loaded.pan_negative_edge_counts_per_ms.is_some());
     assert!(loaded.tilt_positive_counts_per_ms.is_some());
     assert!(loaded.tilt_negative_counts_per_ms.is_some());
+    assert!(loaded.tilt_positive_edge_counts_per_ms.is_some());
+    assert!(loaded.tilt_negative_edge_counts_per_ms.is_some());
     assert!(loaded.pan.last_nis.is_some());
     assert!(loaded.pan.ewma_nis.is_some());
     assert!(loaded.pan.residual_variance_proxy.is_some());
@@ -1048,13 +1402,25 @@ fn legacy_ekf_state_loads_and_seeds_online_learning_params() {
         120.0,
         loaded.pan_positive_counts_per_ms,
         loaded.pan_negative_counts_per_ms,
+        loaded.pan_positive_edge_counts_per_ms,
+        loaded.pan_negative_edge_counts_per_ms,
     );
     let positive =
         pan_lut.counts_per_ms(crate::app::usecases::ptz_pulse_lut::AxisDirection::Positive);
     let negative =
         pan_lut.counts_per_ms(crate::app::usecases::ptz_pulse_lut::AxisDirection::Negative);
+    let positive_edge = pan_lut.counts_per_ms_in_band(
+        crate::app::usecases::ptz_pulse_lut::AxisDirection::Positive,
+        true,
+    );
+    let negative_edge = pan_lut.counts_per_ms_in_band(
+        crate::app::usecases::ptz_pulse_lut::AxisDirection::Negative,
+        true,
+    );
     assert!((positive - 1.0).abs() < 1e-9);
     assert!((negative - 1.0).abs() < 1e-9);
+    assert!((positive_edge - 1.0).abs() < 1e-9);
+    assert!((negative_edge - 1.0).abs() < 1e-9);
 
     let _ = fs::remove_file(PathBuf::from(&temp_file));
 }

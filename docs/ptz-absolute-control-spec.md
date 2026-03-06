@@ -1,6 +1,6 @@
 # PTZ 絶対位置制御（Raw Count）仕様
 
-最終更新: 2026-03-03
+最終更新: 2026-03-06
 
 ## 1. スコープ
 
@@ -15,6 +15,7 @@
 
 - `reocli ptz set-absolute <pan_count> <tilt_count> [--tol-count <i64>] [--timeout-ms <u64>] [--channel <0-255>]`
 - `reocli ptz get-absolute [--channel <0-255>]`
+- 関連コマンド: `reocli ptz calibrate auto [--channel <0-255>]`
 
 既定値:
 
@@ -32,6 +33,10 @@
 - `reolink.ptz_set_absolute [channel?] <pan_count> <tilt_count> [tol_count] [timeout_ms]`
 - `reolink.ptz_get_absolute [channel?]`
 
+補足:
+
+- `ptz onvif status` / `ptz onvif options` / `ptz onvif relative-move` は現状 CLI 専用で、MCP には公開していない。
+
 ## 3. バックエンドとトランスポート
 
 - `REOCLI_PTZ_BACKEND`
@@ -40,7 +45,21 @@
 
 `set-absolute` は基本的に `ptz_transport` を通じて PTZ 移動/停止を実行する。
 
-### 3.1 ONVIF 時の条件付き CGI フォールバック
+### 3.1 永続化ファイル
+
+- `REOCLI_CALIBRATION_DIR` 未設定時、保存先は `~/.reocli/calibration`。
+- `ptz calibrate auto` は calibration を `<serial>__<model>__<firmware>.json` として保存する。
+- カメラ側の `calibrated=true` と保存済み calibration が一致する場合、`ptz calibrate auto` は再計測せず既存ファイルを再利用する。
+- `set-absolute` は保存済み calibration を自動読込する。
+- `set-absolute` は同じディレクトリに `<endpoint>.ch<channel>.ekf-count.json` を保存し、EKF の位置・速度・gain 学習状態を次回実行へ持ち越す。
+
+### 3.2 Strict 完了判定の調整
+
+- `REOCLI_PTZ_STRICT_SUCCESS_PAN_COUNT` で pan 側閾値を上書きできる。既定値は `50`。
+- `REOCLI_PTZ_STRICT_SUCCESS_TILT_COUNT` で tilt 側閾値を上書きできる。既定値は `24`。
+- これらは success latch と strict completion 判定の許容幅として使われる。
+
+### 3.3 ONVIF 時の条件付き CGI フォールバック
 
 `REOCLI_PTZ_BACKEND=onvif` でも、以下をすべて満たす場合はパルス移動と停止のみ CGI を強制する。
 
@@ -65,7 +84,7 @@
 
 ## 5. ONVIF オプション確認方法
 
-ONVIF backend 利用時は以下で PTZ 機能を確認できる。
+ONVIF backend 利用時は以下で PTZ 機能を確認できる。これは CLI 専用の補助コマンドで、MCP ツールには公開していない。
 
 ```bash
 REOCLI_PTZ_BACKEND=onvif reocli ptz onvif options --channel 0
@@ -83,6 +102,9 @@ REOCLI_PTZ_BACKEND=onvif reocli ptz onvif options --channel 0
 ## 6. 実行例
 
 ```bash
+# calibration を保存または再利用
+reocli ptz calibrate auto --channel 0
+
 # CGI backend (default)
 reocli ptz set-absolute 1500 -180 --tol-count 12 --timeout-ms 25000 --channel 0
 
@@ -97,5 +119,6 @@ reocli-mcp reolink.ptz_get_absolute 0
 ## 7. 注意点
 
 - 本仕様は角度ではなく raw count を扱う。
+- calibration と EKF state はどちらも `REOCLI_CALIBRATION_DIR` 配下に保存される。
 - 機種/FW 差により `onvif options` の値は変動する。
 - RelativeMove 非対応かつ `timeout_min` が大きい機種では、ONVIF backend 指定中でも一部コマンドが CGI 経由になる。

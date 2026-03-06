@@ -1,0 +1,1 @@
+Definition of done in this repo: code compiles with cargo check, formatting passes with cargo fmt --check, clippy passes with -D warnings, tests pass with cargo test, and new or changed public behavior is documented and tested. Build docs with `cargo doc --no-deps` when public APIs change.

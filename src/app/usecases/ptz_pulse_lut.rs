@@ -6,8 +6,10 @@ pub enum AxisDirection {
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct AxisPulseLut {
-    positive_counts_per_ms: f64,
-    negative_counts_per_ms: f64,
+    positive_mid_counts_per_ms: f64,
+    negative_mid_counts_per_ms: f64,
+    positive_edge_counts_per_ms: f64,
+    negative_edge_counts_per_ms: f64,
     ema_alpha: f64,
 }
 
@@ -27,53 +29,92 @@ impl AxisPulseLut {
             COUNTS_PER_MS_FALLBACK
         };
         Self {
-            positive_counts_per_ms: seeded_rate,
-            negative_counts_per_ms: seeded_rate,
+            positive_mid_counts_per_ms: seeded_rate,
+            negative_mid_counts_per_ms: seeded_rate,
+            positive_edge_counts_per_ms: seeded_rate,
+            negative_edge_counts_per_ms: seeded_rate,
             ema_alpha: EMA_ALPHA_DEFAULT,
         }
     }
 
     pub(crate) fn from_seed_and_rates(
         model_beta: f64,
-        positive_counts_per_ms: Option<f64>,
-        negative_counts_per_ms: Option<f64>,
+        positive_mid_counts_per_ms: Option<f64>,
+        negative_mid_counts_per_ms: Option<f64>,
+        positive_edge_counts_per_ms: Option<f64>,
+        negative_edge_counts_per_ms: Option<f64>,
     ) -> Self {
         let mut lut = Self::seeded(model_beta);
-        if let Some(value) = sanitize_stored_rate(positive_counts_per_ms) {
-            lut.positive_counts_per_ms = value;
+        if let Some(value) = sanitize_stored_rate(positive_mid_counts_per_ms) {
+            lut.positive_mid_counts_per_ms = value;
         }
-        if let Some(value) = sanitize_stored_rate(negative_counts_per_ms) {
-            lut.negative_counts_per_ms = value;
+        if let Some(value) = sanitize_stored_rate(negative_mid_counts_per_ms) {
+            lut.negative_mid_counts_per_ms = value;
+        }
+        if let Some(value) = sanitize_stored_rate(positive_edge_counts_per_ms) {
+            lut.positive_edge_counts_per_ms = value;
+        }
+        if let Some(value) = sanitize_stored_rate(negative_edge_counts_per_ms) {
+            lut.negative_edge_counts_per_ms = value;
         }
         lut
     }
 
     pub fn counts_per_ms(&self, direction: AxisDirection) -> f64 {
-        match direction {
-            AxisDirection::Positive => self.positive_counts_per_ms,
-            AxisDirection::Negative => self.negative_counts_per_ms,
+        self.counts_per_ms_in_band(direction, false)
+    }
+
+    pub fn counts_per_ms_in_band(&self, direction: AxisDirection, edge_band: bool) -> f64 {
+        match (direction, edge_band) {
+            (AxisDirection::Positive, false) => self.positive_mid_counts_per_ms,
+            (AxisDirection::Negative, false) => self.negative_mid_counts_per_ms,
+            (AxisDirection::Positive, true) => self.positive_edge_counts_per_ms,
+            (AxisDirection::Negative, true) => self.negative_edge_counts_per_ms,
         }
     }
 
     pub fn update(&mut self, direction: AxisDirection, pulse_ms: u64, observed_delta_count: f64) {
+        self.update_in_band(direction, false, pulse_ms, observed_delta_count);
+    }
+
+    pub fn update_in_band(
+        &mut self,
+        direction: AxisDirection,
+        edge_band: bool,
+        pulse_ms: u64,
+        observed_delta_count: f64,
+    ) {
         let sample_rate = sample_rate_from_observation(pulse_ms, observed_delta_count);
         let Some(sample_rate) = sample_rate else {
             return;
         };
 
-        let previous = self.counts_per_ms(direction);
+        let previous = self.counts_per_ms_in_band(direction, edge_band);
         let alpha = self.ema_alpha.clamp(0.05, 0.95);
         let updated = ((1.0 - alpha) * previous) + (alpha * sample_rate);
         let updated = updated.clamp(COUNTS_PER_MS_MIN, COUNTS_PER_MS_MAX);
-        match direction {
-            AxisDirection::Positive => self.positive_counts_per_ms = updated,
-            AxisDirection::Negative => self.negative_counts_per_ms = updated,
+        match (direction, edge_band) {
+            (AxisDirection::Positive, false) => self.positive_mid_counts_per_ms = updated,
+            (AxisDirection::Negative, false) => self.negative_mid_counts_per_ms = updated,
+            (AxisDirection::Positive, true) => self.positive_edge_counts_per_ms = updated,
+            (AxisDirection::Negative, true) => self.negative_edge_counts_per_ms = updated,
         }
     }
 
     pub fn pulse_ms_for_target(
         &self,
         direction: AxisDirection,
+        target_delta_count: f64,
+        min_ms: u64,
+        max_ms: u64,
+    ) -> u64 {
+        self.pulse_ms_for_target_in_band(direction, false, target_delta_count, min_ms, max_ms)
+    }
+
+    pub fn pulse_ms_for_target_in_band(
+        &self,
+        direction: AxisDirection,
+        edge_band: bool,
         target_delta_count: f64,
         min_ms: u64,
         max_ms: u64,
@@ -85,7 +126,7 @@ impl AxisPulseLut {
         }
 
         let rate = self
-            .counts_per_ms(direction)
+            .counts_per_ms_in_band(direction, edge_band)
             .clamp(COUNTS_PER_MS_MIN, COUNTS_PER_MS_MAX);
         let raw_ms = (target / rate).round();
         if !raw_ms.is_finite() {

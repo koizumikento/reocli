@@ -3,6 +3,25 @@ pub struct PositionSettlingTracker {
     stable_steps: usize,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct CompletionGateCapabilities {
+    pub has_reliable_moving: bool,
+    pub has_reliable_move_age: bool,
+}
+
+impl CompletionGateCapabilities {
+    pub fn from_hint(moving: Option<bool>, move_age_ms: Option<u64>) -> Self {
+        Self {
+            has_reliable_moving: moving.is_some(),
+            has_reliable_move_age: move_age_ms.is_some(),
+        }
+    }
+
+    fn has_full_hint(self) -> bool {
+        self.has_reliable_moving && self.has_reliable_move_age
+    }
+}
+
 impl PositionSettlingTracker {
     pub fn new() -> Self {
         Self { stable_steps: 0 }
@@ -37,20 +56,35 @@ impl PositionSettlingTracker {
 pub fn completion_gate_allows_success(
     moving: Option<bool>,
     move_age_ms: Option<u64>,
+    capabilities: CompletionGateCapabilities,
     min_age_ms: u64,
     stable_steps: usize,
     required_stable_steps: usize,
+    fallback_required_stable_steps: usize,
 ) -> bool {
     let required = required_stable_steps.max(1);
     if stable_steps < required {
         return false;
     }
 
-    match moving {
-        Some(true) => false,
-        Some(false) => move_age_ms.is_none_or(|age_ms| age_ms >= min_age_ms),
-        None => move_age_ms.is_some_and(|age_ms| age_ms >= min_age_ms),
+    if matches!(moving, Some(true)) {
+        return false;
     }
+
+    if capabilities.has_full_hint() {
+        return match moving {
+            Some(false) => move_age_ms.is_none_or(|age_ms| age_ms >= min_age_ms),
+            None => move_age_ms.is_some_and(|age_ms| age_ms >= min_age_ms),
+            Some(true) => false,
+        };
+    }
+
+    let fallback_required = fallback_required_stable_steps.max(required.saturating_add(1));
+    if stable_steps < fallback_required {
+        return false;
+    }
+
+    move_age_ms.is_none_or(|age_ms| age_ms >= min_age_ms)
 }
 
 fn sanitize_threshold(raw: f64) -> f64 {

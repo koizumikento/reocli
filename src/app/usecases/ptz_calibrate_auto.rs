@@ -294,7 +294,7 @@ fn try_build_measured_calibration(
 
         let (pan_min, pan_max, pan_sweep_deltas) =
             sweep_axis_bounds(client, channel, AxisKind::Pan, detected_pan_motion)?;
-        let (tilt_min, tilt_max, tilt_sweep_deltas) =
+        let (mut tilt_min, mut tilt_max, mut tilt_sweep_deltas) =
             sweep_axis_bounds(client, channel, AxisKind::Tilt, detected_tilt_motion)?;
 
         restore_axis_to_home(
@@ -312,17 +312,81 @@ fn try_build_measured_calibration(
             detected_tilt_motion,
         )?;
         let pan_span = (pan_max - pan_min).unsigned_abs() as f64;
-        let tilt_span = (tilt_max - tilt_min).unsigned_abs() as f64;
+        let mut tilt_span = (tilt_max - tilt_min).unsigned_abs() as f64;
         let pan_estimate =
             estimate_model_from_sweep_with_quality(AxisKind::Pan, pan_span, &pan_sweep_deltas);
-        let tilt_estimate =
+        let mut tilt_estimate =
             estimate_model_from_sweep_with_quality(AxisKind::Tilt, tilt_span, &tilt_sweep_deltas);
-        validate_measured_calibration_quality(
+        let mut retry_note = None;
+        if should_retry_tilt_sampling_after_quality_check(
             pan_span,
             tilt_span,
             pan_estimate.residual_p95_count,
             tilt_estimate.residual_p95_count,
-        )?;
+        ) {
+            let tilt_samples_before_retry = tilt_sweep_deltas.len();
+            let initial_tilt_p95 = tilt_estimate.residual_p95_count;
+            let (retry_tilt_min, retry_tilt_max) = sweep_axis_bounds_pass(
+                client,
+                channel,
+                AxisKind::Tilt,
+                detected_tilt_motion,
+                &mut tilt_sweep_deltas,
+                axis_model_sample_cap(AxisKind::Tilt),
+            )?;
+            tilt_min = tilt_min.min(retry_tilt_min);
+            tilt_max = tilt_max.max(retry_tilt_max);
+            if tilt_max <= tilt_min {
+                return Err(AppError::new(
+                    ErrorKind::UnexpectedResponse,
+                    format!(
+                        "invalid {:?} span after retry sweep: min={tilt_min}, max={tilt_max}",
+                        AxisKind::Tilt
+                    ),
+                ));
+            }
+            restore_axis_to_home(
+                client,
+                channel,
+                AxisKind::Tilt,
+                home_tilt,
+                detected_tilt_motion,
+            )?;
+            tilt_span = (tilt_max - tilt_min).unsigned_abs() as f64;
+            tilt_estimate = estimate_model_from_sweep_with_quality(
+                AxisKind::Tilt,
+                tilt_span,
+                &tilt_sweep_deltas,
+            );
+            let retry_extra_samples = tilt_sweep_deltas
+                .len()
+                .saturating_sub(tilt_samples_before_retry);
+            retry_note = Some(format!(
+                "tilt_retry=extra_pass_used; tilt_retry_extra_samples={retry_extra_samples}; tilt_retry_initial_p95={initial_tilt_p95}; tilt_retry_final_p95={}",
+                tilt_estimate.residual_p95_count
+            ));
+            if let Err(error) = validate_measured_calibration_quality(
+                pan_span,
+                tilt_span,
+                pan_estimate.residual_p95_count,
+                tilt_estimate.residual_p95_count,
+            ) {
+                return Err(AppError::new(
+                    error.kind,
+                    format!(
+                        "measured calibration rejected after extra tilt pass: {}",
+                        error.message
+                    ),
+                ));
+            }
+        } else {
+            validate_measured_calibration_quality(
+                pan_span,
+                tilt_span,
+                pan_estimate.residual_p95_count,
+                tilt_estimate.residual_p95_count,
+            )?;
+        }
         let pan_deadband = estimate_directional_deadband_count(
             client,
             channel,
@@ -341,6 +405,18 @@ fn try_build_measured_calibration(
         .unwrap_or_else(|_| DirectionalDeadband::uniform(DEFAULT_DEADBAND_COUNT));
         let pan_deadband_count = pan_deadband.compatibility_count();
         let tilt_deadband_count = tilt_deadband.compatibility_count();
+
+        let mut report_notes = format!(
+            "created_from_measured_sweep; pan_samples={}; tilt_samples={}; pan_blend={:.2}; tilt_blend={:.2}",
+            pan_estimate.sample_count,
+            tilt_estimate.sample_count,
+            pan_estimate.fallback_blend_ratio,
+            tilt_estimate.fallback_blend_ratio
+        );
+        if let Some(retry_note) = retry_note {
+            report_notes.push_str("; ");
+            report_notes.push_str(&retry_note);
+        }
 
         Ok((
             CalibrationParams {
@@ -365,13 +441,7 @@ fn try_build_measured_calibration(
                 samples: pan_estimate.sample_count.max(tilt_estimate.sample_count),
                 pan_error_p95_count: pan_estimate.residual_p95_count,
                 tilt_error_p95_count: tilt_estimate.residual_p95_count,
-                notes: format!(
-                    "created_from_measured_sweep; pan_samples={}; tilt_samples={}; pan_blend={:.2}; tilt_blend={:.2}",
-                    pan_estimate.sample_count,
-                    tilt_estimate.sample_count,
-                    pan_estimate.fallback_blend_ratio,
-                    tilt_estimate.fallback_blend_ratio
-                ),
+                notes: report_notes,
             },
         ))
     })();
@@ -484,45 +554,19 @@ fn sweep_axis_bounds(
     let sample_cap = axis_model_sample_cap(axis);
     let min_samples = axis_model_min_samples(axis).min(sample_cap);
     let mut sweep_deltas = Vec::with_capacity(sample_cap);
-    let mut min = sweep_axis_limit(
-        client,
-        channel,
-        axis,
-        motion.decrease,
-        true,
-        &mut sweep_deltas,
-        sample_cap,
-    )?;
-    let mut max = sweep_axis_limit(
-        client,
-        channel,
-        axis,
-        motion.increase,
-        false,
-        &mut sweep_deltas,
-        sample_cap,
-    )?;
+    let (mut min, mut max) =
+        sweep_axis_bounds_pass(client, channel, axis, motion, &mut sweep_deltas, sample_cap)?;
     if sweep_deltas.len() < min_samples {
         for _ in 0..CALIBRATION_SWEEP_RETRY_PASSES_MAX {
-            let pass_min = sweep_axis_limit(
+            let (pass_min, pass_max) = sweep_axis_bounds_pass(
                 client,
                 channel,
                 axis,
-                motion.decrease,
-                true,
+                motion,
                 &mut sweep_deltas,
                 sample_cap,
             )?;
             min = min.min(pass_min);
-            let pass_max = sweep_axis_limit(
-                client,
-                channel,
-                axis,
-                motion.increase,
-                false,
-                &mut sweep_deltas,
-                sample_cap,
-            )?;
             max = max.max(pass_max);
             if sweep_deltas.len() >= min_samples {
                 break;
@@ -540,6 +584,35 @@ fn sweep_axis_bounds(
     }
 
     Ok((min, max, sweep_deltas))
+}
+
+fn sweep_axis_bounds_pass(
+    client: &Client,
+    channel: u8,
+    axis: AxisKind,
+    motion: AxisMotion,
+    sweep_deltas: &mut Vec<f64>,
+    sample_cap: usize,
+) -> AppResult<(i64, i64)> {
+    let min = sweep_axis_limit(
+        client,
+        channel,
+        axis,
+        motion.decrease,
+        true,
+        sweep_deltas,
+        sample_cap,
+    )?;
+    let max = sweep_axis_limit(
+        client,
+        channel,
+        axis,
+        motion.increase,
+        false,
+        sweep_deltas,
+        sample_cap,
+    )?;
+    Ok((min, max))
 }
 
 fn sweep_axis_limit(
@@ -899,6 +972,12 @@ struct AxisQualityThreshold {
     ceiling_count: i64,
 }
 
+#[derive(Debug, Clone, Copy)]
+struct MeasuredQualityGateDecision {
+    pan_passed: bool,
+    tilt_passed: bool,
+}
+
 fn axis_quality_threshold(axis: AxisKind) -> AxisQualityThreshold {
     match axis {
         AxisKind::Pan => AxisQualityThreshold {
@@ -936,6 +1015,35 @@ fn axis_quality_threshold_count(axis: AxisKind, span: f64) -> i64 {
         .max(1)
 }
 
+fn measured_quality_gate_decision(
+    pan_span: f64,
+    tilt_span: f64,
+    pan_residual_p95_count: i64,
+    tilt_residual_p95_count: i64,
+) -> MeasuredQualityGateDecision {
+    let pan_max_allowed = axis_quality_threshold_count(AxisKind::Pan, pan_span);
+    let tilt_max_allowed = axis_quality_threshold_count(AxisKind::Tilt, tilt_span);
+    MeasuredQualityGateDecision {
+        pan_passed: pan_residual_p95_count <= pan_max_allowed,
+        tilt_passed: tilt_residual_p95_count <= tilt_max_allowed,
+    }
+}
+
+fn should_retry_tilt_sampling_after_quality_check(
+    pan_span: f64,
+    tilt_span: f64,
+    pan_residual_p95_count: i64,
+    tilt_residual_p95_count: i64,
+) -> bool {
+    let decision = measured_quality_gate_decision(
+        pan_span,
+        tilt_span,
+        pan_residual_p95_count,
+        tilt_residual_p95_count,
+    );
+    decision.pan_passed && !decision.tilt_passed
+}
+
 fn validate_measured_calibration_quality(
     pan_span: f64,
     tilt_span: f64,
@@ -944,12 +1052,17 @@ fn validate_measured_calibration_quality(
 ) -> AppResult<()> {
     let pan_threshold = axis_quality_threshold(AxisKind::Pan);
     let tilt_threshold = axis_quality_threshold(AxisKind::Tilt);
-    let pan_max_allowed = axis_quality_threshold_count(AxisKind::Pan, pan_span);
-    let tilt_max_allowed = axis_quality_threshold_count(AxisKind::Tilt, tilt_span);
-
-    if pan_residual_p95_count <= pan_max_allowed && tilt_residual_p95_count <= tilt_max_allowed {
+    let decision = measured_quality_gate_decision(
+        pan_span,
+        tilt_span,
+        pan_residual_p95_count,
+        tilt_residual_p95_count,
+    );
+    if decision.pan_passed && decision.tilt_passed {
         return Ok(());
     }
+    let pan_max_allowed = axis_quality_threshold_count(AxisKind::Pan, pan_span);
+    let tilt_max_allowed = axis_quality_threshold_count(AxisKind::Tilt, tilt_span);
 
     Err(AppError::new(
         ErrorKind::UnexpectedResponse,
