@@ -34,6 +34,18 @@ fn update_applies_ema_for_valid_sample_only() {
 }
 
 #[test]
+fn update_in_band_only_changes_selected_band() {
+    let mut lut = AxisPulseLut::seeded(120.0);
+    let mid_base = lut.counts_per_ms_in_band(AxisDirection::Positive, false);
+    let edge_base = lut.counts_per_ms_in_band(AxisDirection::Positive, true);
+
+    lut.update_in_band(AxisDirection::Positive, true, 100, 500.0);
+
+    assert!((lut.counts_per_ms_in_band(AxisDirection::Positive, false) - mid_base).abs() < 1e-6);
+    assert!(lut.counts_per_ms_in_band(AxisDirection::Positive, true) > edge_base);
+}
+
+#[test]
 fn update_ignores_noise_and_invalid_values() {
     let mut lut = AxisPulseLut::seeded(120.0);
     let base = lut.counts_per_ms(AxisDirection::Positive);
@@ -56,4 +68,15 @@ fn pulse_ms_for_target_uses_directional_rate_and_clamps() {
     assert_eq!(low, 10);
     let high = lut.pulse_ms_for_target(AxisDirection::Positive, 9_999.0, 10, 120);
     assert_eq!(high, 120);
+}
+
+#[test]
+fn pulse_ms_for_target_in_band_uses_band_specific_rate() {
+    let lut = AxisPulseLut::from_seed_and_rates(120.0, Some(1.0), Some(1.0), Some(4.0), Some(1.0));
+
+    let mid_pulse = lut.pulse_ms_for_target_in_band(AxisDirection::Positive, false, 80.0, 10, 120);
+    let edge_pulse = lut.pulse_ms_for_target_in_band(AxisDirection::Positive, true, 80.0, 10, 120);
+
+    assert_eq!(mid_pulse, 80);
+    assert_eq!(edge_pulse, 20);
 }

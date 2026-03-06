@@ -145,6 +145,7 @@ cargo test --test live_smoke -- --nocapture
 - `set-absolute` / `get-absolute` は角度ではなく `GetPtzCurPos` の生カウント値で扱います。
 - `set-absolute` は `pan_count` / `tilt_count` を目標として、`tol_count` 以内になるまで PTZ 制御を繰り返します。
 - `set-absolute` の既定値は `tol_count=10`、`timeout_ms=25000` です。
+- パルス制御経路では、中域と端部で別々の `counts/ms` を online 学習し、EKF state に保持します。
 - `REOCLI_PTZ_BACKEND=onvif` の場合、目標近傍では ONVIF `RelativeMove` を優先します。
 - ただし `supports_relative_pan_tilt_translation=false` かつ `has_timeout_range=true` で `timeout_min >= PT1S` の機種では、`set-absolute` のパルス移動/停止は CGI に自動フォールバックします。
 - 判定に使う値は `REOCLI_PTZ_BACKEND=onvif reocli ptz onvif options --channel <ch>` で確認できます。

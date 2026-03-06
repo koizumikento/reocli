@@ -7,7 +7,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::app::usecases::ptz_calibrate_auto::{StoredCalibration, load_saved_params_for_device};
 use crate::app::usecases::ptz_controller::{AxisEkf, AxisEkfConfig, AxisEkfSnapshot};
-use crate::app::usecases::ptz_deadband::scale_directional_deadband;
+use crate::app::usecases::ptz_deadband::{
+    PositionBand, classify_position_band, scale_directional_deadband,
+};
 use crate::app::usecases::ptz_get_absolute_raw::{PtzRawPosition, map_status_to_raw_position};
 use crate::app::usecases::ptz_pulse_lut::{AxisDirection, AxisPulseLut};
 use crate::app::usecases::ptz_settle_gate::{
@@ -186,9 +188,17 @@ struct StoredPtzEkfState {
     #[serde(default)]
     pan_negative_counts_per_ms: Option<f64>,
     #[serde(default)]
+    pan_positive_edge_counts_per_ms: Option<f64>,
+    #[serde(default)]
+    pan_negative_edge_counts_per_ms: Option<f64>,
+    #[serde(default)]
     tilt_positive_counts_per_ms: Option<f64>,
     #[serde(default)]
     tilt_negative_counts_per_ms: Option<f64>,
+    #[serde(default)]
+    tilt_positive_edge_counts_per_ms: Option<f64>,
+    #[serde(default)]
+    tilt_negative_edge_counts_per_ms: Option<f64>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -238,6 +248,7 @@ struct PendingPulseObservation {
     axis: ControlAxis,
     direction: AxisDirection,
     pulse_ms: u64,
+    edge_band: bool,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -743,11 +754,15 @@ fn run_closed_loop(
             pan_model.beta,
             stored.pan_positive_counts_per_ms,
             stored.pan_negative_counts_per_ms,
+            stored.pan_positive_edge_counts_per_ms,
+            stored.pan_negative_edge_counts_per_ms,
         );
         tilt_pulse_lut = AxisPulseLut::from_seed_and_rates(
             tilt_model.beta,
             stored.tilt_positive_counts_per_ms,
             stored.tilt_negative_counts_per_ms,
+            stored.tilt_positive_edge_counts_per_ms,
+            stored.tilt_negative_edge_counts_per_ms,
         );
     }
 
@@ -871,6 +886,8 @@ fn run_closed_loop(
         }
         let pan_axis_stale = axis_stale_detected(last_pan_u, pan_observed_delta);
         let tilt_axis_stale = axis_stale_detected(last_tilt_u, tilt_observed_delta);
+        let pan_lut_sample_reliable = !pan_model_mismatch_now && !pan_axis_stale;
+        let tilt_lut_sample_reliable = !tilt_model_mismatch_now && !tilt_axis_stale;
         let pan_noise_hint = measurement_noise_hint_scale(
             pan_model_mismatch_now,
             pan_axis_stale,
@@ -891,6 +908,8 @@ fn run_closed_loop(
             &mut pending_pulse_observation,
             pan_observed_delta,
             tilt_observed_delta,
+            pan_lut_sample_reliable,
+            tilt_lut_sample_reliable,
             &mut pan_pulse_lut,
             &mut tilt_pulse_lut,
         );
@@ -1403,6 +1422,15 @@ fn run_closed_loop(
                         speed_cap_for_error(command_error_abs).max(1)
                     };
                     let base_pulse_ms = if pulse_lut_candidate {
+                        let lut_edge_band = pulse_lut_edge_band_for_command(
+                            direction,
+                            pan_measure,
+                            pan_min_count,
+                            pan_max_count,
+                            tilt_measure,
+                            tilt_min_count,
+                            tilt_max_count,
+                        );
                         pulse_ms_for_direction_with_lut(
                             direction,
                             pan_command_error,
@@ -1410,6 +1438,7 @@ fn run_closed_loop(
                             &pan_pulse_lut,
                             &tilt_pulse_lut,
                             command_error_abs,
+                            lut_edge_band,
                         )
                     } else {
                         control_pulse_ms_for_error(command_error_abs)
@@ -1470,8 +1499,27 @@ fn run_closed_loop(
                         pulse_ms,
                         force_cgi_pulse_transport,
                     )?;
-                    pending_pulse_observation =
-                        pending_pulse_observation_for_command(direction, pulse_ms);
+                    let lut_edge_band = pulse_lut_edge_band_for_command(
+                        direction,
+                        pan_measure,
+                        pan_min_count,
+                        pan_max_count,
+                        tilt_measure,
+                        tilt_min_count,
+                        tilt_max_count,
+                    );
+                    pending_pulse_observation = pending_pulse_observation_for_lut_command(
+                        direction,
+                        pulse_ms,
+                        lut_edge_band,
+                        pulse_lut_learning_allowed(
+                            direction,
+                            pulse_lut_candidate,
+                            pulse_ms,
+                            pan_reversal_now,
+                            tilt_reversal_now,
+                        ),
+                    );
                     let elapsed_ms = Instant::now()
                         .saturating_duration_since(started)
                         .as_millis();
@@ -2649,6 +2697,7 @@ fn pulse_ms_for_direction_with_lut(
     pan_lut: &AxisPulseLut,
     tilt_lut: &AxisPulseLut,
     command_error_abs: f64,
+    edge_band: bool,
 ) -> u64 {
     let fallback = control_pulse_ms_for_error(command_error_abs);
     let Some((axis, axis_direction)) = control_axis_direction(direction) else {
@@ -2668,8 +2717,9 @@ fn pulse_ms_for_direction_with_lut(
         ControlAxis::Pan => pan_lut,
         ControlAxis::Tilt => tilt_lut,
     };
-    lut.pulse_ms_for_target(
+    lut.pulse_ms_for_target_in_band(
         axis_direction,
+        edge_band,
         target_count,
         PULSE_LUT_MIN_MS,
         PULSE_LUT_MAX_MS,
@@ -2689,6 +2739,42 @@ fn control_axis_direction(direction: PtzDirection) -> Option<(ControlAxis, AxisD
     }
 }
 
+fn pulse_lut_edge_band_for_command(
+    direction: PtzDirection,
+    pan_measure: f64,
+    pan_min_count: f64,
+    pan_max_count: f64,
+    tilt_measure: f64,
+    tilt_min_count: f64,
+    tilt_max_count: f64,
+) -> bool {
+    let band = match control_axis_direction(direction).map(|(axis, _)| axis) {
+        Some(ControlAxis::Pan) => classify_position_band(pan_measure, pan_min_count, pan_max_count),
+        Some(ControlAxis::Tilt) => {
+            classify_position_band(tilt_measure, tilt_min_count, tilt_max_count)
+        }
+        None => PositionBand::Mid,
+    };
+    matches!(band, PositionBand::Low | PositionBand::High)
+}
+
+fn pulse_lut_learning_allowed(
+    direction: PtzDirection,
+    pulse_lut_candidate: bool,
+    pulse_ms: u64,
+    pan_reversal_now: bool,
+    tilt_reversal_now: bool,
+) -> bool {
+    if !pulse_lut_candidate || pulse_ms < PULSE_LUT_MIN_MS {
+        return false;
+    }
+    match control_axis_direction(direction).map(|(axis, _)| axis) {
+        Some(ControlAxis::Pan) => !pan_reversal_now,
+        Some(ControlAxis::Tilt) => !tilt_reversal_now,
+        None => false,
+    }
+}
+
 fn pending_pulse_observation_for_command(
     direction: PtzDirection,
     pulse_ms: u64,
@@ -2701,13 +2787,30 @@ fn pending_pulse_observation_for_command(
         axis,
         direction: axis_direction,
         pulse_ms,
+        edge_band: false,
     })
+}
+
+fn pending_pulse_observation_for_lut_command(
+    direction: PtzDirection,
+    pulse_ms: u64,
+    edge_band: bool,
+    learning_enabled: bool,
+) -> Option<PendingPulseObservation> {
+    if !learning_enabled {
+        return None;
+    }
+    let mut observation = pending_pulse_observation_for_command(direction, pulse_ms)?;
+    observation.edge_band = edge_band;
+    Some(observation)
 }
 
 fn apply_pending_pulse_observation(
     pending: &mut Option<PendingPulseObservation>,
     pan_observed_delta: Option<f64>,
     tilt_observed_delta: Option<f64>,
+    pan_sample_reliable: bool,
+    tilt_sample_reliable: bool,
     pan_lut: &mut AxisPulseLut,
     tilt_lut: &mut AxisPulseLut,
 ) {
@@ -2726,12 +2829,19 @@ fn apply_pending_pulse_observation(
     }
 
     match observation.axis {
-        ControlAxis::Pan => {
-            pan_lut.update(observation.direction, observation.pulse_ms, observed_delta)
-        }
-        ControlAxis::Tilt => {
-            tilt_lut.update(observation.direction, observation.pulse_ms, observed_delta)
-        }
+        ControlAxis::Pan if pan_sample_reliable => pan_lut.update_in_band(
+            observation.direction,
+            observation.edge_band,
+            observation.pulse_ms,
+            observed_delta,
+        ),
+        ControlAxis::Tilt if tilt_sample_reliable => tilt_lut.update_in_band(
+            observation.direction,
+            observation.edge_band,
+            observation.pulse_ms,
+            observed_delta,
+        ),
+        ControlAxis::Pan | ControlAxis::Tilt => {}
     }
 }
 
@@ -3320,22 +3430,42 @@ fn save_stored_ekf_state(
         pan_positive_counts_per_ms: Some(
             learning
                 .pan_pulse_lut
-                .counts_per_ms(AxisDirection::Positive),
+                .counts_per_ms_in_band(AxisDirection::Positive, false),
         ),
         pan_negative_counts_per_ms: Some(
             learning
                 .pan_pulse_lut
-                .counts_per_ms(AxisDirection::Negative),
+                .counts_per_ms_in_band(AxisDirection::Negative, false),
+        ),
+        pan_positive_edge_counts_per_ms: Some(
+            learning
+                .pan_pulse_lut
+                .counts_per_ms_in_band(AxisDirection::Positive, true),
+        ),
+        pan_negative_edge_counts_per_ms: Some(
+            learning
+                .pan_pulse_lut
+                .counts_per_ms_in_band(AxisDirection::Negative, true),
         ),
         tilt_positive_counts_per_ms: Some(
             learning
                 .tilt_pulse_lut
-                .counts_per_ms(AxisDirection::Positive),
+                .counts_per_ms_in_band(AxisDirection::Positive, false),
         ),
         tilt_negative_counts_per_ms: Some(
             learning
                 .tilt_pulse_lut
-                .counts_per_ms(AxisDirection::Negative),
+                .counts_per_ms_in_band(AxisDirection::Negative, false),
+        ),
+        tilt_positive_edge_counts_per_ms: Some(
+            learning
+                .tilt_pulse_lut
+                .counts_per_ms_in_band(AxisDirection::Positive, true),
+        ),
+        tilt_negative_edge_counts_per_ms: Some(
+            learning
+                .tilt_pulse_lut
+                .counts_per_ms_in_band(AxisDirection::Negative, true),
         ),
     };
 
@@ -3564,10 +3694,42 @@ impl StoredAxisEkfState {
 
 impl StoredPtzEkfState {
     fn is_finite(&self) -> bool {
+        let pan_positive_ok = self
+            .pan_positive_counts_per_ms
+            .is_none_or(|value| value.is_finite());
+        let pan_negative_ok = self
+            .pan_negative_counts_per_ms
+            .is_none_or(|value| value.is_finite());
+        let pan_positive_edge_ok = self
+            .pan_positive_edge_counts_per_ms
+            .is_none_or(|value| value.is_finite());
+        let pan_negative_edge_ok = self
+            .pan_negative_edge_counts_per_ms
+            .is_none_or(|value| value.is_finite());
+        let tilt_positive_ok = self
+            .tilt_positive_counts_per_ms
+            .is_none_or(|value| value.is_finite());
+        let tilt_negative_ok = self
+            .tilt_negative_counts_per_ms
+            .is_none_or(|value| value.is_finite());
+        let tilt_positive_edge_ok = self
+            .tilt_positive_edge_counts_per_ms
+            .is_none_or(|value| value.is_finite());
+        let tilt_negative_edge_ok = self
+            .tilt_negative_edge_counts_per_ms
+            .is_none_or(|value| value.is_finite());
         self.last_pan_u.is_finite()
             && self.last_tilt_u.is_finite()
             && self.pan.is_finite()
             && self.tilt.is_finite()
+            && pan_positive_ok
+            && pan_negative_ok
+            && pan_positive_edge_ok
+            && pan_negative_edge_ok
+            && tilt_positive_ok
+            && tilt_negative_ok
+            && tilt_positive_edge_ok
+            && tilt_negative_edge_ok
     }
 }
 
